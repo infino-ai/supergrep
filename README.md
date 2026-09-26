@@ -41,7 +41,7 @@ SuperGrep offers agents four tools over an Infino index, kept in two places. `fi
 
 ![Offered both, the model reaches for SuperGrep](docs/subagent/tool-choice.svg)
 
-The calls that are not SuperGrep are mostly `Read`: the model opens a file *after* the index has told it which one, rather than instead of asking. That is the shape you want - the index does the finding, and the model still opens what it needs to quote.
+The model's own file tools stayed available throughout. What it had from SuperGrep was the server's instructions, which say which tool fits which kind of question; the choice on each call was the model's. The calls that are not SuperGrep are mostly `Read`: the model opens a file *after* the index has told it which one, rather than instead of asking. That is the shape you want - the index does the finding, and the model still opens what it needs to quote.
 
 ## Go beyond code - index your entire laptop or any corpus
 
