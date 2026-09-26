@@ -1,7 +1,7 @@
 <svg xmlns='http://www.w3.org/2000/svg' width='920' height='234' viewBox='0 0 920 234' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif'>
 <rect width='920' height='234' fill='#ffffff'/>
 <text x='20' y='30' fill='#24292f' font-size='18' font-weight='600'>Offered both, the model reaches for SuperGrep</text>
-<text x='20' y='50' fill='#57606a' font-size='12'>Its own file tools stayed available; SuperGrep's instructions say which tool fits which question. 36 questions on a 256,000-line repository, 2026-09-24.</text>
+<text x='20' y='50' fill='#57606a' font-size='12'>Its own file tools stayed available; SuperGrep's instructions say which tool fits which question. 36 questions, 2026-09-24.</text>
 <text x='20' y='80' fill='#24292f' font-size='13' font-weight='600'>Share of its tool calls that went through SuperGrep</text>
 <text x='20' y='111' fill='#24292f' font-size='13' font-weight='600'>Haiku</text>
 <rect x='90' y='96' width='223' height='18' rx='3' fill='#2f81f7'/>
