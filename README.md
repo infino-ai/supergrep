@@ -8,9 +8,9 @@
 
 # SuperGrep
 
-**Retrieval + inference offload for AI coding agents.** Search your code + dev environment with lower latency and cost than frontier models alone, while keeping the same answer quality.
+**Retrieval + inference offload for AI coding agents.** Help your agents find answers faster and at lower cost, while keeping the same answer quality. 
 
-**[Try it live at infino.ai/supergrep](https://infino.ai/supergrep)** - put a question to a real codebase and watch the same model answer it with and without SuperGrep, side by side, with the bill for each.
+**[Try it live at infino.ai/supergrep](https://infino.ai/supergrep)** - put a question to a real codebase and watch the same model answer it with and without SuperGrep, side by side, with the bill for each. Supergrep uses Infino for retrieval, which tightly integrates small language models with indexes for scalable agent retrieval on object storage. 
 
 ![SuperGrep: find and plain sql on your machine, search, semantic sql and ask in the Infino cloud, one index in both places](docs/subagent/architecture.svg)
 
