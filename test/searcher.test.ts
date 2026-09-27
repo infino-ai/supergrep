@@ -3,6 +3,7 @@ import {
   analyzerOf,
   analyzerTokens,
   applyEmbeds,
+  citeOf,
   excerpt,
   guardSql,
   matchLines,
@@ -171,6 +172,21 @@ describe("numberLines", () => {
 
   it("numbers a single line without a trailing newline", () => {
     expect(numberLines("one line", 1)).toBe("1: one line");
+  });
+});
+
+describe("citeOf", () => {
+  it("writes a place the way a citation is written: path:start-end, the path whole", () => {
+    // The whole path with its directories and extension: what a caller
+    // composing its own citation dropped (`SearchTransportAction:339`), and
+    // what no check or page reads as a citation.
+    expect(citeOf("server/src/main/java/org/opensearch/action/search/SearchTransportAction.java", 330, 362)).toBe(
+      "server/src/main/java/org/opensearch/action/search/SearchTransportAction.java:330-362",
+    );
+  });
+
+  it("writes a single line as path:line", () => {
+    expect(citeOf("src/a.rs", 47, 47)).toBe("src/a.rs:47");
   });
 });
 

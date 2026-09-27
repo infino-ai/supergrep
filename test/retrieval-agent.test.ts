@@ -143,9 +143,11 @@ describe("retrievalAgentRunFrom", () => {
     // Each line carries its own number in the file, counted from the row's
     // start line - so f1's chunk, which begins at line 11, numbers 11-13.
     expect(result.hits).toEqual([
-      { path: "src/f0.ts", startLine: 1, endLine: 9, content: "1: fn f0() {\n2:   body\n3: }" },
-      { path: "src/f1.ts", startLine: 11, endLine: 19, content: "11: fn f1() {\n12:   body\n13: }" },
+      { cite: "src/f0.ts:1-9", path: "src/f0.ts", startLine: 1, endLine: 9, content: "1: fn f0() {\n2:   body\n3: }" },
+      { cite: "src/f1.ts:11-19", path: "src/f1.ts", startLine: 11, endLine: 19, content: "11: fn f1() {\n12:   body\n13: }" },
     ]);
+    // The citation is the first thing on a hit, so it is the first thing read.
+    expect(Object.keys(result.hits[0])[0]).toBe("cite");
     expect(result.rows).toEqual([]);
     expect(result.hitsTotal).toBe(2);
   });
@@ -235,7 +237,7 @@ describe("factsFrom", () => {
   it("makes one hit per row carrying path, start_line and end_line, with the whole content and the descriptors", () => {
     const { hits } = factsFrom([{ ...chunkRow(4, "first line\nsecond line"), symbol: "f4", lang: "ts" }]);
     expect(hits).toEqual([
-      { path: "src/f4.ts", startLine: 41, endLine: 49, content: "41: first line\n42: second line", symbol: "f4", lang: "ts" },
+      { cite: "src/f4.ts:41-49", path: "src/f4.ts", startLine: 41, endLine: 49, content: "41: first line\n42: second line", symbol: "f4", lang: "ts" },
     ]);
   });
 
@@ -256,7 +258,7 @@ describe("factsFrom", () => {
 
   it("gives empty content to a row with only the place columns - the citation is the fact", () => {
     const { hits } = factsFrom([{ path: "a.ts", start_line: 1, end_line: 2 }]);
-    expect(hits).toEqual([{ path: "a.ts", startLine: 1, endLine: 2, content: "" }]);
+    expect(hits).toEqual([{ cite: "a.ts:1-2", path: "a.ts", startLine: 1, endLine: 2, content: "" }]);
   });
 
   it("makes a find fact's matched line the hit's content, numbered where it sits in the file", () => {
@@ -268,8 +270,8 @@ describe("factsFrom", () => {
       { path: "src/b.rs", start_line: 1, end_line: 3, line: "fn narrow() {}" },
     ]);
     expect(hits).toEqual([
-      { path: "src/a.rs", startLine: 40, endLine: 60, content: "47:     narrow();", symbol: "wide" },
-      { path: "src/b.rs", startLine: 1, endLine: 3, content: "1: fn narrow() {}" },
+      { cite: "src/a.rs:40-60", path: "src/a.rs", startLine: 40, endLine: 60, content: "47:     narrow();", symbol: "wide" },
+      { cite: "src/b.rs:1-3", path: "src/b.rs", startLine: 1, endLine: 3, content: "1: fn narrow() {}" },
     ]);
   });
 

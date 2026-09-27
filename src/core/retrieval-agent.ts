@@ -18,7 +18,7 @@
 
 import type { HostedDb, RowRecord } from "./hosted.js";
 import { DEFAULT_SEARCH_K } from "./config.js";
-import { normalizeUnder, numberLines } from "./searcher.js";
+import { citeOf, normalizeUnder, numberLines } from "./searcher.js";
 import { rowFact, type TableShape } from "./table-shape.js";
 
 /** Place-naming rows kept in one result: as many as a search returns by
@@ -189,6 +189,9 @@ export interface RetrievalAgentBudget {
  * shape, so the outer agent cites it as path:line and answers from the
  * content when the statement selected it. */
 export interface RetrievalAgentHit {
+  /** The place written as a citation (`citeOf` in searcher.ts), first on
+   * the hit as it is on a search hit. */
+  cite: string;
   path: string;
   startLine: number;
   endLine: number;
@@ -469,7 +472,7 @@ function hitFromRow(raw: unknown): RetrievalAgentHit | null {
       : typeof row[COL_LINE] === "string"
         ? numberLines(row[COL_LINE] as string, isFiniteNumber(fileLine) ? fileLine : startLine)
         : "";
-  const hit: RetrievalAgentHit = { path, startLine, endLine, content };
+  const hit: RetrievalAgentHit = { cite: citeOf(path, startLine, endLine), path, startLine, endLine, content };
   if (typeof row[COL_SYMBOL] === "string" && row[COL_SYMBOL] !== "") hit.symbol = row[COL_SYMBOL] as string;
   if (typeof row[COL_LANG] === "string" && row[COL_LANG] !== "") hit.lang = row[COL_LANG] as string;
   return hit;

@@ -268,7 +268,9 @@ describe("the chunks table with the platform up, and answer switched on", () => 
     const result = first.value as { index: string; ranking: string; hits: Array<Record<string, unknown>>; usage?: string };
     expect(result.index).toBe("platform");
     expect(result.ranking).toBe("hybrid");
-    expect(result.hits[0]).toMatchObject({ path: "src/a.ts", startLine: 1, endLine: 3, lang: "ts", symbol: "f", score: 0.5 });
+    expect(result.hits[0]).toMatchObject({ cite: "src/a.ts:1-3", path: "src/a.ts", startLine: 1, endLine: 3, lang: "ts", symbol: "f", score: 0.5 });
+    // The citation leads the hit, so it is the first thing read.
+    expect(Object.keys(result.hits[0])[0]).toBe("cite");
     expect(result.hits[0].content).toBe("1: fn f() {\n2:   body\n3: }");
     expect(result.usage).toMatch(/1 chunk \/ 1 file/);
     // The readiness memo holds: a second search is the search alone.

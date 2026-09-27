@@ -111,6 +111,11 @@ export function hostedTelemetry(
 // --- search -----------------------------------------------------------------
 
 export interface SearchHit {
+  /** The hit's place written as a citation is written - `path:start-end`,
+   * `citeOf` - so the form is on the hit itself and a caller copies the
+   * path from it rather than composing one. See `citeOf` for the measured
+   * need. First in the object, so it is the first thing read. */
+  cite: string;
   path: string;
   startLine: number;
   endLine: number;
@@ -244,11 +249,14 @@ export function focusLines(
  * lines (focusLines) rather than the chunk. */
 function toHit(r: Record<string, unknown>, focus?: LineFocus): SearchHit {
   const full = String(r.content);
+  const path = String(r.path);
   const startLine = Number(r.start_line);
+  const endLine = Number(r.end_line);
   const place = {
-    path: String(r.path),
+    cite: citeOf(path, startLine, endLine),
+    path,
     startLine,
-    endLine: Number(r.end_line),
+    endLine,
     lang: String(r.lang ?? ""),
     score: Number(r.score),
     ...(r.symbol ? { symbol: String(r.symbol) } : {}),
@@ -618,6 +626,25 @@ export function numberLines(text: string, startLine: number): string {
     .split("\n")
     .map((line, i) => `${startLine + i}${LINE_NUMBER_SEPARATOR}${line}`)
     .join("\n");
+}
+
+/** A place written as a citation is written: `path:start-end`, or
+ * `path:line` for a single line - the shape the citation check and the
+ * page's links read.
+ *
+ * Every hit carries this beside its `path`, `startLine` and `endLine`. The
+ * instructions say to copy a place exactly as a tool result gave it, but
+ * nothing in a hit was written as a citation: a caller composed one from
+ * the three fields, and each model composed its own. Opus wrote the full
+ * path; Haiku wrote the class name with the line - `SearchTransportAction:339`
+ * - which no check and no page reads as a citation, so its answers over the
+ * index showed no citations at all (the demo, 2026-09-26 and 27: zero
+ * linked citations on seven of its runs). With the citation written on the
+ * hit, "copy it as given" has something to copy. The numbers are the hit's
+ * whole range; the caller narrows them to the lines the content numbers,
+ * as the instructions say. About twenty tokens a hit. */
+export function citeOf(path: string, startLine: number, endLine: number): string {
+  return endLine > startLine ? `${path}:${startLine}-${endLine}` : `${path}:${startLine}`;
 }
 
 /** A column name that carries a row's first line, by the same rule the

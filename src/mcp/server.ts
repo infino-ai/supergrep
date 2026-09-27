@@ -415,6 +415,14 @@ function exampleScalar(shape: TableShape): string {
 export const CITE_EXACTLY =
   "Cite the places your tool results gave you exactly as they gave them - the path and line numbers " +
   "copied, never recalled or adjusted.";
+/** Where the place to copy is: every hit carries its own citation as
+ * `cite` (`citeOf` in core/searcher.ts). Said beside CITE_EXACTLY wherever
+ * hits are described, because a caller told only to copy composed a
+ * citation of its own from the hit's fields, and one model's own was a
+ * class name with a line that nothing reads as a citation. */
+export const CITE_FROM_HIT =
+  " Each hit's cite is its place in that form: keep its path exactly as it is there, and narrow " +
+  "the numbers to the lines the content numbers.";
 export const SWEEP_TO_A_TOOL =
   "Be efficient: prefer few, well-chosen tool calls, and hand a sweep across many files to a tool " +
   "built for it rather than searching by hand.";
@@ -635,6 +643,7 @@ export function logIndexInstructions(agentTools: boolean, files: number, chunks:
     "with its own number in the file, so cite a place as path:line or path:start-end from those numbers and " +
     "only where the thing you name sits - never the hit's whole line range, which spans the window. " +
     CITE_EXACTLY +
+    CITE_FROM_HIT +
     " A 'partial' marker means files over the index cap were left out, so a missing match is not proof of absence."
   );
 }
@@ -1709,6 +1718,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         "from those numbers and only where the thing you name sits - never the hit's whole line " +
         "range, which spans the chunk. " +
         CITE_EXACTLY +
+        CITE_FROM_HIT +
         " Read files with read, every path in one call; Claude's own Read only for a hit marked truncated. " +
         "Every tool takes an optional 'path' (an absolute repo root) to target another repository. " +
         "A 'partial' marker means files over the index cap were left out, so a missing match is not " +
@@ -1742,7 +1752,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         "range, and the chunk content: answer from the hits. The content shows each line with its " +
         "own number in the file, so cite from those numbers - the hit's line range spans the whole " +
         "chunk and is not the line a quoted or named thing sits on. Quote only text a hit shows, " +
-        "from the lines you cite it to. When one " +
+        "from the lines you cite it to." +
+        CITE_FROM_HIT +
+        " When one " +
         "search is not enough, refine the query and search again. " +
         // Measured on LogDx-CI (35 CI failure logs, evidence lines marked):
         // at 200 lines returned per log, whole chunks kept 0.797 of the
