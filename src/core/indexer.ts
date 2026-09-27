@@ -317,7 +317,9 @@ export async function indexRepoStaged(opts: IndexOptions): Promise<StagedIndexRu
     if (db.listTables().includes(TABLE)) db.dropTable(TABLE, true);
     const textTable = db.createTable(TABLE, { ...TEXT_SCHEMA }, new IndexSpec().fts(CONTENT_COLUMN));
     appendSpillSync(textTable, spill, chunkCount, undefined, onProgress);
-    if (!embedder) compact(textTable);
+    // Always - this table is never recreated after this point, embedder or
+    // not, since the local index never gains a vector column any more.
+    compact(textTable);
     const indexMs = Math.round(performance.now() - t0);
 
     const stats: IndexStats = {
@@ -330,7 +332,10 @@ export async function indexRepoStaged(opts: IndexOptions): Promise<StagedIndexRu
       ...(parseBreakerTripped ? { parseBreakerTripped } : {}),
       maxFiles: caps.maxFiles,
       languages,
-      vectors: embedder ? "building" : "none",
+      // Always: the local table never gains a vector column, embedder or
+      // not - only the platform manifest (written separately, below) ever
+      // reports "building"/"ready".
+      vectors: "none",
       indexMs,
     };
     writeManifest(indexDirPath, toManifest(stats, ENGINE_DEFAULT_ANALYZER));
@@ -343,19 +348,26 @@ export async function indexRepoStaged(opts: IndexOptions): Promise<StagedIndexRu
       writePlatformManifest(indexDirPath, toManifest({ ...stats, vectors: "building" }, platformAnalyzer, undefined, "hosted"));
     }
     writeFileState(indexDirPath, fileState);
-    if (!embedder && !opts.hosted) {
+    if (!opts.hosted) {
+      // Nothing past stage 1 is ever needed without an account: the local
+      // table is always lexical (find, plain sql), and an `embedder` passed
+      // in this case would only be a caller's mistake - there is nowhere for
+      // its vectors to go. See the header note above `EMBEDDING_COLUMN`.
       spill.release();
       return { text: stats, completion: Promise.resolve(stats) };
     }
 
-    // --- stage 2: embed and swap in the hybrid table; then the platform load ---
-    // A failure anywhere before the swap (model download, endpoint down, full
-    // disk) leaves the stage-1 keyword table live and the manifest honest -
-    // search degrades, indexing never fails. The swap itself is again one
-    // synchronous block. The platform load comes after, from the same spill
-    // and the same vectors, so the two tables hold the same rows; its failure
-    // is recorded, never thrown. `completion` must never reject; its finally
-    // owns the spill from here on.
+    // --- stage 2: embed for the platform's client-vector column, then load it ---
+    // The LOCAL table never gains a vector column - it stays the stage-1
+    // keyword table for the life of the index, so `find` and plain `sql` are
+    // always lexical, fast, and account-free (the owner's decision,
+    // 2026-09-09: "locally is always lexical ... all vector search happens on
+    // the cloud"). `embedder` here exists for exactly one reason:
+    // `--embed-provider local` asks THIS machine to compute the vectors the
+    // PLATFORM table's embedding column carries, rather than the platform's
+    // own model. Its failure only affects that column (the platform table
+    // loads keyword-only instead); the local index is untouched either way.
+    // `completion` must never reject; its finally owns the spill from here on.
     const completion = (async () => {
       let dim: number | undefined;
       try {
@@ -367,30 +379,10 @@ export async function indexRepoStaged(opts: IndexOptions): Promise<StagedIndexRu
               chunkCount === 0
                 ? await embedder.dim() // no chunks to embed - just size the schema
                 : await embedSpill(spill, embedder, chunkCount, onProgress);
-
-            onPhase?.("commit-vectors");
-            db.dropTable(TABLE, true);
-            const hybridTable = db.createTable(
-              TABLE,
-              { ...TEXT_SCHEMA, [EMBEDDING_COLUMN]: { vector: dim } },
-              new IndexSpec().fts(CONTENT_COLUMN).vector(EMBEDDING_COLUMN, dim, VECTOR_METRIC),
-            );
-            // Zero chunks ⇒ no vector spill was ever written; the empty table is
-            // already complete.
-            if (chunkCount > 0) appendSpillSync(hybridTable, spill, chunkCount, dim, onProgress);
-            compact(hybridTable);
-            stats.vectors = "ready";
             stats.embedMs = Math.round(performance.now() - tEmbed);
-            writeManifest(indexDirPath, toManifest(stats, ENGINE_DEFAULT_ANALYZER, localEmbedderInfo(embedder, dim)));
           } catch (err) {
             dim = undefined;
-            stats.vectors = "none";
             stats.embedError = (err as Error).message;
-            try {
-              writeManifest(indexDirPath, toManifest(stats, ENGINE_DEFAULT_ANALYZER));
-            } catch {
-              /* disk gone - nothing left to record on, and completion must not reject */
-            }
           }
         }
         if (opts.hosted && platformAnalyzer) {

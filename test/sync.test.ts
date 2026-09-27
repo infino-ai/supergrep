@@ -100,7 +100,7 @@ describe("syncRepo", () => {
     expect(outcome.action).toBe("noop");
   });
 
-  it("applies edits incrementally and keeps vectors current", async () => {
+  it("applies edits incrementally", async () => {
     writeFileSync(join(root, "src", "alpha.ts"), "export function alphaThing() { return 'capybara'; }\n");
     writeFileSync(join(root, "src", "gamma.ts"), "export function gammaThing() { return 'axolotl'; }\n");
     unlinkSync(join(root, "src", "beta.ts"));
@@ -122,9 +122,10 @@ describe("syncRepo", () => {
     expect(count("axolotl")).toBeGreaterThan(0);
     expect(count("quokka")).toBe(0);
     expect(count("wombat")).toBe(0);
-    // hybrid search still works over synced rows (vectors were embedded)
+    // Keyword search still works over synced rows - the local table has no
+    // account here and never gains a vector column (owner, 2026-09-09).
     const s = await search(handle, fakeEmbedder, "axolotl", 3);
-    expect(s.ranking).toBe("hybrid");
+    expect(s.ranking).toBe("keyword");
     expect(s.hits.some((h) => h.path === "src/gamma.ts")).toBe(true);
   });
 
@@ -135,10 +136,12 @@ describe("syncRepo", () => {
     expect(outcome.action).toBe("noop");
   });
 
-  it("demands a rebuild when the embedder changes", async () => {
+  it("without an account, the embedder identity is moot: no rebuild is demanded when it changes", async () => {
+    // There is nothing local keyed to the embedder any more - the local
+    // table has no vector column to invalidate, embedder or not.
     const other = { ...fakeEmbedder, model: "different-model" };
     const outcome = await syncRepo({ ...opts(), embedder: other });
-    expect(outcome.action).toBe("rebuild-required");
+    expect(outcome.action).toBe("noop");
   });
 
   it("demands a rebuild when there is no prior state", async () => {

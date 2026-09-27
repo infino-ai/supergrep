@@ -68,8 +68,11 @@ export function replayLog(): number { return 42; }
   writeFileSync(join(root, "ignored.ts"), "export const SHOULD_NOT_APPEAR = 1;\n");
 
   const db = connect(dir);
+  // No --db here, so the embedder is never used: the local table is always
+  // lexical, whether or not a caller passes one (owner, 2026-09-09 - see
+  // indexer.ts's early-return in indexRepoStaged).
   const stats = await indexRepo({ root, db, indexDirPath: dir, embedder: fakeEmbedder });
-  expect(stats.vectors).toBe("ready");
+  expect(stats.vectors).toBe("none");
   handle = { root, dir, db, manifest: readManifest(dir)! };
 });
 
@@ -81,8 +84,7 @@ describe("indexing", () => {
   it("indexes the fixture and honors .gitignore", () => {
     const m = handle.manifest;
     expect(m.files).toBe(4); // auth.ts, storage.ts, README.md, notes.txt (.gitignore is not indexable)
-    expect(m.vectors).toBe("ready");
-    expect(m.embedder?.dim).toBe(16);
+    expect(m.vectors).toBe("none");
     // A local build goes through the binding's bare IndexSpec.fts, which the
     // pinned engine indexes with its default analyzer; the manifest says so.
     expect(m.analyzer).toBe("ascii_lower");
@@ -91,11 +93,11 @@ describe("indexing", () => {
     expect(rows.map((r) => r.path)).not.toContain("ignored.ts");
   });
 
-  it("staged run reports keyword readiness before vectors", async () => {
+  it("a staged run with no account has nothing left to stage: text and vectors both resolve at once, as \"none\"", async () => {
     const staged = await indexRepoStaged({ root, db: handle.db, indexDirPath: dir, embedder: fakeEmbedder });
-    expect(staged.text.vectors).toBe("building");
+    expect(staged.text.vectors).toBe("none");
     const final = await staged.completion;
-    expect(final.vectors).toBe("ready");
+    expect(final.vectors).toBe("none");
   });
 
   it("sync leaves the local index on the engine's analyzer whatever --analyzer says (that names the platform table's)", async () => {
@@ -119,16 +121,13 @@ describe("search", () => {
     expect(r.hits[0].content).toContain("verifySession");
   });
 
-  it("hybrid ranking once vectors are ready", async () => {
-    const r = await search(handle, fakeEmbedder, "session verification", 5);
-    expect(r.ranking).toBe("hybrid");
-    expect(r.hits.length).toBeGreaterThan(0);
-    expect(r.hits[0].path).toMatch(/auth|README/);
-  });
-
-  it("keyword ranking while vectors are not ready", async () => {
-    const noVec = { ...handle, manifest: { ...handle.manifest, vectors: "building" as const } };
-    const r = await search(noVec, fakeEmbedder, "commit log", 5);
+  // Hybrid ranking against a locally-built vector column no longer has a
+  // path to exercise: the local table never gains one (owner, 2026-09-09).
+  // The fusion/ranking math itself stays covered through the hosted path -
+  // chunks-server.test.ts and rows-server.test.ts both assert
+  // ranking === "hybrid" against a platform-backed manifest.
+  it("keyword ranking, since the local index never has vectors", async () => {
+    const r = await search(handle, fakeEmbedder, "commit log", 5);
     expect(r.ranking).toBe("keyword");
     expect(r.note).toMatch(/vectors not ready/);
   });
@@ -437,14 +436,20 @@ describe("sql", () => {
     expect(String(rows[0].path)).toBe("src/auth.ts");
   });
 
-  it("hybrid table function via {{q}} embed map", async () => {
-    const rows = await runSql(
-      handle,
-      fakeEmbedder,
-      "SELECT path FROM hybrid_search('chunks','content','session','embedding', {{q}}, 10)",
-      { q: "session verification" },
-    );
-    expect(rows.length).toBeGreaterThan(0);
+  it("a hybrid_search statement has no vector column to run against locally any more", async () => {
+    // The local table is always lexical (owner, 2026-09-09): the MCP server
+    // refuses a statement like this outright when there is no account (see
+    // server.ts); runSql itself, called directly here as the CLI's `cx sql`
+    // does, has no account-awareness at all and simply hits the engine's own
+    // error for a column that was never created.
+    await expect(
+      runSql(
+        handle,
+        fakeEmbedder,
+        "SELECT path FROM hybrid_search('chunks','content','session','embedding', {{q}}, 10)",
+        { q: "session verification" },
+      ),
+    ).rejects.toThrow(/embedding/);
   });
 
   it("rejects writes", async () => {

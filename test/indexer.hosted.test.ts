@@ -56,8 +56,8 @@ const SMALL_LINES = 12;
 /** Write tokens the fake stamps on every write response. */
 const WRITE_TOKENS_PER_CALL = 0.5;
 
-const KEY = "inf_test_key_do_not_log";
-const TARGET = { baseUrl: "https://api.example.test", database: "cx", apiKey: KEY };
+export const KEY = "inf_test_key_do_not_log";
+export const TARGET = { baseUrl: "https://api.example.test", database: "cx", apiKey: KEY };
 
 const TEXT_COLUMNS = [
   { name: "path", type: "large_utf8" },
@@ -125,7 +125,7 @@ type Row = Record<string, unknown>;
  * table (path and lang only - enough to answer the sync's recount), driven by
  * op. Every write response carries a write-tokens header. `failOn` makes one
  * op answer 500, to see what a platform failure leaves behind. */
-function fakePlatform(tables: string[] = [], failOn?: string) {
+export function fakePlatform(tables: string[] = [], failOn?: string) {
   const calls: Call[] = [];
   const live = new Set(tables);
   let rows: Row[] = [];
@@ -232,7 +232,7 @@ afterEach(() => {
 // --- the build -------------------------------------------------------------------------------
 
 describe("a build with a platform database (client vectors)", () => {
-  it("builds the local index, then drops, creates and fills the platform table from the same spill", async () => {
+  it("keeps the local index lexical (keyword-only), and fills the platform table's vectors from the same spill", async () => {
     writeBigFixture(root);
     const platform = fakePlatform([TABLE, "other"]);
     const phases: string[] = [];
@@ -249,12 +249,15 @@ describe("a build with a platform database (client vectors)", () => {
     expect(stats.files).toBe(BIG_FILES);
     expect(stats.chunks).toBe(BIG_FILES * CHUNKS_PER_BIG_FILE);
     expect(stats.chunks).toBeGreaterThan(APPEND_BATCH);
-    expect(stats.vectors).toBe("ready");
+    // The local table never gains a vector column any more (owner,
+    // 2026-09-09): "vectors" only ever describes the platform's copy.
+    expect(stats.vectors).toBe("none");
     expect(stats.embedMs).toBeGreaterThanOrEqual(0);
     expect(stats.embedError).toBeUndefined();
     expect(stats.hostedError).toBeUndefined();
-    // The local stages first, the platform load last, from the same vectors.
-    expect(phases).toEqual(["scan", "chunk", "commit-text", "embed", "commit-vectors", "load"]);
+    // No "commit-vectors" phase any more: the embed step feeds the platform
+    // load directly, with nothing local to swap in afterward.
+    expect(phases).toEqual(["scan", "chunk", "commit-text", "embed", "load"]);
 
     // The local index holds every chunk.
     expect(localRowCount(db)).toBe(stats.chunks);
@@ -309,8 +312,8 @@ describe("a build with a platform database (client vectors)", () => {
     const local = readManifest(dir)!;
     expect(local.origin).toBeUndefined();
     expect(local.analyzer).toBe("ascii_lower");
-    expect(local.vectors).toBe("ready");
-    expect(local.embedder).toEqual({ provider: "fake", model: "fake-16d", dim: DIM });
+    expect(local.vectors).toBe("none");
+    expect(local.embedder).toBeUndefined();
     expect(local.chunks).toBe(stats.chunks);
     const remote = readPlatformManifest(dir)!;
     expect(remote.origin).toBe("hosted");
@@ -352,7 +355,7 @@ describe("a build with a platform database (client vectors)", () => {
     const platform = fakePlatform();
     const stats = await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
     expect(stats.chunks).toBe(0);
-    expect(stats.vectors).toBe("ready");
+    expect(stats.vectors).toBe("none"); // local; only the platform's copy embeds
     expect(stats.hosted!.appendCalls).toBe(0);
     expect(localRowCount(db)).toBe(0);
     const created = createBody(platform.calls.find((c) => c.op === "create_table")!);
@@ -364,12 +367,11 @@ describe("a build with a platform database (client vectors)", () => {
     writeSmallFixture(root);
     const platform = fakePlatform();
     const run = await indexRepoStaged({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
-    expect(run.text.vectors).toBe("building");
+    expect(run.text.vectors).toBe("none"); // local; the local table never gets one
     expect(run.text.hosted).toBeUndefined();
     expect(platform.calls).toHaveLength(0); // nothing on the wire yet
-    // The record says a load is under way: a sync in this window waits (on
-    // the local vector stage first, then on the platform load - both read as
-    // "in progress", never as "rebuild").
+    // The provisional platform manifest says a load is under way: a sync in
+    // this window waits on it, reading "in progress", never "rebuild".
     const provisional = readPlatformManifest(dir)!;
     expect(provisional.vectors).toBe("building");
     expect(provisional.analyzer).toBe("ascii_lower");
@@ -378,7 +380,7 @@ describe("a build with a platform database (client vectors)", () => {
     expect(syncInProgress(waiting)).toBe(true);
     expect(platform.calls).toHaveLength(0); // the sync made no platform call either
     const final = await run.completion;
-    expect(final.vectors).toBe("ready");
+    expect(final.vectors).toBe("none"); // local; the platform manifest below is the one that goes "ready"
     expect(final.hosted!.appendCalls).toBe(1);
     expect(readPlatformManifest(dir)!.vectors).toBe("ready");
   });
@@ -405,7 +407,7 @@ describe("a build with a platform database (client vectors)", () => {
 });
 
 describe("a build with a platform database (the platform embeds)", () => {
-  it("embeds the local index locally and declares an embedding column the platform fills, appending JSON rows without it", async () => {
+  it("declares an embedding column the platform fills, appending JSON rows without it; the local index stays keyword-only regardless of an embedder passed in", async () => {
     writeSmallFixture(root);
     const platform = fakePlatform([TABLE]);
     const phases: string[] = [];
@@ -418,8 +420,9 @@ describe("a build with a platform database (the platform embeds)", () => {
       embedProvider: "platform",
       onPhase: (p) => phases.push(p),
     });
-    expect(phases).toEqual(["scan", "chunk", "commit-text", "embed", "commit-vectors", "load"]);
-    expect(stats.vectors).toBe("ready");
+    // No "commit-vectors" phase: the local table never gains a vector column.
+    expect(phases).toEqual(["scan", "chunk", "commit-text", "embed", "load"]);
+    expect(stats.vectors).toBe("none");
     expect(stats.embedMs).toBeGreaterThanOrEqual(0);
 
     const created = createBody(platform.calls.find((c) => c.op === "create_table")!);
@@ -440,8 +443,9 @@ describe("a build with a platform database (the platform embeds)", () => {
     }
     expect(stats.hosted!.appendCalls).toBe(1);
 
-    // The local index has the local model's vectors; the platform table has its own.
-    expect(readManifest(dir)!.embedder).toEqual({ provider: "fake", model: "fake-16d", dim: DIM });
+    // The local manifest never records an embedder any more - only the
+    // platform's, since only the platform's copy ever gets vectors.
+    expect(readManifest(dir)!.embedder).toBeUndefined();
     const remote = readPlatformManifest(dir)!;
     expect(remote.vectors).toBe("ready");
     expect(remote.embedder).toEqual({ provider: "platform", model: "server-side" });
@@ -499,11 +503,11 @@ describe("failures during a build", () => {
     writeSmallFixture(root);
     const platform = fakePlatform([], "create_table");
     const stats = await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder });
-    expect(stats.vectors).toBe("ready");
+    expect(stats.vectors).toBe("none"); // local; never affected by the platform's failure
     expect(stats.hosted).toBeUndefined();
     expect(stats.hostedError).toMatch(/create_table: server returned 500/);
     expect(localRowCount(db)).toBe(3);
-    expect(readManifest(dir)!.vectors).toBe("ready");
+    expect(readManifest(dir)!.vectors).toBe("none");
     expect(readPlatformManifest(dir)).toBeUndefined();
     expect(indexDirFiles(dir).filter((f) => f.startsWith("spill."))).toEqual([]);
   });
@@ -578,7 +582,7 @@ describe("a sync with a platform database", () => {
     // Totals come from each side's own count and land in its manifest.
     expect(outcome.chunks).toBe(stats.chunks - 2 + 2);
     expect(outcome.files).toBe(3);
-    expect(outcome.vectors).toBe("ready");
+    expect(outcome.vectors).toBe("none"); // local; only the platform's copy embeds
     expect(outcome.hosted).toMatchObject({ appendCalls: 1 });
     expect(outcome.hosted!.writeTokens).toBeCloseTo(WRITE_TOKENS_PER_CALL * 2);
     expect(readManifest(dir)!.chunks).toBe(outcome.chunks);
@@ -643,13 +647,16 @@ describe("a sync with a platform database", () => {
       onPhase: (p) => phases.push(p),
     })) as SyncResult;
     expect(outcome.action).toBe("synced");
-    expect(phases).toContain("embed"); // the local index has vectors
+    // The platform embeds server-side under this provider, so nothing here
+    // ever needs a client-side embed: not for the local table (never has
+    // vectors), and not for the platform's (its own model fills the column).
+    expect(phases).not.toContain("embed");
     const append = platform.calls.slice(beforeCalls).find((c) => c.op === "append")!;
     expect(append.headers["content-type"]).toBe("application/json");
     const { data } = append.json as { data: Row[] };
     expect(data).toHaveLength(1);
     expect(data[0]).not.toHaveProperty("embedding");
-    expect(outcome.vectors).toBe("ready");
+    expect(outcome.vectors).toBe("none");
     expect(localRowCount(db)).toBe(3);
   });
 

@@ -1,31 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 //
-// The three doors over a hosted table of another shape, end to end through
-// the MCP server on an in-memory transport against a scripted platform. Three
-// servers are started, each against its own scripted platform, for the three
+// The two doors over a hosted table of another shape, end to end through
+// the MCP server on an in-memory transport against a scripted platform. Two
+// servers are started, each against its own scripted platform, for the two
 // things under test.
 //
-// The first: with CX_REMOTE_SEARCH on and CX_TABLE naming a table that is not
-// the chunks table, find, search, sql and ask answer from that table with the
+// The first: with an account and CX_TABLE naming a table that is not the
+// chunks table, find, search, sql and ask answer from that table with the
 // requests the platform's workers accept (the shapes the live
 // cxbench.chunks_jobs probes returned on 2026-09-11), the tool text describes
 // it, and the shape is read from the platform ONCE, at startup - no call asks
 // the platform what it is about to run against, so each call's requests are
-// its own and nothing else.
+// its own and nothing else. A non-default CX_TABLE always means rows mode
+// while an account is configured - there is no local-doors fallback for it,
+// since a local build would drop and recreate the platform table it is
+// pointed at, and this process never owns that table.
 //
-// The second: the same table, but the platform cannot describe it at startup.
-// The server then registers the rows tools - never the chunks text, which
-// would name columns the table does not have - and every call says why it
-// cannot run.
-//
-// The third: no CX_REMOTE_SEARCH at all, so the doors are local, and the
-// repository has no index. Auto-index is on, yet nothing builds one: a build
-// DROPS and recreates the platform table it is pointed at, and this process
-// did not load that table (CX_TABLE is not the default), so the server refuses
-// by ownership rather than by luck of the column names. In all three, no
-// manifest appears and no drop_table / create_table / append ever reaches the
-// platform.
+// The second: the same table, but the platform cannot describe it at
+// startup. The server then registers the rows tools - never the chunks text,
+// which would name columns the table does not have - and every call says why
+// it cannot run. In both, no manifest appears and no drop_table /
+// create_table / append ever reaches the platform.
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -39,7 +35,6 @@ const JOBS_TABLE = "chunks_jobs";
 // config.ts) and at startup, set before either module is imported - which is
 // why every import of the client's own code below is dynamic.
 process.env.CX_TABLE = JOBS_TABLE;
-process.env.CX_REMOTE_SEARCH = "1";
 process.env.CX_NO_EMBED = "1";
 delete process.env.CX_AUTO_INDEX; // on: the guard needs the path that would build
 delete process.env.CX_NO_RECEIPT;
@@ -419,33 +414,3 @@ describe("a table of another shape the platform could not describe at startup", 
   });
 });
 
-describe("the same table without CX_REMOTE_SEARCH: local doors, no index, auto-index on", () => {
-  let s: Started;
-  beforeAll(async () => {
-    delete process.env.CX_REMOTE_SEARCH;
-    s = await start(undescribable(), "cx-rows-");
-  });
-  afterAll(async () => {
-    await stop(s);
-    process.env.CX_REMOTE_SEARCH = "1";
-  });
-
-  it("refuses to build by ownership - CX_TABLE names a table this process does not own - whatever CX_AUTO_INDEX says", async () => {
-    // Only the card was asked for at startup, as it always was without
-    // CX_REMOTE_SEARCH; the chunks text stands because the doors ARE local.
-    expect(s.startup).toEqual(["table_card"]);
-    for (const [name, args] of [
-      ["find", { query: "rust" }],
-      ["search", { query: "rust" }],
-      ["sql", { query: `SELECT COUNT(*) FROM ${JOBS_TABLE}` }],
-      ["ask", { question: "how many rust roles?" }],
-    ] as Array<[string, Record<string, unknown>]>) {
-      const { ok, value, ops } = await call(s, name, args);
-      expect(ok, name).toBe(false);
-      expect(value, name).toContain(`CX_TABLE=${JOBS_TABLE} names a table this process does not own`);
-      expect(value, name).toContain("build it with `cx index` explicitly");
-      expect(ops, name).toEqual([]);
-    }
-    expectNothingBuilt(s);
-  });
-});

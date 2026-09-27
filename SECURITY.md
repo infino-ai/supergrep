@@ -16,14 +16,13 @@ Which one you are in is your own choice: `install` with no flags for the
 first, `install --platform` (or `--db` by hand) for the second.
 
 **Local-only (`install` with no flags):** everything runs **locally** -
-indexing, storage (`.infino/` in your repo), search, and embedding. The MCP
-server is a local subprocess over stdio - no network listener, no remote
-service, no telemetry. The embedding model (~25 MB) is downloaded once from
-huggingface.co on first use; after that there is no network at query or
-index time. Your code is never sent to any API, and there is no key to
-provision. (Running the server via `npx` also contacts the npm registry;
-install the package for fully offline use.) This mode gives you `find` and
-plain `sql`, nothing else.
+indexing, storage (`.infino/` in your repo), and the two tools it gives you,
+`find` and plain `sql`. The MCP server is a local subprocess over stdio - no
+network listener, no remote service, no telemetry, no embedding model
+downloaded or run. Your code is never sent to any API, and there is no key
+to provision. (Running the server via `npx` also contacts the npm registry;
+install the package for fully offline use.) Semantic ranking (`search`) is
+not part of this mode: it is a platform capability, so it needs an account.
 
 **With an account (`find` and plain `sql` still local; `search`, a `sql`
 statement with a ranked search in it, and `ask` run in the cloud):** the
