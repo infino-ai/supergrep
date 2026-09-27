@@ -148,6 +148,7 @@ import {
   numberRowLines,
   partialIndex,
   CONTENT_COLUMN,
+  FIND_RESULT_CHAR_BUDGET,
   MAX_FIND_CONTEXT,
 } from "../core/searcher.js";
 import { renderFind } from "../core/find-text.js";
@@ -462,6 +463,15 @@ export const FIND_BY_BARE_NAME =
   "Find a definition by its bare name with defines - `refresh(` lists every refresh declared - never by " +
   "a signature you have composed: find matches characters, so a guessed line matches nothing.";
 
+/** The count per project (the first path segment) or per file, as one sql
+ * statement over the unranked complete match: what a model otherwise writes
+ * as `rg | awk | sort | uniq -c` in the shell (the demo, 2026-09-27: "how
+ * does each project cache..." went to a five-stage pipeline for exactly this
+ * table). Told in find's description and again on a flood. */
+export const PER_PROJECT_COUNT =
+  "SELECT split_part(path,'/',1) AS project, count(*) AS lines FROM token_match('chunks','content','<the " +
+  "term>','and') GROUP BY 1 ORDER BY 2 DESC (GROUP BY path for the count per file).";
+
 /** The hint on an empty find, or null when the result needs none: a query
  * with spaces is a phrase or a signature, which one exact line may never
  * hold; with `defines` on and nothing found, the name itself is in doubt.
@@ -476,8 +486,10 @@ export function findHint(query: string, total: number, defines: boolean, withTex
     return (
       `${withText} of ${total} lines carry their text; the rest are listed by path and line after them.${beyond} ` +
       "For a line's text, sql: SELECT start_line, content FROM the table WHERE path = '...' AND start_line <= " +
-      "<line> AND end_line >= <line>. To see less, narrow the terms or add under; to count, sql over " +
-      "token_match. A saved result is not for the shell to read."
+      "<line> AND end_line >= <line>. To see less, narrow the terms or add under; to count per file or per " +
+      "project, sql: " +
+      PER_PROJECT_COUNT +
+      " A saved result is not for the shell to read."
     );
   }
   if (total > 0) return null;
@@ -1267,12 +1279,14 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const batched = async <A extends { query?: string; queries?: string[] }>(
     tool: string,
     args: A,
-    single: (args: A & { query: string }) => Promise<ToolResult>,
+    single: (args: A & { query: string; share?: number }) => Promise<ToolResult>,
   ): Promise<ToolResult> => {
     const { queries, query, ...rest } = args;
     if (queries && queries.length > 0) {
       const t0 = performance.now();
-      const results = await Promise.all(queries.map((q) => single({ ...(rest as A), query: q })));
+      // `share` is how many queries the call carries, so a tool with a text
+      // budget can divide it: a batch is one result and gets one budget.
+      const results = await Promise.all(queries.map((q) => single({ ...(rest as A), query: q, share: queries.length })));
       const each = results.map((r, i) =>
         "isError" in r ? { query: queries[i], error: r.content[0]?.text ?? "failed" } : { query: queries[i], ...(values.get(r) as object) },
       );
@@ -1890,7 +1904,11 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         " The lines around a match - what leads into an error and follows it - come with it when you ask " +
         "for context (like grep -B/-A); no file need be opened for them. " +
         "A wide result lists every matching place: the first lines with their text, the rest by path and " +
-        "line after them; a line's text is one sql statement away, and the per-file counts count them all. Not for a " +
+        "line after them; a line's text is one sql statement away, and the per-file counts count them all. " +
+        "A count per project or per file - which projects use X, how many times each - is one sql statement, " +
+        "never a shell pipeline: " +
+        PER_PROJECT_COUNT +
+        " Not for a " +
         `file you already know - its lines are one sql statement away (SELECT start_line, content FROM ${TABLE} ` +
         "WHERE path = '...' ORDER BY start_line). " +
         // find's hand-off must name the tool that owns the question on this
@@ -1969,7 +1987,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           ),
       },
     },
-    async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, path }) => {
+    async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, path, share }) => {
       let ctx: RepoCtx;
       try {
         ctx = repoFor(path);
@@ -2012,7 +2030,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       if (!autoIndexed) maybeAutoSync(ctx); // a fresh build is already current
       try {
         const t0 = performance.now();
-        const result = await find(handle, query, { ignoreCase, defines, under, limit, context });
+        // A batch shares the one text budget between its queries.
+        const budget = share && share > 1 ? Math.floor(FIND_RESULT_CHAR_BUDGET / share) : undefined;
+        const result = await find(handle, query, { ignoreCase, defines, under, limit, context, budget });
         recordOf(ctx).addLines(TABLE, result.matches);
         const listed = result.matches.length + (result.more ?? []).reduce((n, m) => n + m.lines.length, 0);
         const hint = findHint(query, result.total, Boolean(defines), result.matches.length, listed) ?? undefined;

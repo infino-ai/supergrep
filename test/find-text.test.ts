@@ -94,6 +94,22 @@ describe("find as text", () => {
     expect(lines.slice(-3)).toEqual(["hint: narrow it", "took 1.5 ms", "usage: returned ~1k tokens | 30 matches / 2 files"]);
   });
 
+  it("lists the files with the most matches and sums the rest on one line", () => {
+    const wide: FindResult = {
+      ...base,
+      total: 300,
+      files: 100,
+      byFile: Array.from({ length: 100 }, (_, i) => ({ path: `repo_${i}/f.py`, count: 100 - i })),
+    };
+    const lines = renderFind(wide).split("\n");
+    const at = lines.indexOf("per file (100):");
+    expect(at).toBeGreaterThan(0);
+    expect(lines[at + 1]).toBe("repo_0/f.py: 100");
+    expect(lines[at + 40]).toBe("repo_39/f.py: 61");
+    expect(lines[at + 41]).toBe("... and 60 more files with 1830 lines between them");
+    expect(lines[at + 42]).toBeUndefined();
+  });
+
   it("says when the index left files out, and when nothing matched", () => {
     const partial: FindResult = {
       ...base,

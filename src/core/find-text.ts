@@ -34,6 +34,11 @@ const CONTEXT_SEPARATOR = "-";
 /** The chunker marks a window inside a longer definition as
  * `name (first-last, part)`; the bare name is what a reader wants. */
 const PART_MARKER = /^(.*?) \(\d+-\d+, part\)$/;
+/** Files listed with their counts: the ones with the most matches, then one
+ * line for the rest. A term across a 64-repository corpus matches in
+ * hundreds of files, and the whole list was a third of a flood
+ * (2026-09-27); the totals on the first line count them all either way. */
+const PER_FILE_LISTED = 40;
 
 /** What is written after the result proper: the hint on an empty or wide
  * find, the note that the index was built on this call, the timing, and the
@@ -101,7 +106,12 @@ export function renderFind(result: FindResult, extras: FindTextExtras = {}): str
   if (result.byFile.length > 0) {
     out.push("");
     out.push(`per file (${result.byFile.length}):`);
-    for (const f of result.byFile) out.push(`${f.path}: ${f.count}`);
+    for (const f of result.byFile.slice(0, PER_FILE_LISTED)) out.push(`${f.path}: ${f.count}`);
+    const rest = result.byFile.slice(PER_FILE_LISTED);
+    if (rest.length > 0) {
+      const lines = rest.reduce((n, f) => n + f.count, 0);
+      out.push(`... and ${rest.length} more file${rest.length === 1 ? "" : "s"} with ${lines} line${lines === 1 ? "" : "s"} between them`);
+    }
   }
   const tail: string[] = [];
   if (extras.hint) tail.push(`hint: ${extras.hint}`);

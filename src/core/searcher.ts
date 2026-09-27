@@ -447,6 +447,13 @@ export interface FindOptions {
    * context on the match it has no reason to. Clamped to MAX_FIND_CONTEXT;
    * a window is about sixty lines, so context past its edge is cut there. */
   context?: number;
+  /** Characters of match text this call may carry, when the caller has less
+   * than the whole budget to give it: a batch of finds shares one budget
+   * (FIND_RESULT_CHAR_BUDGET) between its queries, so four queries at once
+   * cannot write four budgets' worth (measured 2026-09-27: 99,000
+   * characters from one batch, over the tool-result cap). Clamped to the
+   * budget; unset is the whole budget. */
+  budget?: number;
 }
 
 /** Most context lines a find carries on each side of a match. */
@@ -739,7 +746,11 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
     .map(([path, count]) => ({ path, count }))
     .sort((a, b) => b.count - a.count || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
-  const { matches, more } = cutFindMatches(rows, limit);
+  const budget =
+    opts.budget !== undefined && Number.isFinite(opts.budget) && opts.budget > 0
+      ? Math.min(Math.floor(opts.budget), FIND_RESULT_CHAR_BUDGET)
+      : FIND_RESULT_CHAR_BUDGET;
+  const { matches, more } = cutFindMatches(rows, limit, budget);
   return {
     query,
     ignoreCase,
