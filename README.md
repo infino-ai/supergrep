@@ -203,7 +203,7 @@ By default a job that fails for good drops its half-built table, so a partial ta
 
 The table is then searchable like any other. `ask` runs over it, and one question can span it and your code at once.
 
-Note: Indexing from object storage needs to be enabled per account. Contact support@infino.ai for more details.
+Note: Hydrate API needs to be enabled per account. Contact support@infino.ai to enable.
 
 ## Learn more
 
