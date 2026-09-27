@@ -30,20 +30,27 @@ const TRANSCRIPT = [
   assistant([{ type: "text", text: "Earlier answer about scoring." }]),
   user("How does a refresh differ from a flush?"),
   assistant([
-    { type: "thinking", thinking: "Two asks: one for refresh, one for flush." },
+    { type: "thinking", thinking: "Two asks: one for refresh, one for flush.", signature: "EosnCkYICx" },
     { type: "text", text: "Let me look at both paths." },
     { type: "tool_use", id: "t1", name: "mcp__code-context__ask", input: { question: "refresh" } },
   ]),
   toolResult("{\"hits\":[]}"),
   assistant([{ type: "text", text: "A refresh opens a new reader; a flush commits." }], { isSidechain: true }),
-  assistant([{ type: "text", text: "Refresh makes documents visible; flush makes them durable." }]),
+  assistant([
+    // An empty thinking block: what the API returns when its text was not asked for.
+    { type: "thinking", thinking: "", signature: "EosnCkYICx" },
+    { type: "text", text: "Refresh makes documents visible; flush makes them durable." },
+  ]),
   "",
 ].join("\n");
 
 describe("the narration read from a transcript", () => {
-  it("takes the text after the last question, in order, and leaves out thinking, tool calls, tool results, earlier turns and subagents", () => {
-    // The thinking block is the model's own and is never lifted out.
-    expect(transcriptNarration(TRANSCRIPT)).toBe("Let me look at both paths.\n\nRefresh makes documents visible; flush makes them durable.");
+  it("takes the thinking summaries and the text after the last question, in order, and leaves out empty thinking, signatures, tool calls, tool results, earlier turns and subagents", () => {
+    const narration = transcriptNarration(TRANSCRIPT);
+    expect(narration).toBe(
+      "Two asks: one for refresh, one for flush.\n\nLet me look at both paths.\n\nRefresh makes documents visible; flush makes them durable.",
+    );
+    expect(narration).not.toContain("EosnCkYICx");
   });
 
   it("is null without a question, without any narration after it, or for a file that is not a transcript", () => {
@@ -132,7 +139,7 @@ describe("the hook's output", () => {
     expect(out.hookSpecificOutput.updatedInput).toEqual({
       question: "How does a refresh differ from a flush?",
       under: "server/",
-      [NARRATION_INPUT]: "Let me look at both paths.\n\nRefresh makes documents visible; flush makes them durable.",
+      [NARRATION_INPUT]: "Two asks: one for refresh, one for flush.\n\nLet me look at both paths.\n\nRefresh makes documents visible; flush makes them durable.",
     });
   });
 
