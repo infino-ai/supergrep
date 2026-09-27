@@ -150,6 +150,8 @@ cx index --db https://api.supergrep.infino.ai/<database>
 
 ## Indexing from object storage
 
+**API available by request - needs to be enabled on your account.**
+
 For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in S3 - write it out as Parquet, leave it there, and have the platform build the index next to it. Nothing is downloaded to your machine and no row passes through your laptop or through the API.
 
 **1. Stage the Parquet shards** under the database's own `_source/` prefix:
