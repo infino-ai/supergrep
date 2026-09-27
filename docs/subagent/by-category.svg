@@ -19,8 +19,8 @@
 <text x='20' y='263' fill='#57606a' font-size='11'>24 answers</text>
 <rect x='350' y='223' width='205' height='18' rx='3' fill='#8b949e'/>
 <text x='561' y='237' fill='#24292f' font-size='12' font-weight='600'>15 of 24</text>
-<rect x='350' y='245' width='150' height='18' rx='3' fill='#2f81f7'/>
-<text x='506' y='259' fill='#24292f' font-size='12' font-weight='600'>11 of 24</text>
+<rect x='350' y='245' width='205' height='18' rx='3' fill='#2f81f7'/>
+<text x='561' y='259' fill='#24292f' font-size='12' font-weight='600'>15 of 24</text>
 <text x='20' y='305' fill='#24292f' font-size='13' font-weight='600'>where is this symbol (pinpoint)</text>
 <text x='20' y='319' fill='#57606a' font-size='11'>32 answers</text>
 <rect x='350' y='279' width='256' height='18' rx='3' fill='#8b949e'/>
