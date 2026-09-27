@@ -150,8 +150,6 @@ cx index --db https://api.supergrep.infino.ai/<database>
 
 ## Indexing from object storage
 
-**Indexing from object storage needs to be enabled per account.** Contact support@infino.ai if you need it.
-
 For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in S3 - write it out as Parquet, leave it there, and have the platform build the index next to it. Nothing is downloaded to your machine and no row passes through your laptop or through the API.
 
 **1. Stage the Parquet shards** under the database's own `_source/` prefix:
@@ -204,6 +202,8 @@ curl -sS -X DELETE "https://api.supergrep.infino.ai/v1/hydrate/<database>?table=
 By default a job that fails for good drops its half-built table, so a partial table is never served; `"on_failure": "keep"` keeps what was committed.
 
 The table is then searchable like any other. `ask` runs over it, and one question can span it and your code at once.
+
+Note: Indexing from object storage needs to be enabled per account. Contact support@infino.ai for more details.
 
 ## Learn more
 
