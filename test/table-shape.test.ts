@@ -67,6 +67,24 @@ describe("tableShapeFrom", () => {
     expect(shape.primaryText).toBe("content");
   });
 
+  it("searches the column the table's configuration names when it is indexed, and guesses otherwise", () => {
+    // Every text column indexed, as the Wikipedia table is loaded since
+    // 2026-09-27: the guess would land on `abstract` (a hinted name) and
+    // every search would see the lede; the configuration names the body.
+    const fields: SchemaField[] = [
+      { name: "name", nullable: true, type: "utf8" },
+      { name: "abstract", nullable: true, type: "large_utf8" },
+      { name: "sections", nullable: true, type: "large_utf8" },
+      { name: "references", nullable: true, type: "large_utf8" },
+    ];
+    const card = { schema: [{ name: "abstract", index: "fts" }, { name: "sections", index: "fts" }, { name: "references", index: "fts" }] };
+    expect(tableShapeFrom("chunks_wikipedia", fields, card).primaryText).toBe("abstract");
+    expect(tableShapeFrom("chunks_wikipedia", fields, card, "sections").primaryText).toBe("sections");
+    // A name that is not an indexed text column is ignored: the guess stands.
+    expect(tableShapeFrom("chunks_wikipedia", fields, card, "name").primaryText).toBe("abstract");
+    expect(tableShapeFrom("chunks_wikipedia", fields, card, "nowhere").primaryText).toBe("abstract");
+  });
+
   it("reads the jobs table from its schema alone: the embedded column, the LargeUtf8 text, the key", () => {
     expect(JOBS.isChunks).toBe(false);
     expect(JOBS.vectorColumn).toBe("emb");

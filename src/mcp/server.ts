@@ -58,6 +58,7 @@ import {
   indexDir,
   resolveRoot,
   TABLE,
+  TEXT_COLUMN,
   DEFAULT_TABLE,
   DEFAULT_CAPS,
   DEFAULT_SEARCH_K,
@@ -429,6 +430,31 @@ export const SWEEP_TO_A_TOOL =
 
 /** The most queries one find, search or sql call carries. */
 export const BATCH_MAX = 16;
+
+/** How many of a batch's queries run at once. A batch ran every query
+ * together: sixteen LIKE scans of a 468,749-row table sent as one call
+ * (2026-09-27, the Wikipedia corpus) hit one datanode at once, the ones
+ * that finished took 12-19 s against 1.4 s alone, and twelve of the
+ * sixteen ran past the 60 s budget; the same scans three at a time took
+ * 3 s each. Four keeps a batch of searches fast and keeps a batch of
+ * scans from taking the datanode down with them. */
+export const BATCH_CONCURRENCY = 4;
+
+/** `items` mapped through `run`, at most `limit` in flight, results in the
+ * items' order; a rejection is the caller's to catch inside `run`. */
+async function mapWithLimit<T, R>(items: readonly T[], limit: number, run: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await run(items[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
 
 /** Independent calls in one reply. Measured 2026-09-26 on the live demo: a
  * caller issued 25 index calls one per turn, each turn re-sending the whole
@@ -1295,7 +1321,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       const t0 = performance.now();
       // `share` is how many queries the call carries, so a tool with a text
       // budget can divide it: a batch is one result and gets one budget.
-      const results = await Promise.all(queries.map((q) => single({ ...(rest as A), query: q, share: queries.length })));
+      const results = await mapWithLimit(queries, BATCH_CONCURRENCY, (q) => single({ ...(rest as A), query: q, share: queries.length }));
       const each = results.map((r, i) =>
         "isError" in r ? { query: queries[i], error: r.content[0]?.text ?? "failed" } : { query: queries[i], ...(values.get(r) as object) },
       );
@@ -1451,7 +1477,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const siblingNames = hosted ? siblingTables() : [];
   if (hosted && remoteSearch && TABLE !== DEFAULT_TABLE) {
     try {
-      const shape = await resolveTableShape(registry.get().hosted!, TABLE, CARD_TIER, noCard);
+      const shape = await resolveTableShape(registry.get().hosted!, TABLE, CARD_TIER, noCard, TEXT_COLUMN);
       card = shape.card;
       if (!shape.isChunks) mode = { kind: "rows", shape };
     } catch (err) {

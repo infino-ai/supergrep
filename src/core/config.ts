@@ -365,6 +365,13 @@ export const DEFAULT_TABLE = "chunks";
  * an explicit `cx index` does. */
 export const TABLE = process.env.CX_TABLE?.trim() || DEFAULT_TABLE;
 
+/** The column the doors search on the hosted table, when whoever configured
+ * the table says so (CX_TEXT_COLUMN); unset, the column is chosen from the
+ * table's shape (`tableShapeFrom`). Set beside CX_TABLE for a table with
+ * several indexed text columns, so the choice is a decision on record and
+ * not a guess from the columns' names. */
+export const TEXT_COLUMN = process.env.CX_TEXT_COLUMN?.trim() || undefined;
+
 /** Manifest file inside the index dir - the product's own record of what the
  * local index holds (the engine ignores foreign files in its catalog root). */
 export const MANIFEST_NAME = "codecontext.json";

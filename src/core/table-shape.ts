@@ -146,8 +146,15 @@ function renderType(field: SchemaField): string {
 }
 
 /** The shape of `table` from its schema descriptors and, when it has one,
- * its card. Pure, so a test can hand it any table. */
-export function tableShapeFrom(table: string, fields: SchemaField[], card?: RowRecord | null): TableShape {
+ * its card. `searched` names the column the doors search, set by whoever
+ * configured the table (CX_TEXT_COLUMN): it wins over the name guess when
+ * it is one of the table's indexed text columns, and is ignored with the
+ * guess standing when it is not. Before it, the searched column was guessed
+ * from the columns' names alone, and a table loaded for the demo was
+ * indexed on its body only so that the guess would land there - which left
+ * every other text column unindexed and scanned with LIKE (2026-09-27).
+ * Pure, so a test can hand it any table. */
+export function tableShapeFrom(table: string, fields: SchemaField[], card?: RowRecord | null, searched?: string): TableShape {
   const cardColumns = Array.isArray(card?.schema) ? (card.schema as CardColumn[]).filter((c) => typeof c?.name === "string") : [];
   const roles = new Map(cardColumns.map((c) => [c.name, c.index]));
   const names = new Set(fields.map((f) => f.name));
@@ -173,6 +180,7 @@ export function tableShapeFrom(table: string, fields: SchemaField[], card?: RowR
   // `title` and indexes `description_html`), and a search sent against the
   // unindexed one is refused by the engine.
   const primaryText =
+    (searched && textColumns.includes(searched) ? searched : undefined) ??
     textColumns.find((name) => TEXT_NAME_HINT.test(name)) ??
     vectorSource.find((name) => textColumns.includes(name)) ??
     textColumns[0] ??
@@ -224,6 +232,7 @@ export async function resolveTableShape(
   table: string,
   cardTier?: string,
   onNoCard?: (err: unknown) => void,
+  searched?: string,
 ): Promise<TableShape> {
   const fields = (await hosted.schema(table)) as unknown;
   if (!Array.isArray(fields)) throw new Error(`schema of ${table}: expected the platform's column descriptors, got ${typeof fields}`);
@@ -238,7 +247,11 @@ export async function resolveTableShape(
     // no card yet: the schema alone stands
     onNoCard?.(err);
   }
-  return tableShapeFrom(table, fields as SchemaField[], card);
+  const shape = tableShapeFrom(table, fields as SchemaField[], card, searched);
+  if (searched && shape.primaryText !== searched) {
+    console.error(`CX_TEXT_COLUMN names ${searched}, which is not an indexed text column of ${table}; searching ${shape.primaryText || "nothing"}`);
+  }
+  return shape;
 }
 
 // --- rows as hits -----------------------------------------------------------------
