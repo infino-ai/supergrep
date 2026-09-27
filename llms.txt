@@ -20,13 +20,16 @@ copy of the data. Try it live at https://infino.ai/supergrep.
 
 ## Using it
 
-- Install: clone the repository (`git clone https://github.com/infino-ai/supergrep`,
-  `npm ci && npm run build`), then in the directory to index run
-  `node /path/to/supergrep/dist/cli.js install --platform https://host`.
-  That indexes the directory, gets a free account with one consent prompt
-  (key at `~/.infino/key`, mode 600), registers a database and writes the
-  MCP entry. `install` with no flags is the local-only form: `find` and
-  plain `sql`, no account, nothing uploaded.
+- Install: the Claude Code plugin, once per machine -
+  `claude plugin marketplace add infino-ai/supergrep` then
+  `claude plugin install code-context@infino-ai`. Any directory a session
+  opens is indexed on its first question; `find`, `sql` and `read` need no
+  account and upload nothing. `search` and `ask` need one: the person runs
+  `npx -y @infino-ai/code-context login --platform https://host` once, in a
+  terminal - it asks, creates a free account (key at `~/.infino/key`, mode
+  600), and every directory after that has all four tools, each in its own
+  database, uploaded the first time `search` or `ask` is used in it. `cx
+  install` writes a per-repository `.mcp.json` entry for other clients.
 - MCP tools (stdio): `find` (every line containing an exact string, written
   like `grep -n` with per-file counts; complete and unranked), `search` (one
   ranked pass fusing exact terms with meaning; hits carry the code and their

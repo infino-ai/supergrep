@@ -150,6 +150,131 @@ describe("cx login --logout / --show", () => {
   });
 });
 
+describe("cx login: agreeing to uploads", () => {
+  it("records the agreement with --yes, so the plugin's server can serve every directory", async () => {
+    const { impl } = withDatabases();
+    const result = await loginCmd({ db: PLATFORM, yes: true }, { stdin: () => KEY, fetch: impl });
+    expect(result.uploadAgreed).toBe(true);
+    expect(readStoredAccount()?.uploadConsentAt).toBeDefined();
+  });
+
+  it("asks at the terminal when there is one, in machine-wide words", async () => {
+    const { impl } = withDatabases();
+    const asked: string[] = [];
+    const result = await loginCmd(
+      { db: PLATFORM },
+      { stdin: () => KEY, fetch: impl, consent: { interactive: true, ask: async (q) => (asked.push(q), "y") } },
+    );
+    expect(result.uploadAgreed).toBe(true);
+    expect(asked[0]).toMatch(/directories you use search and ask in/);
+    expect(readStoredAccount()?.uploadConsentAt).toBeDefined();
+  });
+
+  it("stores the key and leaves the agreement off when it cannot ask, saying how to agree", async () => {
+    const { impl } = withDatabases();
+    const result = await loginCmd({ db: PLATFORM }, { stdin: () => KEY, fetch: impl, consent: { interactive: false } });
+    expect(result.action).toBe("stored");
+    expect(result.uploadAgreed).toBe(false);
+    expect(readStoredKey()).toBe(KEY);
+    expect(readStoredAccount()?.uploadConsentAt).toBeUndefined();
+  });
+
+  it("--yes alone agrees for the account already stored, and stores nothing else", async () => {
+    const { impl, calls } = withDatabases();
+    await loginCmd({ db: PLATFORM }, { stdin: () => KEY, fetch: impl, consent: { interactive: false } });
+    const result = await loginCmd({ yes: true }, { stdin: () => "", fetch: impl });
+    expect(result.action).toBe("agreed");
+    expect(readStoredAccount()?.uploadConsentAt).toBeDefined();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("--yes alone with no account says to sign in", async () => {
+    await expect(loginCmd({ yes: true }, { stdin: () => "" })).rejects.toThrow(/it has none/);
+  });
+
+  it("keeps the agreement across a key rotation on the same platform, and drops it for another", async () => {
+    const { impl } = withDatabases();
+    await loginCmd({ db: PLATFORM, yes: true }, { stdin: () => KEY, fetch: impl });
+    const rotated = await loginCmd({ db: PLATFORM }, { stdin: () => `${KEY}-2`, fetch: impl, consent: { interactive: false } });
+    expect(rotated.uploadAgreed).toBe(true);
+    const elsewhere = await loginCmd({ db: "https://other.example" }, { stdin: () => KEY, fetch: impl, consent: { interactive: false } });
+    expect(elsewhere.uploadAgreed).toBe(false);
+  });
+});
+
+describe("cx login --platform: a free account", () => {
+  /** A platform that grants a trial, recording what it was asked. */
+  const granting = () => {
+    const calls: Array<{ url: string; body: string }> = [];
+    const impl = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), body: String(init?.body ?? "") });
+      return new Response(JSON.stringify({ api_key: KEY, database: "here", credit_cents: 500, console_url: "https://console.example" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    return { impl, calls };
+  };
+
+  it("asks first - an account and the uploads in one question - then stores the key, agreed", async () => {
+    const { impl, calls } = granting();
+    const asked: string[] = [];
+    const result = await loginCmd(
+      { platform: PLATFORM },
+      { fetch: impl, consent: { interactive: true, ask: async (q) => (asked.push(q), "y") } },
+    );
+    expect(asked[0]).toMatch(/Create a free Infino account and upload the contents of the directories/);
+    expect(calls).toEqual([{ url: `${PLATFORM}/v1/trial`, body: expect.stringContaining('"database"') }]);
+    expect(result).toMatchObject({ action: "created", baseUrl: PLATFORM, databases: ["here"], uploadAgreed: true });
+    expect(readStoredKey()).toBe(KEY);
+    expect(statSync(keyFilePath()).mode & 0o777).toBe(0o600);
+    expect(readStoredAccount()).toMatchObject({ baseUrl: PLATFORM, consoleUrl: "https://console.example" });
+    expect(readStoredAccount()?.uploadConsentAt).toBeDefined();
+  });
+
+  it("creates nothing on a no", async () => {
+    const { impl, calls } = granting();
+    const result = await loginCmd({ platform: PLATFORM }, { fetch: impl, consent: { interactive: true, ask: async () => "" } });
+    expect(result.action).toBe("declined");
+    expect(calls).toHaveLength(0);
+    expect(existsSync(keyFilePath())).toBe(false);
+  });
+
+  it("creates nothing with nobody at the terminal, and --yes does not stand in for them", async () => {
+    const { impl, calls } = granting();
+    await expect(loginCmd({ platform: PLATFORM, yes: true }, { fetch: impl, consent: { interactive: false } })).rejects.toThrow(/no terminal/);
+    expect(calls).toHaveLength(0);
+    expect(existsSync(keyFilePath())).toBe(false);
+  });
+
+  it("takes the platform from CX_PLATFORM_URL when the flag names none", async () => {
+    process.env.CX_PLATFORM_URL = PLATFORM;
+    try {
+      const { impl, calls } = granting();
+      await loginCmd({ platform: true }, { fetch: impl, consent: { interactive: true, ask: async () => "yes" } });
+      expect(calls[0]?.url).toBe(`${PLATFORM}/v1/trial`);
+    } finally {
+      delete process.env.CX_PLATFORM_URL;
+    }
+  });
+
+  it("refuses to make a second account for a machine that has one", async () => {
+    const { impl } = withDatabases();
+    await loginCmd({ db: PLATFORM, yes: true }, { stdin: () => KEY, fetch: impl });
+    const { impl: trial, calls } = granting();
+    await expect(loginCmd({ platform: "https://other.example" }, { fetch: trial, consent: { interactive: true, ask: async () => "y" } })).rejects.toThrow(
+      /already signed in/,
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it("says when a platform offers no trial, or this network has had one", async () => {
+    const consent = { interactive: true, ask: async () => "y" };
+    const { impl: none } = answering(501, JSON.stringify({ message: "no trial" }));
+    await expect(loginCmd({ platform: PLATFORM }, { fetch: none, consent })).rejects.toThrow(/does not offer free accounts/);
+    const { impl: had } = answering(409, JSON.stringify({ message: "already" }));
+    await expect(loginCmd({ platform: PLATFORM }, { fetch: had, consent })).rejects.toThrow(/already used its free trial/);
+    expect(existsSync(keyFilePath())).toBe(false);
+  });
+});
+
 describe("the platform URL", () => {
   it("accepts an origin, and a database URL whose name it ignores", () => {
     expect(baseUrlFrom("https://platform.example")).toBe(PLATFORM);

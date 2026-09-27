@@ -14,13 +14,19 @@
 // has the local index only - a platform database holds one chunks table, and
 // a second repo's chunks in it would be indistinguishable from the first's.
 //
+// When the platform came from the stored ACCOUNT instead (no --db: the Claude
+// Code plugin's one entry for every project), every root gets a client of its
+// own, on its own database named from its directory - the database `cx
+// install` would have registered there. One server started anywhere then
+// serves every directory a session opens, each in its own table.
+//
 // The connection and filesystem-stat calls are injected so this unit tests
 // without a real engine or on-disk repo.
 
 import { statSync } from "node:fs";
 import { join } from "node:path";
 import type { Connection } from "@infino-ai/infino";
-import { indexDir, resolveRoot, INDEX_DIR_NAME } from "../core/config.js";
+import { accountTargetFor, indexDir, resolveRoot, INDEX_DIR_NAME, type AccountSettings } from "../core/config.js";
 import { hostedDbFor, newHostedMemo, type HostedMemo } from "../core/context.js";
 import type { HostedDb, HostedOptions, HostedTarget } from "../core/hosted.js";
 
@@ -66,6 +72,10 @@ export interface RepoRegistryOptions {
   /** The platform database of the default root, when one is configured.
    * `options` tune the client (tests inject a fetch through it). */
   hosted?: { target: HostedTarget; options?: HostedOptions };
+  /** The stored account the platform came from, when no `--db` named a
+   * database: then every root, not only the default, gets its own client on
+   * its own database (`accountTargetFor`). */
+  account?: AccountSettings;
 }
 
 const DEFAULT_MAX_OPEN = 8;
@@ -77,6 +87,7 @@ export class RepoRegistry {
   private readonly stat: (path: string) => StatLike;
   private readonly maxOpen: number;
   private readonly hosted?: { target: HostedTarget; options?: HostedOptions };
+  private readonly account?: AccountSettings;
 
   constructor(defaultRoot: string, opts: RepoRegistryOptions) {
     this.defaultRoot = defaultRoot;
@@ -84,6 +95,7 @@ export class RepoRegistry {
     this.stat = opts.stat ?? statSync;
     this.maxOpen = opts.maxOpen ?? DEFAULT_MAX_OPEN;
     this.hosted = opts.hosted;
+    this.account = opts.account;
   }
 
   /** Index directory for a root. CX_INDEX_DIR is a single-repo override that
@@ -93,11 +105,15 @@ export class RepoRegistry {
     return root === this.defaultRoot ? indexDir(root) : join(root, INDEX_DIR_NAME);
   }
 
-  /** Whether a root's context carries the platform client: only the default
-   * root's, and only when a database is configured - the server was started
-   * against one database, which holds one chunks table. */
-  private hasPlatform(root: string): boolean {
-    return this.hosted !== undefined && root === this.defaultRoot;
+  /** The platform target a root's context carries, or null for none: the
+   * configured database for the default root alone when `--db` named one -
+   * the server was started against one database, which holds one chunks
+   * table - and, on the stored account, the root's own database for every
+   * root. */
+  private platformFor(root: string): HostedTarget | null {
+    if (this.hosted === undefined) return null;
+    if (root === this.defaultRoot) return this.hosted.target;
+    return this.account ? accountTargetFor(this.account, root) : null;
   }
 
   /** Roots currently held open, most-recently-used last. Test/introspection. */
@@ -125,14 +141,13 @@ export class RepoRegistry {
     }
     if (!stat.isDirectory()) throw new Error(`not a directory: ${root}`);
     const dir = this.dirFor(root);
+    const platform = this.platformFor(root);
     const ctx: RepoCtx = {
       root,
       dir,
       target: dir,
       db: this.connect(dir),
-      ...(this.hasPlatform(root)
-        ? { hosted: hostedDbFor(this.hosted!.target, this.hosted!.options), hostedMemo: newHostedMemo() }
-        : {}),
+      ...(platform ? { hosted: hostedDbFor(platform, this.hosted!.options), hostedMemo: newHostedMemo() } : {}),
       lastSyncCheck: 0,
       mutation: null,
       completion: null,

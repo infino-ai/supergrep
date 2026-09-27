@@ -65,6 +65,7 @@ import {
   DEFAULT_FIND_LIMIT,
   MAX_FIND_LIMIT,
   hostedTarget,
+  hostedAccount,
   hostedLabel,
   hostedAnalyzer,
   embedProvider,
@@ -80,6 +81,7 @@ import {
   subagentMaxWallSecs,
 } from "../core/config.js";
 import { keyFilePath, readStoredAccount } from "../core/keystore.js";
+import { createDatabase } from "../core/account-api.js";
 import { runRetrievalAgent } from "../core/retrieval-agent.js";
 import { answerDisplayMode, hookDeliveryText, relayDeliveryText, type AnswerDisplay } from "../core/answer-display.js";
 import { readManifest, readPlatformManifest, type Manifest } from "../core/manifest.js";
@@ -96,6 +98,32 @@ export function outOfCreditSteps(): string {
     `local index and cost nothing - but ask needs a balance. To restore it, the ` +
     `account's owner adds their billing details and a card to this same account at ${where} ` +
     `(the key on this machine keeps working and nothing needs reinstalling), then retries`
+  );
+}
+
+/** The platform a first sign-in asks for a free account, when the deployment
+ * that installed this server named one (the plugin's MCP entry carries it).
+ * Nothing in the source names a host: which platform a published client
+ * signs people up to is a release decision (see `install`). */
+const PLATFORM_URL_ENV = "CX_PLATFORM_URL";
+
+/** What a server with no account says, in its instructions and on the calls
+ * that need one: which tools are off, which are on, and the one command that
+ * turns the rest on - run by the person, in a terminal. Said that way on
+ * purpose. The step creates an account and agrees to file contents leaving
+ * the machine, and the agent must never be the one who agrees (the rule is
+ * core/consent.ts's): so the model is told whose command it is and told not
+ * to run it, and the command asks the person itself before it does anything.
+ * No key is ever typed into a conversation. */
+export function noAccountSteps(): string {
+  const platform = process.env[PLATFORM_URL_ENV]?.trim() || "<the platform's URL>";
+  return (
+    "search and ask are off on this server: this machine has no Infino account, or has not agreed to uploads. " +
+    "find, sql and read run on the local index and need nothing. To turn search and ask on, the person - not " +
+    `you - runs once, in a terminal: \`npx -y @infino-ai/code-context login --platform ${platform}\`. It asks ` +
+    "them first, creates a free account (no email, no card), stores its key on this machine, and every " +
+    "directory they open after that has all four tools once the session restarts. Do not run that command " +
+    "yourself, and never ask for or paste a key"
   );
 }
 
@@ -978,6 +1006,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // startup, not on the first tool call. The key stays inside the target;
   // only `hostedLabel` ever reaches a log line.
   const hosted = hostedTarget();
+  // The account the target came from, when no --db named a database: then
+  // every repository a session opens gets its own database on it (see
+  // RepoRegistry), registered here before its first build.
+  const account = hostedAccount();
 
   const noEmbed = Boolean(process.env.CX_NO_EMBED);
   // The local model exists for exactly one job now: `--embed-provider local`
@@ -998,6 +1030,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const registry = new RepoRegistry(defaultRoot, {
     connect,
     ...(hosted ? { hosted: { target: hosted, ...(hostedOptions ? { options: hostedOptions } : {}) } } : {}),
+    ...(account ? { account } : {}),
   });
   const repoFor = (requested?: string): RepoCtx => registry.get(requested);
 
@@ -1103,12 +1136,32 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     ctx.completion = held;
   };
 
+  /** On the stored account, the repository's database has to exist before
+   * its table can: registered here once per repository for the server's
+   * life, as `cx install` registers it - a name the account already holds is
+   * the outcome wanted, not a failure. Nothing to do when `--db` named the
+   * database: it was registered by whoever named it. A refusal (a key the
+   * platform will not take, an account that cannot spend) fails the build
+   * with the platform's words and the fix, and the next query tries again. */
+  const registered = new Set<string>();
+  const ensureDatabase = async (ctx: RepoCtx): Promise<void> => {
+    if (!account || !ctx.hosted || registered.has(ctx.root)) return;
+    const database = ctx.hosted.target.database;
+    try {
+      await createDatabase(account, database, { fetch: hostedOptions?.fetch });
+    } catch (err) {
+      throw new Error(`could not register the database ${database} on ${account.baseUrl} for ${ctx.root}: ${(err as Error).message}${refusalHint(err)}`);
+    }
+    registered.add(ctx.root);
+  };
+
   /** Acquire the repo's mutation lock and run a staged build; resolves at
    * keyword-live with stage-1 stats, or null if a build is already in flight.
    * The build's completion (vectors, then the platform table when one is
    * configured) runs on in the background, held on `ctx.completion`. */
   const buildIndex = (ctx: RepoCtx): Promise<IndexStats> | null =>
     exclusive(ctx, async () => {
+      await ensureDatabase(ctx);
       const emb = buildEmbedder();
       const run = await indexRepoStaged({ ...indexTargets(ctx), embedder: emb });
       backfill(ctx, run, emb);
@@ -1116,6 +1169,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     });
 
   const doSync = async (ctx: RepoCtx): Promise<SyncOutcome> => {
+    await ensureDatabase(ctx);
     const outcome = await syncRepo({ ...indexTargets(ctx), embedder: getEmbedder() });
     // A rebuild for every reason but "a build is already in flight" (the
     // vector stage, or the platform load - a second build would race it).
@@ -1630,7 +1684,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         : mode.kind === "unresolved"
         ? unresolvedInstructions(TABLE, mode.cause, agentTools)
         : logIndex
-        ? logIndexInstructions(agentTools, startManifest?.files ?? 0, startManifest?.chunks ?? 0)
+        ? logIndexInstructions(agentTools, startManifest?.files ?? 0, startManifest?.chunks ?? 0) + (platformTools ? "" : ` ${noAccountSteps()}.`)
         : // The first move was ls and cat CLAUDE.md, every run, before any of
           // these tools (the demo, 2026-09-24): the model looks around a
           // checkout it has been told nothing about. It has been told: the
@@ -1711,7 +1765,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         " Read files with read, every path in one call; Claude's own Read only for a hit marked truncated. " +
         "Every tool takes an optional 'path' (an absolute repo root) to target another repository. " +
         "A 'partial' marker means files over the index cap were left out, so a missing match is not " +
-        "proof of absence.") +
+        "proof of absence." +
+        // Without an account the two platform tools are not registered, and
+        // a model that finds them missing needs to know why and what the
+        // person can do - once, from a terminal - rather than conclude the
+        // server is broken or go looking for a key.
+        (platformTools ? "" : ` ${noAccountSteps()}.`)) +
         (apiTools ? apiToolsInstruction(Boolean(rows)) : "") +
         (siblingNames.length > 0 ? siblingsInstruction(TABLE, siblingNames, agentTools) : ""),
     },
@@ -2160,7 +2219,8 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       if (!ctx.hosted && embedsAQuery(query)) {
         return fail(
           "this statement embeds a query (hybrid_search/vector_search), which needs an account - " +
-            "there is no local vector index. Use bm25_search or token_match for keyword ranking instead.",
+            "there is no local vector index. Use bm25_search or token_match for keyword ranking instead. " +
+            `${noAccountSteps()}.`,
         );
       }
       const ensured = await localIndex(ctx);

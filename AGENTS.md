@@ -15,10 +15,12 @@ questions about a codebase without crawling files into the context window.
 `search`, a `sql` statement with a ranked search inside it, and `ask` run in
 the Infino cloud, over the same index's platform copy, where the embeddings
 are computed: a bearer key authenticates the connection, and the platform's
-own model embeds that copy by default. `install` with no flags gives a
-local-only entry with no account, no key, and nothing uploaded - `find` and
-plain `sql` alone answer questions. `install --platform` sets up the account
-and the cloud tools with it. It is built on the
+own model embeds that copy by default. Without an account the server is
+`find`, plain `sql` and `read`, with no key and nothing uploaded. `cx login
+--platform` gets the account (it asks the person first - the agent never
+agrees on their behalf), and with one stored the server serves every
+directory a session opens, each in its own database, so the Claude Code
+plugin needs nothing per project. It is built on the
 [infino](https://github.com/infino-ai/infino) engine, which runs SQL,
 full-text, and vector search over one copy of the data. The package, the CLI
 and the MCP server are still named `code-context`; SuperGrep is the product.

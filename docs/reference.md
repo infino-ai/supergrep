@@ -47,14 +47,19 @@ server-side, so agents never handle raw vectors.
 
 ### One index in two places
 
-`install --platform`, or `cx index --db` by hand, builds the local index and
-loads the same chunks into a platform database; every sync after it (the
-explicit `cx index`, or the server's auto-sync as queries arrive) applies the
-same diff to both, so they never drift. `find` and plain `sql` read the local
-copy; `search`, a `sql` with a ranked search in it, and `ask` run on the
-platform copy, where every embedding is computed. Without an account the
-server is the local keyword index alone, and nothing leaves the machine: no
-account, no key, no telemetry.
+With the machine signed in (`cx login`), the first `search` or `ask` in a
+directory builds the local index and loads the same chunks into that
+directory's own database on the account; `cx index --db` does it by hand for
+a database you name. Every sync after it (the explicit `cx index`, or the
+server's auto-sync as queries arrive) applies the same diff to both, so they
+never drift. `find` and plain `sql` read the local copy; `search`, a `sql`
+with a ranked search in it, and `ask` run on the platform copy, where every
+embedding is computed. Without an account the server is the local keyword
+index alone, and nothing leaves the machine: no account, no key, no
+telemetry. A stored key alone is not an account here: the person has to have
+agreed to the upload (`cx login --platform` asks; `cx login --yes` for a key
+you already had), and until then the server says which tools are off and
+what turns them on.
 
 The keyword index commits first - about a second on a 3,000-chunk
 repository - so `find` works within seconds; the platform's vectors backfill
@@ -69,7 +74,7 @@ that touch it, `cx index` and `cx mcp`:
 
 | flag | default | purpose |
 |---|---|---|
-| `--db <url>` | (local index only) | the platform database, `https://host/<database>` (plain `http://` only for localhost) |
+| `--db <url>` | the directory's own database on the stored account; the local index alone without one | the platform database, `https://host/<database>` (plain `http://` only for localhost) |
 | `--api-key-file <path>` | `INFINO_API_KEY` | file holding the bearer key. The key is never an argument, since a process's arguments are visible to every other process on the machine; the environment variable is the one alternative |
 | `--embed-provider <platform\|local>` | `platform` | who fills the platform table's vectors: the platform's own model, or this machine's (vectors shipped with the rows) |
 | `--analyzer <ascii_lower\|standard>` | the table's own; `ascii_lower` for a first load | `cx index` only: the full-text analyzer the platform table is created with. `ascii_lower` splits code identifiers on `.`, `_`, and `::`. Without the flag a rebuild keeps the analyzer the table has; naming a different one rebuilds it |
@@ -108,9 +113,11 @@ model's side is on your own model bill as usual.
 ## CLI
 
 ```
-cx install --platform <url>  index this directory, get a free account, register its database, write the MCP entry
-cx install                   the local-only entry (find and plain sql; no account, nothing uploaded)
-cx login --db <url> < key    store this machine's account once (key at mode 600)
+cx login --platform <url>    get a free account (asks first), store its key at mode 600: every directory has all four tools
+cx login --db <url> --yes < key   store a key you already have, agreed to uploads
+cx login --show | --logout   what is stored / forget the key
+cx install                   write this repository's MCP entry into .mcp.json, for clients other than the plugin
+                             (--platform <url> signs up too; --local-only: find and plain sql, nothing uploaded)
 cx index [path]           sync the index (incremental; --full rebuilds, --watch follows edits)
 cx find <text>            every line containing the exact text, path:line  (-i, -c per-file counts, --limit)
 cx search <query>         exact terms + meaning, one ranked pass           (-k hits, --lines for the matching lines only)
@@ -138,8 +145,10 @@ their standard server config. Point the server at a repository with
 not the repository.
 
 The npm release (`npx -y @infino-ai/code-context mcp`) and the Claude Code
-plugin ship the local tools alone; the platform tools come with the
-repository, built as the [README](../README.md#install) shows.
+plugin are the same server: with no `--db` it serves the directory it is
+started in on the stored account, once `cx login` has stored one, and every
+`path` a call names on the same account, each directory in its own database.
+`--db` pins one database instead, for a table loaded some other way.
 
 ## What it is, and what it isn't
 

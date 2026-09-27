@@ -33,6 +33,7 @@ import {
   DEFAULT_CAPS,
   configureHosted,
   hostedSettingsFromFlags,
+  resolveRoot,
   type HostedFlags,
 } from "./core/config.js";
 
@@ -52,9 +53,13 @@ function hostedOptions(command: Command): Command {
     .option("--cold-start-secs <n>", `how long to wait out a cold database or a starting embedder (default ${DEFAULT_DB_COLD_START_SECS})`);
 }
 
-/** Resolve and install the platform settings from a command's parsed flags. */
-function applyHosted(flags: HostedFlags): void {
-  configureHosted(hostedSettingsFromFlags(flags));
+/** Resolve and install the platform settings from a command's parsed flags.
+ * `root` is the repository the command runs for: without `--db`, the stored
+ * account serves that repository's own database, once the person at this
+ * machine has agreed to uploads (`cx login`) - the shape the Claude Code
+ * plugin runs in, one entry for every project. */
+function applyHosted(flags: HostedFlags, root: string): void {
+  configureHosted(hostedSettingsFromFlags(flags, process.env, undefined, { accountRoot: root }));
 }
 
 /** Published version of this package. `cx install` pins it into the `npx`
@@ -134,7 +139,7 @@ hostedOptions(
     "FTS analyzer the platform table is created with (default ascii_lower: splits code identifiers on . _ and ::)",
   )
   .action(async (path: string | undefined, opts: IndexCmdOptions & HostedFlags) => {
-    applyHosted(opts);
+    applyHosted(opts, resolveRoot(path));
     await indexCmd(path, opts);
   });
 
@@ -191,24 +196,32 @@ program
 
 program
   .command("login")
-  .description("store this machine's Infino account once, so nothing after it needs a flag")
-  .option("--db <url>", "the platform to sign in to, https://host")
-  .option("--api-key-file <path>", "file holding the API key (default: read it from standard input)")
+  .description("sign this machine in to Infino once - get a free account, or store a key you have - so every directory after that needs no flag")
+  .option("--platform [url]", "get a free account on this platform, https://host (or CX_PLATFORM_URL); asks you first, then stores the key")
+  .option("--db <url>", "the platform a key you already have belongs to, https://host")
+  .option("--api-key-file <path>", "file holding that key (default: read it from standard input)")
+  .option("--yes", "agree to uploading the contents of the directories you use search and ask in, without being asked (a piped key has no terminal to ask on)")
   .option("--console-url <url>", "where a human manages billing on this platform, shown when the account runs out of credit")
   .option("--show", "report the stored account and change nothing")
   .option("--logout", "forget the stored key (the platform URL is kept: it is not a secret)")
   .addHelpText(
     "after",
     `
-The key is never an argument - argv is readable by every process on this
-machine - so it comes from a file or from standard input:
+No account yet - one command, asked before anything is created or sent:
 
-  cx login --db https://host < keyfile
-  pbpaste | cx login --db https://host
+  cx login --platform https://host
+
+A key you already have is never an argument - argv is readable by every
+process on this machine - so it comes from a file or from standard input:
+
+  cx login --db https://host --yes < keyfile
+  pbpaste | cx login --db https://host --yes
   cx login --db https://host --api-key-file ~/Downloads/key.txt
 
-It is stored at mode 600 and used automatically from then on: \`cx install\`
-in any repository needs no flags, and no config file ever names a key.`,
+Either way the key is stored at mode 600 and used from then on: with the
+Claude Code plugin, every directory you open has all four tools, and \`cx
+install\` in a repository writes an entry for other clients. No config file
+ever names a key.`,
   )
   .action(async (opts: LoginCmdOptions) => {
     await loginCmd(opts);
@@ -242,7 +255,7 @@ hostedOptions(
   .option("--subagent-max-wall-secs <n>", `wall-clock cap for one ask call, in seconds (default ${DEFAULT_SUBAGENT_MAX_WALL_SECS})`)
   .option("--subagent-k <n>", `facts one ask call asks for and returns (default ${DEFAULT_SUBAGENT_K}, search's k)`)
   .action(async (opts: { path?: string } & HostedFlags) => {
-    applyHosted(opts);
+    applyHosted(opts, resolveRoot(opts.path));
     const { serveMcp } = await import("./mcp/server.js");
     await serveMcp(opts.path);
   });

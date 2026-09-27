@@ -91,63 +91,42 @@ It wins on questions about the whole codebase: counts, rankings, every occurrenc
 
 ## Install
 
-You need node 22 or newer, on macOS or Linux. Then clone this repo:
+Two commands, once per machine. You need Claude Code and node 22 or newer, on macOS or Linux.
 
 ```bash
-git clone https://github.com/infino-ai/supergrep
-cd supergrep && npm ci && npm run build
+claude plugin marketplace add infino-ai/supergrep
+claude plugin install code-context@infino-ai
 ```
 
-Now, in the directory you want to make searchable - a repository, a folder of logs, your notes, anything - one command:
+That is the setup. Open Claude Code in any directory - a repository, a folder of logs, your notes, anything - and ask a question. The first question indexes the directory, and `find`, `sql` and `read` answer from then on. Nothing is configured per directory, no account exists yet, and nothing has left your machine.
+
+`search` and `ask` are the cloud half - the embeddings and the retrieval loop run on the Infino platform, over a copy of the index kept there - and they need an account. The first time a question needs them, Claude tells you the one command and does not run it, because it is yours to run. Once, in a terminal:
 
 ```bash
-node /path/to/supergrep/dist/cli.js install --platform https://host
+npx -y @infino-ai/code-context login --platform https://host
 ```
 
-That is the whole setup. It indexes the directory, sets you up with a free account, registers a database for it, and writes the MCP entry. Open Claude Code there and ask a question - all four tools are live.
-
-**A free account, no credit card required.** There is no form, no email, no password and no card, and nothing is created without your say-so: SuperGrep asks you once, tells you that the contents of the files will be uploaded to Infino, and only on your yes creates the account and stores its key at `~/.infino/key`, mode 600, readable only by you. No config file ever holds a key or a path to one. Infino is SOC 2 Type 2 certified.
+**A free account, no credit card required.** There is no form, no email, no password and no card, and nothing is created without your say-so: the command tells you that the contents of the directories you use `search` and `ask` in will be uploaded to Infino, asks, and only on your yes creates the account and stores its key at `~/.infino/key`, mode 600, readable only by you. No config file ever holds a key or a path to one. Infino is SOC 2 Type 2 certified.
 
 **Keep that key.** Because the free account asks for no email and no card, the key is the only thing that identifies you: it is how you get back in, and nothing else can. Back it up somewhere safe. When you add your details in the Infino console the same account gains a sign-in, and keys can be managed from there.
 
-**Every directory after that is the same command with no arguments at all:**
-
-```bash
-cd ../another-project && node /path/to/supergrep/dist/cli.js install
-```
-
-The stored key is found automatically, and each directory gets its own index and its own database. One server answers for every directory it has an index for: the tools take a `path`, so a session that spans several projects names the one it means. When the free credit runs out, `ask` says so and tells you how to add billing details and a card to the same account; `find` and plain `sql` keep working throughout.
-
-### Local tools only
-
-On a machine with no account, `install` with no flags at all gives you the keyword tools - `find` and plain `sql` - with no account, no key and nothing uploaded:
-
-```bash
-node /path/to/supergrep/dist/cli.js install
-```
-
-Add `--local-only` to get that same local-only entry on a machine that does have an account.
-
-**Your agent can run this step itself.** `install --local-only` and `cx index` create no account, take no key and upload nothing - they write an index into `.infino/` and an entry into `.mcp.json`, both inside the directory. So if you are reading this with Claude Code open, "set SuperGrep up locally" is a thing to ask it to do rather than a thing to do yourself. The only step that needs you is `--platform`, because that one creates an account and sends the files' contents off the machine.
+Restart the session and every directory you open has all four tools. Each one gets its own database on your account, named after the directory and loaded the first time you use `search` or `ask` there - a directory you only ever `find` in is never uploaded. One server answers for every directory a session touches: the tools take a `path`, so a session that spans several projects names the one it means. When the free credit runs out, `ask` says so and tells you how to add billing details and a card to the same account; `find` and plain `sql` keep working throughout.
 
 ### If you already have an Infino account
 
-Sign in once per machine instead. The key comes from a file or standard input, never from an argument - argv is readable by every process on the machine:
+Sign in once per machine instead. The key comes from a file or standard input, never from an argument - argv is readable by every process on the machine - and `--yes` is the same agreement the sign-up asks for, since a piped key leaves no terminal to ask on:
 
 ```bash
-node /path/to/supergrep/dist/cli.js login --db https://host < keyfile
+npx -y @infino-ai/code-context login --db https://host --yes < keyfile
 ```
 
-Or name the database and key explicitly, per directory:
+### Other MCP clients, and one entry per repository
 
-```bash
-node /path/to/supergrep/dist/cli.js install \
-  --db https://host/<database> --api-key-file ~/.infino/key
-```
+Cursor, Codex CLI, Gemini CLI, Windsurf and Cline take the same server over stdio. `cx install` in a repository writes its entry into `.mcp.json` there (`--config` for another client's file); with the account stored it names the repository's database and nothing else, `--local-only` writes the keyword-only entry, and `install --platform https://host` is the sign-up and the entry in one for a machine with no account. [The reference](docs/reference.md#cli) has every flag, and [CONTRIBUTING](CONTRIBUTING.md) how to build from source.
 
 ## Indexing it yourself
 
-`install` indexes the directory for you and the MCP server keeps it current, so most of the time you never run an index by hand. When you want to - a first pass over a huge tree, a CI step, a corpus that is not a git repository - `index` is the command. (`cx` below is `node /path/to/supergrep/dist/cli.js`.)
+The first question in a directory indexes it and the MCP server keeps it current, so most of the time you never run an index by hand. When you want to - a first pass over a huge tree, a CI step, a corpus that is not a git repository - `index` is the command. (`cx` below is `npx -y @infino-ai/code-context`, or `cx` itself after `npm install -g @infino-ai/code-context`.)
 
 ```bash
 cx index                      # bring the index up to date; incremental, full on first run
@@ -161,7 +140,7 @@ cx index --max-files 1000000  # raise the cap past the 500,000 default; over it,
 
 The index is plain files under `.infino/` in the directory you indexed. Keyword search is live within seconds of the first `cx index`; semantic and hybrid search light up as the vectors finish backfilling behind it. `cx status` says what the index holds and how fresh it is.
 
-To load the platform copy in the same pass - so `ask` sees the same content as `find` - name the database. The stored key from `install` or `login` is used automatically:
+Signed in, `cx index` loads the platform copy in the same pass - the directory's own database on your account, so `ask` sees the same content as `find`. To load a database you name instead:
 
 ```bash
 cx index --db https://host/<database>

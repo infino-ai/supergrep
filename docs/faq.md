@@ -26,16 +26,18 @@ line, cited `path:line`, complete and unranked, with no file scanned.
 
 ### Does my code leave the machine?
 
-Not unless you ask it to. With a local-only install there are no accounts, no
-API keys and no server: `find` and plain `sql` run offline over the keyword
-index. The opt-in is an account (`install --platform`, or `--db`, next
-question), which also keeps the index in a database you own on the Infino
-platform; that is where embeddings are computed and where `search`, semantic
-`sql` and `ask` run.
+Not unless you ask it to. Without an account there is no key and no upload:
+`find` and plain `sql` run offline over the keyword index. The opt-in is an
+account (`cx login --platform`, which asks you first; or `--db`, next
+question), which keeps each directory's index in a database you own on the
+Infino platform; that is where embeddings are computed and where `search`,
+semantic `sql` and `ask` run. A directory is uploaded the first time you use
+one of those in it, never before.
 
 ### Can the index also live on the Infino platform?
 
-Yes, and it is the same index. `install --platform` sets this up; by hand,
+Yes, and it is the same index. Signed in, the first `search` or `ask` in a
+directory sets this up; by hand,
 `cx index --db https://host/<database> --api-key-file <path>` builds the
 local index exactly as without the flag and then loads the same chunks into
 that database. Every sync after it (the explicit `cx index`, or the MCP
@@ -149,10 +151,12 @@ indexable.
 
 ### Which MCP clients work?
 
-Any MCP client, over stdio. `cx install` writes the entry for Claude Code
-into `.mcp.json` in the directory. Cursor, Codex CLI, Gemini CLI, Windsurf
-and Cline take the same `command` and `args` in their own server config;
-[the reference](reference.md#other-mcp-clients) shows the shape.
+Any MCP client, over stdio. Claude Code gets it as a plugin from the
+`infino-ai/supergrep` marketplace, one entry for every project; `cx install`
+writes a per-repository entry into `.mcp.json` for the others. Cursor, Codex
+CLI, Gemini CLI, Windsurf and Cline take the same `command` and `args` in
+their own server config; [the reference](reference.md#other-mcp-clients)
+shows the shape.
 
 ### What is it built on?
 

@@ -44,6 +44,33 @@ export function consentNotice(baseUrl: string, database: string, root: string, n
     `  Every later sync sends what changed.`,
     ``,
   ];
+  return noticeTail(lines, newAccount);
+}
+
+/** The same disclosure for a sign-in that covers the whole machine rather
+ * than one repository (`cx login`): with an account stored and this agreed,
+ * the server the Claude Code plugin runs serves every directory a session
+ * opens, each on its own database, with nothing written anywhere - so what
+ * is agreed to here is the contents of each of those directories, the first
+ * time a cloud tool is used in it. Said in those words: a person who agrees
+ * to "this repository" has not agreed to the next one. */
+export function machineConsentNotice(baseUrl: string, newAccount = false): string {
+  const lines = [
+    `${bold("The cloud tools upload the contents of the directories you use them in.")}`,
+    ``,
+    `  search and ask run on ${baseUrl}, over a copy of each directory's index kept there.`,
+    `  The first time you use them in a directory, its ${bold("text of the files")} - the code`,
+    `  itself, not just names or metrics - goes into a database of its own there,`,
+    `  named after the directory. Every later sync sends what changed. No directory`,
+    `  is uploaded until you use search or ask in it.`,
+    ``,
+  ];
+  return noticeTail(lines, newAccount);
+}
+
+/** The part of the notice both scopes share: the account, when one will be
+ * made, and what stays local either way. */
+function noticeTail(lines: string[], newAccount: boolean): string {
   if (newAccount) {
     lines.push(
       `  This machine has no Infino account, so one will be ${bold("created for you")} -`,
@@ -55,11 +82,11 @@ export function consentNotice(baseUrl: string, database: string, root: string, n
     );
   }
   lines.push(
-    `  find, search and sql do not upload anything. They read the index on`,
+    `  find and plain sql do not upload anything. They read the index on`,
     `  this disk, and they keep working if you say no.`,
     ``,
     dim(`  If this code is not yours to upload, say no. You can enable it later`),
-    dim(`  with \`cx install\`, or never, and the local tools are unaffected.`),
+    dim(`  with \`cx install\` or \`cx login\`, or never, and the local tools are unaffected.`),
   );
   return lines.join("\n");
 }
@@ -90,6 +117,10 @@ export interface ConsentDeps {
   now?: () => Date;
   /** Whether agreeing also creates an account, which the notice must say. */
   newAccount?: boolean;
+  /** Whether the agreement covers every directory the cloud tools are used
+   * in on this machine (`cx login`) rather than the one repository being
+   * installed; the notice then says so (`machineConsentNotice`). */
+  machine?: boolean;
 }
 
 /** Obtain consent for uploading `root` to `database` on `baseUrl`, printing
@@ -110,11 +141,11 @@ export async function askUploadConsent(
   const interactive = deps.interactive ?? (process.stdin.isTTY === true && process.stdout.isTTY === true);
   if (!interactive) return "no-terminal";
 
-  console.log(consentNotice(baseUrl, database, root, deps.newAccount === true));
+  const machine = deps.machine === true;
+  console.log(machine ? machineConsentNotice(baseUrl, deps.newAccount === true) : consentNotice(baseUrl, database, root, deps.newAccount === true));
   console.log("");
-  const question = deps.newAccount === true
-    ? "Create a free Infino account and upload this repository's contents? [y/N] "
-    : "Upload this repository's contents to Infino? [y/N] ";
+  const what = machine ? "the contents of the directories you use search and ask in" : "this repository's contents";
+  const question = deps.newAccount === true ? `Create a free Infino account and upload ${what}? [y/N] ` : `Upload ${what} to Infino? [y/N] `;
   const answer = (await (deps.ask ?? promptStdin)(question)).trim().toLowerCase();
   if (answer !== "y" && answer !== "yes") {
     console.log(yellow("Not uploading."));
