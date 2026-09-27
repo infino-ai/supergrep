@@ -150,6 +150,7 @@ import {
   CONTENT_COLUMN,
   MAX_FIND_CONTEXT,
 } from "../core/searcher.js";
+import { renderFind } from "../core/find-text.js";
 import {
   newSession,
   receiptEnabled,
@@ -471,9 +472,9 @@ export function findHint(query: string, total: number, defines: boolean, withTex
   // a saved result (the demo, 2026-09-24: a 58,000-character find went to a
   // file and Bash read it).
   if (total > withText) {
-    const beyond = total > listed ? ` ${total - listed} more are counted in total and byFile but not listed.` : "";
+    const beyond = total > listed ? ` ${total - listed} more are in the total and the per-file counts but not listed.` : "";
     return (
-      `${withText} of ${total} lines carry their text; the rest are listed by path and line under more.${beyond} ` +
+      `${withText} of ${total} lines carry their text; the rest are listed by path and line after them.${beyond} ` +
       "For a line's text, sql: SELECT start_line, content FROM the table WHERE path = '...' AND start_line <= " +
       "<line> AND end_line >= <line>. To see less, narrow the terms or add under; to count, sql over " +
       "token_match. A saved result is not for the shell to read."
@@ -613,7 +614,7 @@ export function logIndexInstructions(agentTools: boolean, files: number, chunks:
     (agentTools ? " - and use ask for a question that spans the logs. " : ". ") +
     "Do not open, read or grep the log files with Bash, Grep or Read: the index holds every line of every log " +
     "and answers in one call, and a single log here can run to tens of thousands of lines. A hit marked " +
-    "truncated is its window, one sql statement away. A find with a `more` list is a flood: every place is " +
+    "truncated is its window, one sql statement away. A find that lists places without their text is a flood: every place is " +
     "listed, the text of any line is one sql statement away, and the next move is narrower terms, under, " +
     "or a count with sql - never the shell.\n" +
     SWEEP_TO_A_TOOL +
@@ -1239,11 +1240,15 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   };
 
   // The value behind an ok result, kept beside it so a batch can put the
-  // results of its queries into one object without parsing its own output.
+  // results of its queries into one object without parsing its own output,
+  // and the text a tool wrote in place of the JSON (find writes grep's
+  // shape), so a batch of such results is written the same way.
   const values = new WeakMap<object, unknown>();
-  const ok = (value: unknown) => {
-    const result = { content: [{ type: "text" as const, text: jsonify(value, true) }] };
+  const texts = new WeakMap<object, string>();
+  const ok = (value: unknown, text?: string) => {
+    const result = { content: [{ type: "text" as const, text: text ?? jsonify(value, true) }] };
     values.set(result, value);
+    if (text !== undefined) texts.set(result, text);
     return result;
   };
   const fail = (message: string) => ({
@@ -1271,7 +1276,16 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       const each = results.map((r, i) =>
         "isError" in r ? { query: queries[i], error: r.content[0]?.text ?? "failed" } : { query: queries[i], ...(values.get(r) as object) },
       );
-      return ok({ results: each, took_ms: Math.round((performance.now() - t0) * 1000) / 1000 });
+      const tookMs = Math.round((performance.now() - t0) * 1000) / 1000;
+      // A tool that writes text writes its batch as text too: each query's
+      // result under a heading naming it, a failed one as its message.
+      const written = results.every((r) => "isError" in r || texts.has(r));
+      const text = written
+        ? results
+            .map((r, i) => `== ${tool} "${queries[i]}"\n${"isError" in r ? `error: ${r.content[0]?.text ?? "failed"}` : texts.get(r)}`)
+            .join("\n\n") + `\n\ntook ${tookMs} ms`
+        : undefined;
+      return ok({ results: each, took_ms: tookMs }, text);
     }
     if (typeof query !== "string" || query.length === 0) return fail(`${tool}: give query, or queries for several at once`);
     return single({ ...(rest as A), query });
@@ -1861,7 +1875,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         : mode.kind === "unresolved"
         ? unresolvedDescription("Every row holding every word of an exact string", TABLE)
         : "Every line in the repository containing an exact string, like grep -n: complete and " +
-        "unranked, with the repo-wide total and per-file counts (byFile, the grep -c answer). " +
+        "unranked, written as grep writes it (path:line:text, one line per match, the enclosing " +
+        "definition in brackets when known), with the repo-wide total and the per-file counts after " +
+        "the matches (the grep -c answer). " +
         "Literal text within one line, case-sensitive unless ignoreCase. Use it where you would " +
         "grep: every use or definition of an identifier, an error message, a config key. Set defines " +
         "to get only where a name is defined rather than everywhere it appears. " +
@@ -1874,7 +1890,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         " The lines around a match - what leads into an error and follows it - come with it when you ask " +
         "for context (like grep -B/-A); no file need be opened for them. " +
         "A wide result lists every matching place: the first lines with their text, the rest by path and " +
-        "line under more; a line's text is one sql statement away, and byFile counts them all. Not for a " +
+        "line after them; a line's text is one sql statement away, and the per-file counts count them all. Not for a " +
         `file you already know - its lines are one sql statement away (SELECT start_line, content FROM ${TABLE} ` +
         "WHERE path = '...' ORDER BY start_line). " +
         // find's hand-off must name the tool that owns the question on this
@@ -1998,21 +2014,28 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         const t0 = performance.now();
         const result = await find(handle, query, { ignoreCase, defines, under, limit, context });
         recordOf(ctx).addLines(TABLE, result.matches);
+        const listed = result.matches.length + (result.more ?? []).reduce((n, m) => n + m.lines.length, 0);
+        const hint = findHint(query, result.total, Boolean(defines), result.matches.length, listed) ?? undefined;
+        const noted = autoIndexed ? autoIndexNote(autoIndexed) : undefined;
+        const tookMs = Math.round((performance.now() - t0) * 1000) / 1000;
+        // Written as grep writes it (`renderFind`); the receipt prices that
+        // text, since it is what was returned, and rides on its last line.
         let usage: string | undefined;
         if (receiptOn) {
-          const entry = findEntry(result);
+          const entry = findEntry(result, false, renderFind(result, { hint, autoIndexed: noted?.note, tookMs }));
           recordUsage(ctx.dir, entry);
           usage = formatReceipt(entry, session);
         }
-        const listed = result.matches.length + (result.more ?? []).reduce((n, m) => n + m.lines.length, 0);
-        const hint = findHint(query, result.total, Boolean(defines), result.matches.length, listed);
-        return ok({
-          ...result,
-          ...(hint ? { hint } : {}),
-          ...(autoIndexed ? { auto_indexed: autoIndexNote(autoIndexed) } : {}),
-          took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
-          ...(usage ? { usage } : {}),
-        });
+        return ok(
+          {
+            ...result,
+            ...(hint ? { hint } : {}),
+            ...(noted ? { auto_indexed: noted } : {}),
+            took_ms: tookMs,
+            ...(usage ? { usage } : {}),
+          },
+          renderFind(result, { hint, autoIndexed: noted?.note, tookMs, usage }),
+        );
       } catch (err) {
         return fail(`find failed: ${(err as Error).message}`);
       }

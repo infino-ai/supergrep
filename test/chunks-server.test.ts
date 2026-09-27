@@ -157,7 +157,7 @@ describe("an index of logs is told apart and gets its instructions in log words"
     // and a cut find is a flood to narrow, never a file for the shell.
     expect(text).toContain("Begin with these tools, not with ls or a look at the directory");
     expect(text).toContain("what fills a log, how often a pattern occurs, the kinds of error");
-    expect(text).toContain("A find with a `more` list is a flood: every place is listed");
+    expect(text).toContain("A find that lists places without their text is a flood: every place is listed");
     expect(text).not.toContain("Read a file only");
     expectSharedSentences(text);
     // Without the agent tools there is no ask line and no ask in the order.

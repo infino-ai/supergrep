@@ -128,8 +128,8 @@ export function searchEntry(result: SearchResult, root: string): UsageEntry {
   };
 }
 
-/** A find returns one line per match, so what it cost is the serialized
- * matches themselves; the whole-file counterfactual is search's and does not
+/** A find returns one line per match, so what it cost is the matches as
+ * they were written; the whole-file counterfactual is search's and does not
  * apply - grep never read the files whole either.
  *
  * `counted` is the `-c` / count mode, where the caller gets the per-file
@@ -137,9 +137,11 @@ export function searchEntry(result: SearchResult, root: string): UsageEntry {
  * the whole payload that was never printed - measured at "~21.4k tokens" for
  * 49 lines of counts - and a receipt is only worth having if it is the thing
  * that was returned. The mode has to be passed in because the result carries
- * both shapes and cannot know which the caller rendered. */
-export function findEntry(result: FindResult, counted = false): UsageEntry {
-  const returned = counted ? jsonify(result.byFile) : jsonify(result.matches);
+ * both shapes and cannot know which the caller rendered. `rendered` is the
+ * text the caller actually wrote out when it is not the JSON (the MCP tool
+ * writes grep's shape); the receipt prices that. */
+export function findEntry(result: FindResult, counted = false, rendered?: string): UsageEntry {
+  const returned = rendered ?? (counted ? jsonify(result.byFile) : jsonify(result.matches));
   return {
     ts: new Date().toISOString(),
     tool: "find",

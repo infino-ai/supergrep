@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
+import { describe, expect, it } from "vitest";
+import { enclosingName, renderFind, renderMatch } from "../src/core/find-text.js";
+import type { FindResult } from "../src/core/searcher.js";
+
+const base: FindResult = {
+  query: "needle",
+  ignoreCase: false,
+  total: 3,
+  files: 2,
+  byFile: [
+    { path: "src/a.rs", count: 2 },
+    { path: "src/b.rs", count: 1 },
+  ],
+  matches: [
+    { path: "src/a.rs", line: 3, text: "let x = needle;", symbol: "f" },
+    { path: "src/a.rs", line: 9, text: "needle()", symbol: "f, g" },
+    { path: "src/b.rs", line: 1, text: "// needle", symbol: "run (1-40, part)" },
+  ],
+};
+
+describe("find as text", () => {
+  it("writes grep -n lines with the one enclosing definition in brackets, then the per-file counts", () => {
+    const text = renderFind(base);
+    expect(text.split("\n")).toEqual([
+      '3 matching lines in 2 files for "needle"',
+      "",
+      "src/a.rs:3:let x = needle;  [f]",
+      "src/a.rs:9:needle()",
+      "src/b.rs:1:// needle  [run]",
+      "",
+      "per file (2):",
+      "src/a.rs: 2",
+      "src/b.rs: 1",
+    ]);
+  });
+
+  it("is less than half the JSON it replaced", () => {
+    // The shape the tool wrote until 2026-09-27: a find for `unsafe` came to
+    // 41,000 characters where rg said the same in 17,000, and this is rg's
+    // shape.
+    const many: FindResult = {
+      ...base,
+      matches: Array.from({ length: 200 }, (_, i) => ({
+        path: `src/module_${i % 7}/file_${i % 13}.rs`,
+        line: 100 + i,
+        text: "        let map = unsafe { Mmap::map(&file).expect(\"mmap text corpus\") };",
+        symbol: "open, from_file, from_file_with_dim, as_slice, n_docs, dim",
+      })),
+    };
+    const json = JSON.stringify({ ...many, byFile: [] }, null, 2).length;
+    const text = renderFind({ ...many, byFile: [] }).length;
+    expect(text * 2).toBeLessThan(json);
+  });
+
+  it("carries context lines as grep -B/-A does, groups apart", () => {
+    const withContext: FindResult = {
+      ...base,
+      matches: [
+        { path: "src/a.rs", line: 3, text: "let x = needle;", before: ["fn f() {", "  // set up"], after: ["  x"] },
+        { path: "src/b.rs", line: 1, text: "// needle", after: ["fn run() {}"] },
+      ],
+    };
+    expect(renderFind(withContext).split("\n").slice(2, 9)).toEqual([
+      "src/a.rs-1-fn f() {",
+      "src/a.rs-2-  // set up",
+      "src/a.rs:3:let x = needle;",
+      "src/a.rs-4-  x",
+      "--",
+      "src/b.rs:1:// needle",
+      "src/b.rs-2-fn run() {}",
+    ]);
+  });
+
+  it("names the scope, the case, the defines filter and the cut on the first line, and lists the places past the text budget", () => {
+    const wide: FindResult = {
+      ...base,
+      ignoreCase: true,
+      under: "src",
+      definedFrom: 40,
+      truncated: true,
+      total: 30,
+      more: [
+        { path: "src/c.rs", lines: [4, 8] },
+        { path: "src/d.rs", lines: [2] },
+      ],
+    };
+    const text = renderFind(wide, { hint: "narrow it", tookMs: 1.5, usage: "returned ~1k tokens | 30 matches / 2 files" });
+    const lines = text.split("\n");
+    expect(lines[0]).toBe('30 matching lines in 2 files for "needle" under src, ignoring case; 30 of 40 inside a definition of it; the first 6 listed');
+    expect(text).toContain("3 more places, text not carried (path: lines):\nsrc/c.rs: 4, 8\nsrc/d.rs: 2");
+    expect(lines.slice(-3)).toEqual(["hint: narrow it", "took 1.5 ms", "usage: returned ~1k tokens | 30 matches / 2 files"]);
+  });
+
+  it("says when the index left files out, and when nothing matched", () => {
+    const partial: FindResult = {
+      ...base,
+      total: 0,
+      files: 0,
+      byFile: [],
+      matches: [],
+      partial: { filesSkipped: 5, fileCap: 1000, note: "5 file(s) over the 1000-file cap were left out of the index" },
+    };
+    const text = renderFind(partial);
+    expect(text.split("\n")).toEqual(['0 matching lines in 0 files for "needle"', "partial index: 5 file(s) over the 1000-file cap were left out of the index", ""]);
+  });
+
+  it("names the one definition a match sits in and no list of several", () => {
+    expect(enclosingName("parseConfig")).toBe("parseConfig");
+    expect(enclosingName("run_compaction_job (603-809, part)")).toBe("run_compaction_job");
+    expect(enclosingName("open, from_file, as_slice")).toBeUndefined();
+    expect(enclosingName("")).toBeUndefined();
+    expect(enclosingName(undefined)).toBeUndefined();
+    expect(renderMatch({ path: "a.rs", line: 7, text: "x" })).toEqual(["a.rs:7:x"]);
+  });
+});
