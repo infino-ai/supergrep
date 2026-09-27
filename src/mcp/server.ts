@@ -1182,7 +1182,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     rows: readonly object[],
     question?: string,
     column: string = CONTENT_COLUMN,
-  ): Promise<{ verdict?: Record<string, unknown>; telemetry?: { rttMs: number; readTokens?: number } }> => {
+  ): Promise<{ verdict?: Record<string, unknown>; telemetry?: { rttMs: number; readTokens?: number; resultBytes?: number } }> => {
     // Under the API tools the verdict is the model's to ask for (`validate`),
     // not attached to every statement.
     if (!ctx.hosted || !verdictDb || apiTools) return {};
@@ -1203,7 +1203,11 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // miss it.
       const info = verdictDb.lastCall();
       const telemetry = info
-        ? { rttMs: info.rttMs, ...(info.readTokens !== undefined ? { readTokens: info.readTokens } : {}) }
+        ? {
+            rttMs: info.rttMs,
+            ...(info.readTokens !== undefined ? { readTokens: info.readTokens } : {}),
+            ...(info.resultBytes !== undefined ? { resultBytes: info.resultBytes } : {}),
+          }
         : undefined;
       // `anchors` and `rows` are the check's own working, not news to the
       // caller, and on a valid result the whole verdict is one word; the
@@ -1546,6 +1550,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             rttMs: (entry.platform?.rttMs ?? 0) + telemetry.rttMs,
             ...(entry.platform?.readTokens !== undefined || telemetry.readTokens !== undefined
               ? { readTokens: (entry.platform?.readTokens ?? 0) + (telemetry.readTokens ?? 0) }
+              : {}),
+            ...(entry.platform?.resultBytes !== undefined || telemetry.resultBytes !== undefined
+              ? { resultBytes: (entry.platform?.resultBytes ?? 0) + (telemetry.resultBytes ?? 0) }
               : {}),
           };
         }

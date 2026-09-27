@@ -93,7 +93,7 @@ export interface UsageEntry {
    * the wire - the round trip of the answering request and the read/write
    * tokens the platform metered (from its response headers, when present).
    * Lives in the ledger, never in the tool result. */
-  platform?: { rttMs: number; readTokens?: number; writeTokens?: number };
+  platform?: { rttMs: number; readTokens?: number; writeTokens?: number; resultBytes?: number };
 }
 
 /** Best-effort sum of the on-disk size (as tokens) of the distinct files the

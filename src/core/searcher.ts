@@ -93,13 +93,18 @@ export { jsonify } from "./json.js";
  * last call is that one. Undefined when there is no platform client, so
  * callers spread it into the usage entry unconditionally. Ledger-only: never
  * part of a tool result. */
-export function hostedTelemetry(handle: { hosted?: HostedDb }): { rttMs: number; readTokens?: number; writeTokens?: number } | undefined {
+export function hostedTelemetry(
+  handle: { hosted?: HostedDb },
+): { rttMs: number; readTokens?: number; writeTokens?: number; resultBytes?: number } | undefined {
   const info = handle.hosted?.lastCall();
   if (!info) return undefined;
   return {
     rttMs: info.rttMs,
     ...(info.readTokens !== undefined ? { readTokens: info.readTokens } : {}),
     ...(info.writeTokens !== undefined ? { writeTokens: info.writeTokens } : {}),
+    // The bytes the platform's egress meter recorded for the response,
+    // filed beside the tokens so a bill reads the metered figure.
+    ...(info.resultBytes !== undefined ? { resultBytes: info.resultBytes } : {}),
   };
 }
 

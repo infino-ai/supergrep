@@ -87,9 +87,11 @@ const JSON_CONTENT_TYPE = "application/json";
 const ARROW_STREAM_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
 
 /** The metering headers the platform returns on every response: decimal
- * tokens (`"0.050"`), one for reads and one for writes. */
+ * tokens (`"0.050"`), one for reads and one for writes, and the response's
+ * bytes as its egress meter recorded them (an integer). */
 const READ_TOKENS_HEADER = "x-infino-read-tokens";
 const WRITE_TOKENS_HEADER = "x-infino-write-tokens";
+const RESULT_BYTES_HEADER = "x-infino-result-bytes";
 
 /** The hosts a plaintext `http://` target may name: the request never leaves
  * the machine, so the bearer credential is never on the wire in the clear. */
@@ -138,8 +140,9 @@ export interface HostedTarget {
 }
 
 /** What one logical call cost: the final status, the round trip of the
- * attempt that answered, how many retries the cold-start loop took, and the
- * tokens the platform billed (from its response headers, when present). */
+ * attempt that answered, how many retries the cold-start loop took, the
+ * tokens the platform billed and the bytes its egress meter recorded for the
+ * response (all from its response headers, when present). */
 export interface HostedCallInfo {
   op: string;
   status: number;
@@ -147,6 +150,7 @@ export interface HostedCallInfo {
   retries: number;
   readTokens?: number;
   writeTokens?: number;
+  resultBytes?: number;
 }
 
 export interface HostedOptions {
@@ -756,8 +760,10 @@ export class HostedDb {
       const info: HostedCallInfo = { op: spec.op, status: response.status, rttMs, retries };
       const readTokens = tokensHeader(response.headers, READ_TOKENS_HEADER);
       const writeTokens = tokensHeader(response.headers, WRITE_TOKENS_HEADER);
+      const resultBytes = tokensHeader(response.headers, RESULT_BYTES_HEADER);
       if (readTokens !== undefined) info.readTokens = readTokens;
       if (writeTokens !== undefined) info.writeTokens = writeTokens;
+      if (resultBytes !== undefined) info.resultBytes = resultBytes;
 
       if (response.ok) {
         this.record(info);
