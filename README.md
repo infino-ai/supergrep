@@ -103,7 +103,7 @@ That is the setup. Open Claude Code in any directory - a repository, a folder of
 `search` and `ask` are the cloud half - the embeddings and the retrieval loop run on the Infino platform, over a copy of the index kept there - and they need an account. The first time a question needs them, Claude tells you the one command and does not run it, because it is yours to run. Once, in a terminal:
 
 ```bash
-npx -y @infino-ai/code-context login --platform https://host
+npx -y @infino-ai/code-context login --platform https://api.supergrep.infino.ai
 ```
 
 **A free account, no credit card required.** There is no form, no email, no password and no card, and nothing is created without your say-so: the command tells you that the contents of the directories you use `search` and `ask` in will be uploaded to Infino, asks, and only on your yes creates the account and stores its key at `~/.infino/key`, mode 600, readable only by you. No config file ever holds a key or a path to one. Infino is SOC 2 Type 2 certified.
@@ -117,12 +117,12 @@ Restart the session and every directory you open has all four tools. Each one ge
 Sign in once per machine instead. The key comes from a file or standard input, never from an argument - argv is readable by every process on the machine - and `--yes` is the same agreement the sign-up asks for, since a piped key leaves no terminal to ask on:
 
 ```bash
-npx -y @infino-ai/code-context login --db https://host --yes < keyfile
+npx -y @infino-ai/code-context login --db https://api.supergrep.infino.ai --yes < keyfile
 ```
 
 ### Other MCP clients, and one entry per repository
 
-Cursor, Codex CLI, Gemini CLI, Windsurf and Cline take the same server over stdio. `cx install` in a repository writes its entry into `.mcp.json` there (`--config` for another client's file); with the account stored it names the repository's database and nothing else, `--local-only` writes the keyword-only entry, and `install --platform https://host` is the sign-up and the entry in one for a machine with no account. [The reference](docs/reference.md#cli) has every flag, and [CONTRIBUTING](CONTRIBUTING.md) how to build from source.
+Cursor, Codex CLI, Gemini CLI, Windsurf and Cline take the same server over stdio. `cx install` in a repository writes its entry into `.mcp.json` there (`--config` for another client's file); with the account stored it names the repository's database and nothing else, `--local-only` writes the keyword-only entry, and `install --platform https://api.supergrep.infino.ai` is the sign-up and the entry in one for a machine with no account. [The reference](docs/reference.md#cli) has every flag, and [CONTRIBUTING](CONTRIBUTING.md) how to build from source.
 
 ## Indexing it yourself
 
@@ -143,7 +143,7 @@ The index is plain files under `.infino/` in the directory you indexed. Keyword 
 Signed in, `cx index` loads the platform copy in the same pass - the directory's own database on your account, so `ask` sees the same content as `find`. To load a database you name instead:
 
 ```bash
-cx index --db https://host/<database>
+cx index --db https://api.supergrep.infino.ai/<database>
 ```
 
 `--embed-provider platform` (the default) has the platform fill that table's vectors with its own model, server-side; `local` embeds on this machine and ships the vectors instead.
@@ -162,7 +162,7 @@ aws s3 cp ./shards/ s3://<your-bucket>/<database-root>/_source/logs/ \
 **2. Submit the job.** One `POST`, and it returns straight away - the build runs on the platform, not in the request:
 
 ```bash
-curl -sS -X POST https://host/v1/hydrate/<database> \
+curl -sS -X POST https://api.supergrep.infino.ai/v1/hydrate/<database> \
   -H "authorization: Bearer $(cat ~/.infino/key)" \
   -H 'content-type: application/json' \
   -d '{
@@ -182,7 +182,7 @@ Leave `fts` and `embed` out and the job reads a sample and picks the roles itsel
 **3. Follow it.** The reply carries the state, how far it has got, the schema it settled on, and what it has cost so far:
 
 ```bash
-curl -sS "https://host/v1/hydrate/<database>?table=logs" \
+curl -sS "https://api.supergrep.infino.ai/v1/hydrate/<database>?table=logs" \
   -H "authorization: Bearer $(cat ~/.infino/key)"
 ```
 
@@ -190,12 +190,12 @@ States are `pending`, `running`, `cancelling`, `stopped`, `succeeded`, `failed`.
 
 ```bash
 # resume where it left off
-curl -sS -X POST https://host/v1/hydrate/<database> -H "authorization: Bearer $(cat ~/.infino/key)" \
+curl -sS -X POST https://api.supergrep.infino.ai/v1/hydrate/<database> -H "authorization: Bearer $(cat ~/.infino/key)" \
   -H 'content-type: application/json' \
   -d '{"table":"logs","source":{"kind":"prefix","prefix":"_source/logs/"},"resume":true}'
 
 # stop a running job at its next commit boundary
-curl -sS -X DELETE "https://host/v1/hydrate/<database>?table=logs" \
+curl -sS -X DELETE "https://api.supergrep.infino.ai/v1/hydrate/<database>?table=logs" \
   -H "authorization: Bearer $(cat ~/.infino/key)"
 ```
 
