@@ -84,7 +84,7 @@ Examples:
   cx sql "SELECT path, SUM(end_line - start_line + 1) AS lines \\
           FROM bm25_search('chunks','content','vector index', 300) \\
           GROUP BY path ORDER BY lines DESC LIMIT 10"
-  cx mcp                              serve the three local MCP tools (find/search/sql) over stdio
+  cx mcp                              serve the MCP tools over stdio (find and plain sql locally; search, ranked sql and ask on the platform)
   cx login --db https://host < key    store this machine's account once (key at mode 600)
   cx install                          write the MCP entry into .mcp.json - with an account stored,
                                       this also registers the repo's database and enables all four

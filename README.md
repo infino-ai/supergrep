@@ -94,7 +94,7 @@ It wins on questions about the whole codebase: counts, rankings, every occurrenc
 You need node 22 or newer, on macOS or Linux. Then clone this repo:
 
 ```bash
-git clone -b feat/side-by-side-demo https://github.com/infino-ai/supergrep
+git clone https://github.com/infino-ai/supergrep
 cd supergrep && npm ci && npm run build
 ```
 
