@@ -150,13 +150,12 @@ cx index --db https://api.supergrep.infino.ai/<database>
 
 ## Indexing from object storage
 
-For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in S3 - write it out as Parquet, leave it there, and have the platform build the index next to it. Nothing is downloaded to your machine and no row passes through your laptop or through the API.
+For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in S3 - write it out as Parquet or JSON, leave it there, and have the platform build the index next to it. Nothing is downloaded to your machine and no row passes through your laptop or through the API.
 
-**1. Stage the Parquet shards** under the database's own `_source/` prefix:
+**1. Stage your Parquet or JSON files** under the database's own `_source/` prefix:
 
 ```bash
-aws s3 cp ./shards/ s3://<your-bucket>/<database-root>/_source/logs/ \
-  --recursive --exclude '*' --include '*.parquet'
+aws s3 cp ./logs/ s3://<your-bucket>/<database-root>/_source/logs/ --recursive
 ```
 
 **2. Submit the job.** One `POST`, and it returns straight away - the build runs on the platform, not in the request:
