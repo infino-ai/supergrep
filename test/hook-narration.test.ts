@@ -58,12 +58,18 @@ describe("the narration read from a transcript", () => {
     expect(transcriptNarration(jsonl)).toBe("said");
   });
 
-  it("keeps the most recent narration under the cap and says what was cut", () => {
+  it("hands the writer the whole narration of a long session, and cuts only past a cap far beyond it", () => {
     const paragraphs = Array.from({ length: 40 }, (_, i) => `paragraph ${i} ${"x".repeat(400)}`);
     const jsonl = [user("q"), ...paragraphs.map((p) => assistant([{ type: "text", text: p }]))].join("\n");
-    const narration = transcriptNarration(jsonl);
+    // Sixteen thousand characters of narration: whole under the default cap.
+    const whole = transcriptNarration(jsonl);
+    expect(whole).toBe(paragraphs.join("\n\n"));
+    expect(NARRATION_CHARS).toBeGreaterThanOrEqual(200_000);
+    // Under a smaller cap the most recent narration is kept and the cut is said.
+    const cap = 12_000;
+    const narration = transcriptNarration(jsonl, cap);
     expect(narration).not.toBeNull();
-    expect(narration!.length).toBeLessThanOrEqual(NARRATION_CHARS);
+    expect(narration!.length).toBeLessThanOrEqual(cap);
     expect(narration!.startsWith("[earlier narration left out]\n\nparagraph ")).toBe(true);
     expect(narration!.endsWith(paragraphs[39])).toBe(true);
     // Whole paragraphs only: the cut falls on a paragraph break.

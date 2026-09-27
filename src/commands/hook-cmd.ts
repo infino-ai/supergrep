@@ -87,9 +87,15 @@ export const ANSWER_DUE_NOTE =
 /** The `answer` tool's input the PreToolUse hook fills. */
 export const NARRATION_INPUT = "narration";
 /** Characters of narration handed to the writer at most, the most recent
- * kept: a long investigation narrates more than a writer needs, and what it
- * said last is what it concluded. */
-export const NARRATION_CHARS = 12_000;
+ * kept. The narration is the caller's whole account of the evidence - what
+ * it concluded at each step, not only at the end - and it is the writer's
+ * brain for the answer (the owner, 2026-09-27: "that's the whole brain"), so
+ * the cap sits far past any session's narration and exists only so a
+ * runaway transcript cannot exceed the writer's context: two hundred
+ * thousand characters is about fifty thousand tokens, beside the sixty rows
+ * the record hands over. It was twelve thousand until then, cut on the
+ * belief that what the caller said last was what it concluded. */
+export const NARRATION_CHARS = 200_000;
 /** What replaces the narration cut from the front when it is over the cap. */
 const NARRATION_CUT_NOTE = "[earlier narration left out]";
 
