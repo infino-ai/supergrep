@@ -17,10 +17,12 @@ import type { Manifest } from "./manifest.js";
 /** The two analyzers the engine ships, by their stored FTS-config names. */
 export type Analyzer = "ascii_lower" | "standard";
 
-/** The analyzer a local table gets when the binding's `IndexSpec.fts(column)`
- * names none: `@infino-ai/infino` 0.5.2 (the pinned engine) builds a bare FTS
- * column with `ascii_lower`. A manifest written before the analyzer was
- * recorded describes such a table, so a missing `analyzer` reads as this. */
+/** The analyzer a local table is built with. The indexer names it on
+ * `IndexSpec.fts` rather than taking the engine's default, which moved from
+ * `ascii_lower` to `standard` in `@infino-ai/infino` 0.8. A manifest written
+ * before the analyzer was recorded describes a table the older engine built
+ * with a bare column, which was `ascii_lower`, so a missing `analyzer` reads as
+ * this too. */
 export const ENGINE_DEFAULT_ANALYZER: Analyzer = "ascii_lower";
 
 /** The analyzer the platform gives a bare FTS column. A hosted manifest that
