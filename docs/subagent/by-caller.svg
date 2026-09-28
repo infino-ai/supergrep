@@ -34,8 +34,8 @@
 <text x='325' y='211' fill='#24292f' font-size='13' font-weight='600'>Sonnet</text>
 <rect x='395' y='185' width='110' height='18' rx='3' fill='#8b949e'/>
 <text x='511' y='199' fill='#24292f' font-size='12' font-weight='600'>18</text>
-<rect x='395' y='207' width='98' height='18' rx='3' fill='#2f81f7'/>
-<text x='499' y='221' fill='#24292f' font-size='12' font-weight='600'>16</text>
+<rect x='395' y='207' width='122' height='18' rx='3' fill='#2f81f7'/>
+<text x='523' y='221' fill='#24292f' font-size='12' font-weight='600'>20</text>
 <text x='325' y='265' fill='#24292f' font-size='13' font-weight='600'>Opus</text>
 <rect x='395' y='239' width='153' height='18' rx='3' fill='#8b949e'/>
 <text x='554' y='253' fill='#24292f' font-size='12' font-weight='600'>25</text>

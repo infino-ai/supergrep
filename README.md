@@ -74,7 +74,7 @@ Real agent runs through the Claude Agent SDK, the same minimal prompt in every a
 
 - **Cheaper on every model.** Haiku 41% off the total bill, Sonnet 58%, Opus 26%, Fable 14%.
 - **Quality increases on the cheaper models.** Haiku gets eight more fully correct answers with SuperGrep than without. On Sonnet, Opus and Fable the answers are level: the judge is itself a model, and graded four times the same answers came back with 19, 20, 17 and 23 claims it could not verify, so a difference under about six answers in 36 is noise, and those three are inside it.
-- **No surprise bills.** On about a third of the questions, Sonnet with file tools sends a subagent off to read through the repository. That one question then costs four to five times as much and takes four times as long. With SuperGrep it asks the index instead. Over the 36 questions that is $3.66 against $8.73 and 20 minutes against 41, with the same number of correct answers.
+- **No surprise bills.** On about a third of the questions, Sonnet with file tools sends a subagent off to read through the repository. That one question then costs four to five times as much and takes four times as long. With SuperGrep it asks the index instead. Over the 36 questions that is $3.66 against $8.73 and 20 minutes against 41, with 20 fully correct answers against 18.
 - **On your own code the gap is wider.** These runs are on a public, open-source repository, because that is a test anyone can repeat - and the large models have seen it in training, which is a head start for reading files. On a private codebase the model has never seen, the index does more of the work, and the effect of SuperGrep is larger.
 
 ### Where it wins, and where it does not
@@ -150,7 +150,7 @@ cx index --db https://api.supergrep.infino.ai/<database>
 
 ## Indexing from object storage
 
-For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in a bucket - point the platform at the bucket and it builds the index from there. Nothing is copied, nothing is downloaded to your machine, and no row passes through your laptop or through the API.
+For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in a bucket as Parquet or JSON - leave it there, point the platform at the bucket, and it builds the index from there. Nothing is copied, nothing is downloaded to your machine, and no row passes through your laptop or through the API.
 
 **1. Grant read on your bucket** to Infino's service account - we give you its address - on the prefix you want indexed: `roles/storage.objectViewer` on GCS, `s3:GetObject` + `s3:ListBucket` on S3. Read only: the platform writes nothing there.
 
@@ -199,6 +199,8 @@ curl -sS -X DELETE "https://api.supergrep.infino.ai/v1/hydrate/<database>?table=
 By default a job that fails for good drops its half-built table, so a partial table is never served; `"on_failure": "keep"` keeps what was committed.
 
 The table is then searchable like any other. `ask` runs over it, and one question can span it and your code at once.
+
+Note: Hydrate API needs to be enabled per account. Contact support@infino.ai to enable.
 
 ## Learn more
 
