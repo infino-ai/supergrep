@@ -315,7 +315,7 @@ export async function indexRepoStaged(opts: IndexOptions): Promise<StagedIndexRu
   try {
     onPhase?.("commit-text");
     if (db.listTables().includes(TABLE)) db.dropTable(TABLE, true);
-    const textTable = db.createTable(TABLE, { ...TEXT_SCHEMA }, new IndexSpec().fts(CONTENT_COLUMN));
+    const textTable = db.createTable(TABLE, { ...TEXT_SCHEMA }, new IndexSpec().fts(CONTENT_COLUMN, { analyzer: ENGINE_DEFAULT_ANALYZER }));
     appendSpillSync(textTable, spill, chunkCount, undefined, onProgress);
     // Always - this table is never recreated after this point, embedder or
     // not, since the local index never gains a vector column any more.
