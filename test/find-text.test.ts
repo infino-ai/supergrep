@@ -123,6 +123,73 @@ describe("find as text", () => {
     expect(text.split("\n")).toEqual(['0 matching lines in 0 files for "needle"', "partial index: 5 file(s) over the 1000-file cap were left out of the index", ""]);
   });
 
+  it("writes a chunks find as blocks: a heading with the citation and the matching lines, then the lines numbered", () => {
+    const blocks: FindResult = {
+      ...base,
+      total: 3,
+      matches: base.matches,
+      blocks: [
+        {
+          path: "src/a.rs",
+          start: 1,
+          end: 4,
+          symbol: "f",
+          lines: ["fn f() {", "  // SAFETY: x is in bounds", "  let x = needle;", "}"].map((text, i) => ({ line: 1 + i, text })),
+          hits: [3],
+        },
+        {
+          path: "src/b.rs",
+          start: 10,
+          end: 31,
+          symbol: "open, close",
+          lines: [
+            { line: 10, text: "// needle" },
+            { line: 11, text: "// needle again" },
+            { line: 30, text: "// SAFETY: the map outlives it" },
+            { line: 31, text: "unsafe { needle }" },
+          ],
+          hits: [10, 11, 31],
+        },
+      ],
+      more: [{ path: "src/c.rs", lines: [7] }],
+    };
+    const text = renderFind(blocks);
+    expect(text.split("\n").slice(2, 14)).toEqual([
+      "== src/a.rs:1-4  [f]  match at 3",
+      "1: fn f() {",
+      "2:   // SAFETY: x is in bounds",
+      "3:   let x = needle;",
+      "4: }",
+      "",
+      "== src/b.rs:10-31  matches at 10, 11, 31",
+      "10: // needle",
+      "11: // needle again",
+      "--",
+      "30: // SAFETY: the map outlives it",
+      "31: unsafe { needle }",
+    ]);
+    expect(text).toContain("1 more matching line, block not carried (path: lines):\nsrc/c.rs: 7");
+  });
+
+  it("with more pages, says so first and does not list the rest by file", () => {
+    const paged: FindResult = {
+      ...base,
+      total: 40,
+      skip: 10,
+      matches: base.matches,
+      more: [{ path: "src/c.rs", lines: [7, 9] }],
+      pages: [13, 25, 33],
+    };
+    const lines = renderFind(paged).split("\n");
+    expect(lines[1]).toBe(
+      "this result carries matches 11-13 of 40. The rest are in 3 more pages: call find now with the same query and " +
+        "options and skip 13, skip 25, skip 33 - all 3 calls in this one reply, not a find per file.",
+    );
+    expect(renderFind(paged)).not.toContain("src/c.rs");
+    // The per-file counts stay: they are the grep -c answer.
+    expect(lines).toContain("per file (2):");
+  });
+
   it("names the one definition a match sits in and no list of several", () => {
     expect(enclosingName("parseConfig")).toBe("parseConfig");
     expect(enclosingName("run_compaction_job (603-809, part)")).toBe("run_compaction_job");

@@ -180,6 +180,19 @@ describe("the hint on an empty find", () => {
   it("doubts the name itself when defines found nothing for a bare identifier", () => {
     expect(findHint("maybeRefresh", 0, true)).toContain('Nothing declares "maybeRefresh"');
   });
+  it("names every following page's skip, to be asked for in one reply, when a find could not carry every match", () => {
+    const hint = findHint("unsafe {", 136, false, 40, 136, true, [40, 81, 118]);
+    expect(hint).toContain("carried 40 of the 136 matching lines with their blocks");
+    expect(hint).toContain("skip set to each of 40, 81, 118 - all of them in the same reply");
+    expect(hint).not.toContain("under");
+    const lines = findHint("unsafe {", 136, false, 40, 136, false, [40]);
+    expect(lines).toContain("with their text");
+    expect(findHint("unsafe {", 900, false, 40, 900, true, Array.from({ length: 16 }, (_, i) => 40 * (i + 1)))).toContain(
+      "The last of them names where the next pages start.",
+    );
+    // A line-mode flood keeps its own wording.
+    expect(findHint("unsafe {", 136, false, 40, 136)).toContain("40 of 136 lines carry their text");
+  });
   it("says nothing when a bare identifier is simply absent, or when anything matched", () => {
     expect(findHint("refresh(", 0, false)).toBeNull();
     expect(findHint("private void refresh(String source)", 3, false)).toBeNull();

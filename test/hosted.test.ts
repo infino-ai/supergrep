@@ -526,23 +526,29 @@ describe("errors", () => {
 // --- telemetry ---------------------------------------------------------------------
 
 describe("telemetry", () => {
-  it("parses the token and result-bytes headers when present and leaves them off when absent", async () => {
+  it("parses the token, result-bytes and inference headers when present and leaves them off when absent", async () => {
     const { db } = client([
-      json([], { "x-infino-read-tokens": "0.050", "x-infino-result-bytes": "2" }),
+      json([], {
+        "x-infino-read-tokens": "0.050",
+        "x-infino-result-bytes": "2",
+        "x-infino-inference-nanodollars": "1950",
+      }),
       json({}, { "x-infino-write-tokens": "2.000" }),
       json([]),
     ]);
     await db.querySql("SELECT 1");
-    expect(db.lastCall()).toMatchObject({ readTokens: 0.05, resultBytes: 2 });
+    expect(db.lastCall()).toMatchObject({ readTokens: 0.05, resultBytes: 2, inferenceNanodollars: 1950 });
     expect(db.lastCall()).not.toHaveProperty("writeTokens");
     await db.appendRows("t", []);
     expect(db.lastCall()).toMatchObject({ writeTokens: 2 });
     expect(db.lastCall()).not.toHaveProperty("readTokens");
     expect(db.lastCall()).not.toHaveProperty("resultBytes");
+    expect(db.lastCall()).not.toHaveProperty("inferenceNanodollars");
     await db.querySql("SELECT 1");
     expect(db.lastCall()).not.toHaveProperty("readTokens");
     expect(db.lastCall()).not.toHaveProperty("writeTokens");
     expect(db.lastCall()).not.toHaveProperty("resultBytes");
+    expect(db.lastCall()).not.toHaveProperty("inferenceNanodollars");
   });
 
   it("starts with no last call", () => {

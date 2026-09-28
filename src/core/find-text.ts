@@ -22,7 +22,7 @@
 // that declares several names says nothing, since the line is inside one
 // of them and the list would not say which.
 
-import type { FindLocations, FindMatch, FindResult } from "./searcher.js";
+import { citeOf, type FindBlock, type FindLocations, type FindMatch, type FindResult } from "./searcher.js";
 
 /** Separates one match's context group from the next, as grep does. */
 const GROUP_SEPARATOR = "--";
@@ -48,6 +48,10 @@ export interface FindTextExtras {
   autoIndexed?: string;
   tookMs?: number;
   usage?: string;
+  /** Set when the caller named neither chunks nor context and each block was
+   * trimmed to this many lines around its matches by default: said on the
+   * result, with the forms to ask for instead. */
+  aroundByDefault?: number;
 }
 
 /** The one definition a match sits in, when the window names exactly one;
@@ -74,6 +78,33 @@ export function renderMatch(m: FindMatch): string[] {
   return lines;
 }
 
+/** Opens a block in a chunks-mode find, before its citation. */
+const BLOCK_HEADING = "==";
+/** Between a carried line's number and its text: the numbering search hits
+ * and file reads use, so a block reads as a file read reads. */
+const BLOCK_LINE_SEPARATOR = ": ";
+
+/** Stands between two runs of a trimmed block, where lines were left out:
+ * grep's own group separator, so the numbers on either side say how many. */
+const BLOCK_GAP = GROUP_SEPARATOR;
+
+/** One block of a chunks-mode find: a heading with the block's citation, its
+ * one definition when there is one, and the lines that matched, then the
+ * block's lines numbered, `--` where a trimmed block leaves lines out. The
+ * citation is the carried span, so it can be quoted as it stands. */
+export function renderBlock(b: FindBlock): string[] {
+  const name = enclosingName(b.symbol);
+  const heading =
+    `${BLOCK_HEADING} ${citeOf(b.path, b.start, b.end)}${name ? `  [${name}]` : ""}` +
+    `  match${b.hits.length === 1 ? "" : "es"} at ${b.hits.join(", ")}`;
+  const out = [heading];
+  b.lines.forEach((l, i) => {
+    if (i > 0 && l.line !== b.lines[i - 1].line + 1) out.push(BLOCK_GAP);
+    out.push(`${l.line}${BLOCK_LINE_SEPARATOR}${l.text}`);
+  });
+  return out;
+}
+
 const placesOf = (more: FindLocations[] | undefined): number => (more ?? []).reduce((n, f) => n + f.lines.length, 0);
 
 /** The whole result as text: a first line with the counts and the scope,
@@ -89,18 +120,57 @@ export function renderFind(result: FindResult, extras: FindTextExtras = {}): str
     (result.under ? ` under ${result.under}` : "") +
     (result.ignoreCase ? ", ignoring case" : "") +
     (result.definedFrom !== undefined ? `; ${result.total} of ${result.definedFrom} inside a definition of it` : "") +
-    (result.truncated ? `; the first ${listed} listed` : "");
+    (result.skip ? `; from match ${result.skip + 1}` : "") +
+    (result.truncated ? `; ${result.skip ? "the next" : "the first"} ${listed} listed` : "");
   out.push(head);
   if (result.partial) out.push(`partial index: ${result.partial.note}`);
+  // More pages: said first, in so many words, and the matches they carry
+  // are NOT listed by file below. Listed by file, they read as a to-do list
+  // of files, and the model took them a file at a time - ten and then
+  // fifteen scoped finds over several turns on the demo (2026-09-28), with
+  // the page starts ignored in the hint at the bottom.
+  const pages = result.pages ?? [];
+  if (extras.aroundByDefault !== undefined && result.blocks) {
+    out.push(
+      `each match in its block with the ${extras.aroundByDefault} lines around it; chunks: false for the matching ` +
+        "lines alone, chunks: true for whole blocks, context for another width",
+    );
+  }
+  if (result.trimmedTo !== undefined) {
+    out.push(
+      `blocks trimmed to ${result.trimmedTo} lines around each match, since whole blocks would take many more pages; ` +
+        "set context for another width",
+    );
+  }
+  if (pages.length > 0) {
+    const from = (result.skip ?? 0) + 1;
+    out.push(
+      `this result carries matches ${from}-${from + result.matches.length - 1} of ${result.total}. The rest are in ` +
+        `${pages.length} more page${pages.length === 1 ? "" : "s"}: call find now with the same query and options and ` +
+        `skip ${pages.join(", skip ")} - ${pages.length === 1 ? "that call" : `all ${pages.length} calls in this one reply`}, ` +
+        "not a find per file.",
+    );
+  }
   out.push("");
-  const withContext = result.matches.some((m) => (m.before?.length ?? 0) + (m.after?.length ?? 0) > 0);
-  result.matches.forEach((m, i) => {
-    if (withContext && i > 0) out.push(GROUP_SEPARATOR);
-    out.push(...renderMatch(m));
-  });
-  if (result.more?.length) {
+  if (result.blocks) {
+    result.blocks.forEach((b, i) => {
+      if (i > 0) out.push("");
+      out.push(...renderBlock(b));
+    });
+  } else {
+    const withContext = result.matches.some((m) => (m.before?.length ?? 0) + (m.after?.length ?? 0) > 0);
+    result.matches.forEach((m, i) => {
+      if (withContext && i > 0) out.push(GROUP_SEPARATOR);
+      out.push(...renderMatch(m));
+    });
+  }
+  if (result.more?.length && pages.length === 0) {
     out.push("");
-    out.push(`${beyond} more place${beyond === 1 ? "" : "s"}, text not carried (path: lines):`);
+    out.push(
+      result.blocks
+        ? `${beyond} more matching line${beyond === 1 ? "" : "s"}, block not carried (path: lines):`
+        : `${beyond} more place${beyond === 1 ? "" : "s"}, text not carried (path: lines):`,
+    );
     for (const f of result.more) out.push(`${f.path}: ${f.lines.join(", ")}`);
   }
   if (result.byFile.length > 0) {

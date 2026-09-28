@@ -95,7 +95,13 @@ export { jsonify } from "./json.js";
  * part of a tool result. */
 export function hostedTelemetry(
   handle: { hosted?: HostedDb },
-): { rttMs: number; readTokens?: number; writeTokens?: number; resultBytes?: number } | undefined {
+): {
+  rttMs: number;
+  readTokens?: number;
+  writeTokens?: number;
+  resultBytes?: number;
+  inferenceNanodollars?: number;
+} | undefined {
   const info = handle.hosted?.lastCall();
   if (!info) return undefined;
   return {
@@ -105,6 +111,9 @@ export function hostedTelemetry(
     // The bytes the platform's egress meter recorded for the response,
     // filed beside the tokens so a bill reads the metered figure.
     ...(info.resultBytes !== undefined ? { resultBytes: info.resultBytes } : {}),
+    // What the call's inference was billed, as the platform metered it,
+    // for the same reason.
+    ...(info.inferenceNanodollars !== undefined ? { inferenceNanodollars: info.inferenceNanodollars } : {}),
   };
 }
 
@@ -386,6 +395,30 @@ export interface FindMatch {
   after?: string[];
 }
 
+/** One line a block carries: its number in the file and its text, cut to
+ * FIND_LINE_CAP. */
+export interface FindBlockLine {
+  line: number;
+  text: string;
+}
+
+/** One block of code a chunks-mode find carries: the lines of the chunk that
+ * holds its matches, numbered - all of them, or with `context` the ones near
+ * a match. Overlapping windows are carried once: a line an earlier block in
+ * the same file wrote is not written again. */
+export interface FindBlock {
+  path: string;
+  /** First and last line carried, 1-based and inclusive. */
+  start: number;
+  end: number;
+  /** Definition name(s) of the chunk, when known. */
+  symbol?: string;
+  /** The lines carried, in order; a gap in the numbers is lines left out. */
+  lines: FindBlockLine[];
+  /** The matching lines the block holds, in order. */
+  hits: number[];
+}
+
 /** Matching lines in one file - the `grep -c` view. */
 export interface FindFileCount {
   path: string;
@@ -396,8 +429,12 @@ export interface FindResult {
   query: string;
   ignoreCase: boolean;
   /** Matching lines in path then line order, cut at the limit, with their
-   * text while the character budget lasts. */
+   * text while the character budget lasts. In chunks mode, the matches whose
+   * block is carried. */
   matches: FindMatch[];
+  /** Chunks mode only: the blocks of code the carried matches sit in, each
+   * once, in path then line order. */
+  blocks?: FindBlock[];
   /** The matching lines within the limit that the text budget did not
    * reach: every one of them, as path and line numbers by file, no excerpt. */
   more?: FindLocations[];
@@ -421,7 +458,34 @@ export interface FindResult {
   /** Echoed when `under` scoped the result, so a caller reading the answer
    * knows the counts describe a subtree and not the repository. */
   under?: string;
+  /** Echoed when `skip` passed over matching lines: where this page starts. */
+  skip?: number;
+  /** When matches remain after this page: the `skip` each following page
+   * starts at, computed with the same budget, so every page is one call
+   * and they can all be asked for at once. At most MAX_FIND_PAGES. */
+  pages?: number[];
+  /** Set when a chunks find given no context trimmed its blocks to this many
+   * lines around each match, because whole blocks would have taken more
+   * pages (see AUTO_CHUNK_CONTEXT). */
+  trimmedTo?: number;
 }
+
+/** Following pages a find result names at most; a result wider than this
+ * says so, and the last page names the next. Sixteen, because at eight the
+ * demo's unsafe question (2026-09-28) needed a third message for the pages
+ * the eighth named. */
+export const MAX_FIND_PAGES = 16;
+
+/** Lines kept around each match when a chunks find was given no context and
+ * its whole blocks would need more than one further page: the width that
+ * carried the most sites with their comment in one page over the engine
+ * (2026-09-28, `unsafe {`: 44 a page against 10 for whole blocks, 23 of the
+ * 44 with their SAFETY comment). */
+export const AUTO_CHUNK_CONTEXT = 4;
+/** Further pages whole blocks may take before a chunks find with no context
+ * trims them to AUTO_CHUNK_CONTEXT: one, so a find that fits in two pages
+ * keeps its whole blocks. */
+const WHOLE_BLOCK_MAX_PAGES = 1;
 
 export interface FindOptions {
   /** Match regardless of letter case. Default false: case-sensitive, like grep. */
@@ -455,6 +519,25 @@ export interface FindOptions {
    * context on the match it has no reason to. Clamped to MAX_FIND_CONTEXT;
    * a window is about sixty lines, so context past its edge is cut there. */
   context?: number;
+  /** Carry each match with the whole chunk it sits in, once, instead of the
+   * matching line alone. For a question about what each match does or
+   * relies on: the demo's "where does this codebase use unsafe, and what
+   * invariant does each block rely on" (2026-09-28) came back as 136 lines
+   * in one find, the invariant of none of them - it lives in the SAFETY
+   * comment above the line - and the model then read 26 windows by hand.
+   * Overlapping windows are carried once (see `findBlocks`); the text budget
+   * is the same, and blocks past it keep their matches' places. With
+   * `context` set too, each block keeps only that many lines around its
+   * matches, merged where they meet: the form for a question over many
+   * sites. */
+  chunks?: boolean;
+  /** Matching lines to pass over before this result starts, in the result's
+   * own order (path, then line): the next page of a find its budget cut. A
+   * result names where each following page starts (`pages`), so the rest
+   * of a wide find is one reply of calls rather than one per file (the
+   * demo, 2026-09-28: a find told to scope follow-ups by file wrote ten of
+   * them, a second of the model's writing each). */
+  skip?: number;
   /** Characters of match text this call may carry, when the caller has less
    * than the whole budget to give it: a batch of finds shares one budget
    * (FIND_RESULT_CHAR_BUDGET) between its queries, so four queries at once
@@ -507,9 +590,12 @@ const FIND_LINE_CAP = 240;
  * just capping rows and dropping them that would suck"). */
 export const FIND_RESULT_CHAR_BUDGET = 24_000;
 
-/** Characters a match costs beyond its path and text: the line number and
- * the JSON around them, as the result is written. */
+/** Characters a match costs beyond its path and text: the line number, the
+ * separators and the bracketed definition, as the result is written. */
 const FIND_MATCH_OVERHEAD = 40;
+/** Characters a context line costs beyond its text and its path, which grep's
+ * shape writes on every line: the line number and the two separators. */
+const FIND_CONTEXT_LINE_OVERHEAD = 8;
 
 /** The matches past the text budget, by file: every place, no excerpt. A
  * line's text is one sql statement away (SELECT start_line, content FROM
@@ -531,19 +617,129 @@ export function cutFindMatches(
   const matches: FindMatch[] = [];
   const more: FindLocations[] = [];
   let chars = 0;
+  // Once one match does not fit, none after it is carried either: what a
+  // result carries is always the first run of its matches, so `skip` can
+  // pick up exactly where it stopped.
+  let full = false;
   for (const m of rows.slice(0, limit)) {
-    const around = [...(m.before ?? []), ...(m.after ?? [])].reduce((n, l) => n + l.length + 4, 0);
+    // A context line is written as `path-line-text`, so it costs its path
+    // too: counting its text alone let a context find come back a third over
+    // the budget (measured 2026-09-28: 31,000 characters written against a
+    // 24,000 budget for `unsafe {` with three lines of context).
+    const around = [...(m.before ?? []), ...(m.after ?? [])].reduce(
+      (n, l) => n + l.length + m.path.length + FIND_CONTEXT_LINE_OVERHEAD,
+      0,
+    );
     const size = m.path.length + m.text.length + (m.symbol?.length ?? 0) + around + FIND_MATCH_OVERHEAD;
-    if (matches.length === 0 || chars + size <= budget) {
+    if (!full && (matches.length === 0 || chars + size <= budget)) {
       matches.push(m);
       chars += size;
+      continue;
+    }
+    full = true;
+    const last = more.at(-1);
+    if (last && last.path === m.path) last.lines.push(m.line);
+    else more.push({ path: m.path, lines: [m.line] });
+  }
+  return { matches, more };
+}
+
+/** A chunk a find read its matches from: where it starts and what it holds. */
+export interface FindChunk {
+  path: string;
+  start: number;
+  content: string;
+  symbol?: string;
+}
+
+/** Characters a block costs beyond its lines: the header naming its place,
+ * its definition and its matching lines. */
+const FIND_BLOCK_OVERHEAD = 60;
+/** Characters a carried line costs beyond its text: its number and `: `. */
+const FIND_BLOCK_LINE_OVERHEAD = 8;
+
+/** The blocks a chunks-mode find carries for `rows` (the matches within the
+ * limit): each match goes to the first chunk, by path then start line, that
+ * holds it; a chunk with no match of its own is not carried; and a line an
+ * earlier carried block in the same file wrote is not written again, so
+ * fixed windows that overlap are written once. With `around`, a block keeps
+ * only the lines within that many of one of its matches - the comment above
+ * each and the lines below, merged where they meet - rather than the whole
+ * window: the shape a question over many sites needs, since a whole window
+ * is about 2,500 characters and the budget holds nine (measured 2026-09-28,
+ * `unsafe {` over the engine). Blocks are carried while `budget` lasts - the
+ * first always, so one long block still comes back - and the matches of the
+ * rest keep their places in `more`, as a line-mode find's do. */
+export function findBlocks(
+  chunks: readonly FindChunk[],
+  rows: readonly FindMatch[],
+  budget = FIND_RESULT_CHAR_BUDGET,
+  around?: number,
+): { blocks: FindBlock[]; matches: FindMatch[]; more: FindLocations[] } {
+  const wanted = new Set(rows.map((m) => `${m.path} ${m.line}`));
+  const assigned = new Set<string>();
+  const sorted = [...chunks].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : a.start - b.start));
+  const blocks: FindBlock[] = [];
+  const carried = new Set<string>();
+  const written = new Set<string>();
+  let chars = 0;
+  // As in `cutFindMatches`: after the first block that does not fit, no
+  // later one is carried, so the carried matches are always the first run
+  // of `rows` and a `skip` resumes exactly after them. (Chunks are in path
+  // then line order, as `rows` are, so blocks are carried in row order.)
+  let full = false;
+  for (const chunk of sorted) {
+    const lines = chunk.content.split("\n").map((l) => l.replace(/\r$/, ""));
+    if (lines.at(-1) === "") lines.pop();
+    const end = chunk.start + lines.length - 1;
+    const hits: number[] = [];
+    for (let line = chunk.start; line <= end; line++) {
+      const key = `${chunk.path} ${line}`;
+      if (wanted.has(key) && !assigned.has(key)) {
+        assigned.add(key);
+        hits.push(line);
+      }
+    }
+    if (hits.length === 0) continue;
+    const near = (line: number) => around === undefined || hits.some((h) => Math.abs(h - line) <= around);
+    const kept: FindBlockLine[] = [];
+    for (let line = chunk.start; line <= end; line++) {
+      if (written.has(`${chunk.path} ${line}`) || !near(line)) continue;
+      kept.push({ line, text: lines[line - chunk.start].slice(0, FIND_LINE_CAP) });
+    }
+    const size =
+      chunk.path.length +
+      (chunk.symbol?.length ?? 0) +
+      FIND_BLOCK_OVERHEAD +
+      kept.reduce((n, l) => n + l.text.length + FIND_BLOCK_LINE_OVERHEAD, 0);
+    if (full || (blocks.length > 0 && chars + size > budget)) {
+      full = true;
+      continue;
+    }
+    chars += size;
+    for (const l of kept) written.add(`${chunk.path} ${l.line}`);
+    for (const line of hits) carried.add(`${chunk.path} ${line}`);
+    blocks.push({
+      path: chunk.path,
+      start: kept[0]?.line ?? hits[0],
+      end: kept.at(-1)?.line ?? hits.at(-1)!,
+      ...(chunk.symbol ? { symbol: chunk.symbol } : {}),
+      lines: kept,
+      hits,
+    });
+  }
+  const matches: FindMatch[] = [];
+  const more: FindLocations[] = [];
+  for (const m of rows) {
+    if (carried.has(`${m.path} ${m.line}`)) {
+      matches.push({ path: m.path, line: m.line, text: m.text, ...(m.symbol ? { symbol: m.symbol } : {}) });
       continue;
     }
     const last = more.at(-1);
     if (last && last.path === m.path) last.lines.push(m.line);
     else more.push({ path: m.path, lines: [m.line] });
   }
-  return { matches, more };
+  return { blocks, matches, more };
 }
 
 /** Characters kept ahead of the match when a long line is cut to a window, so
@@ -727,8 +923,13 @@ function checkFindQuery(query: string, analyzer: Analyzer, column: string, limit
 export async function find(handle: IndexHandle, query: string, opts: FindOptions = {}): Promise<FindResult> {
   const limit = checkFindQuery(query, analyzerOf(handle.manifest), CONTENT_COLUMN, opts.limit);
   const ignoreCase = opts.ignoreCase ?? false;
-  const context = Math.min(Math.max(0, Math.trunc(opts.context ?? 0)), MAX_FIND_CONTEXT);
+  const chunksMode = opts.chunks === true;
+  const asked = opts.context === undefined ? undefined : Math.min(Math.max(0, Math.trunc(opts.context)), MAX_FIND_CONTEXT);
+  // In chunks mode the context trims the block rather than being cut out
+  // around each match a second time.
+  const context = chunksMode ? 0 : (asked ?? 0);
   const partial = partialIndex(handle.manifest);
+  const held: FindChunk[] = [];
 
   const terms = plainTerms(query);
   const candidates = localDb(handle).openTable(TABLE).tokenMatch(CONTENT_COLUMN, terms, { mode: "and", projection: FIND_PROJECTION });
@@ -746,7 +947,11 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
     if (under !== undefined && path !== under && !path.startsWith(`${under}/`)) continue;
     const symbol = row.symbol ? String(row.symbol) : undefined;
     const declares = definesName(symbol, query, ignoreCase);
-    for (const m of matchLines(String(row.content), Number(row.start_line), query, ignoreCase, context)) {
+    const found = matchLines(String(row.content), Number(row.start_line), query, ignoreCase, context);
+    if (chunksMode && found.length > 0) {
+      held.push({ path, start: Number(row.start_line), content: String(row.content), ...(symbol ? { symbol } : {}) });
+    }
+    for (const m of found) {
       const key = `${path} ${m.line}`;
       if (declares) declaring.add(key);
       if (seen.has(key)) continue;
@@ -777,19 +982,55 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
     opts.budget !== undefined && Number.isFinite(opts.budget) && opts.budget > 0
       ? Math.min(Math.floor(opts.budget), FIND_RESULT_CHAR_BUDGET)
       : FIND_RESULT_CHAR_BUDGET;
-  const { matches, more } = cutFindMatches(rows, limit, budget);
+  if (opts.skip !== undefined && (!Number.isInteger(opts.skip) || opts.skip < 0)) {
+    throw new Error(`skip must be a non-negative integer, got ${opts.skip}`);
+  }
+  const skip = opts.skip ?? 0;
+  // One page: the `limit` matching lines from `start`, carried while the
+  // budget lasts. Every page carries a first run of its lines (see
+  // `cutFindMatches`), so the next page starts right after them.
+  const pageAt = (start: number, around: number | undefined) =>
+    chunksMode
+      ? findBlocks(held, rows.slice(start, start + limit), budget, around)
+      : cutFindMatches(rows.slice(start), limit, budget);
+  // Where each page after `start` begins, with the same cut, so the caller
+  // can ask for all of them in one reply.
+  const pagesAfter = (start: number, first: number, around: number | undefined, cap: number): number[] => {
+    const out: number[] = [];
+    for (let next = start + first; next < rows.length && out.length < cap; ) {
+      out.push(next);
+      next += Math.max(1, pageAt(next, around).matches.length);
+    }
+    return out;
+  };
+  // A chunks find given no context keeps whole blocks while they fit in two
+  // pages; past that it trims them, since whole windows made the demo's
+  // unsafe question twelve pages where trimmed ones make three (2026-09-28).
+  // The page computed from `skip` 0 decides, so every page of one find
+  // trims alike.
+  let around = asked;
+  if (chunksMode && asked === undefined && pagesAfter(0, pageAt(0, undefined).matches.length, undefined, WHOLE_BLOCK_MAX_PAGES + 1).length > WHOLE_BLOCK_MAX_PAGES) {
+    around = AUTO_CHUNK_CONTEXT;
+  }
+  const cut: { matches: FindMatch[]; more: FindLocations[]; blocks?: FindBlock[] } = pageAt(skip, around);
+  const { matches, more, blocks } = cut;
+  const pages = pagesAfter(skip, matches.length, around, MAX_FIND_PAGES);
   return {
     query,
     ignoreCase,
     matches,
+    ...(blocks ? { blocks } : {}),
     ...(more.length ? { more } : {}),
     total: rows.length,
     files: byFile.length,
     byFile,
-    ...(rows.length > limit ? { truncated: true } : {}),
+    ...(rows.length - skip > limit ? { truncated: true } : {}),
     ...(partial ? { partial } : {}),
     ...(opts.defines ? { definedFrom: matched } : {}),
     ...(under !== undefined ? { under } : {}),
+    ...(skip > 0 ? { skip } : {}),
+    ...(pages.length ? { pages } : {}),
+    ...(around !== asked ? { trimmedTo: around } : {}),
   };
 }
 
@@ -868,23 +1109,75 @@ export const READ_LINES_CAP = 400;
  * call. The same size as a sql result's budget. */
 export const READ_CHAR_BUDGET = 24_000;
 
+/** Stands between two ranges of one file in a read of several: grep's group
+ * separator, as a trimmed find block writes it, so the numbers on either
+ * side say what was left out. */
+const READ_RANGE_GAP = "--";
+
+/** One line range of a read, 1-based and inclusive. */
+export interface ReadRange {
+  from: number;
+  to: number;
+}
+
+/** Where the next page of a read starts: the line after the last one
+ * returned, or - for a read of several ranges - the ranges still to come,
+ * the first cut to start after that line, in the same paired form they were
+ * asked for. */
+export type ReadMore = { from: number } | { from: number[]; to: number[] };
+
 export interface ReadFileResult {
   path: string;
   /** The first and last line returned. */
   from: number;
   to: number;
-  /** The lines, each numbered with its line in the file. Empty past the
-   * result budget, with `note` saying so. */
+  /** The lines, each numbered with its line in the file; in a read of
+   * several ranges, READ_RANGE_GAP between two that do not meet. Empty past
+   * the result budget, with `note` saying so. */
   lines: string;
   /** The file's last line as the index holds it. */
   total: number;
-  /** Set when the range asked for goes past the page: where to read next. */
-  more?: { from: number };
+  /** Set when the ranges asked for go past the page: where to read next. */
+  more?: ReadMore;
   note?: string;
+}
+
+/** The ranges a read's `from` and `to` name. Plain numbers are the one range
+ * they always were (either end left open); lists pair up in order, one
+ * range per pair - `from [559, 1938], to [610, 1975]` is lines 559-610 and
+ * 1938-1975 - so the windows around several places in a file come back in
+ * one call. Measured on the demo (2026-09-28): Haiku, after a find named
+ * the unsafe sites, wrote exactly those lists in six of its fifteen reads,
+ * and each was refused and retried as one read per range. Undefined when
+ * neither end is given: the whole file. */
+export function readRanges(from: number | number[] | undefined, to: number | number[] | undefined): ReadRange[] | undefined {
+  if (from === undefined && to === undefined) return undefined;
+  if (!Array.isArray(from) && !Array.isArray(to)) {
+    return [{ from: Math.max(1, from ?? 1), to: to ?? Number.MAX_SAFE_INTEGER }];
+  }
+  if (!Array.isArray(from) || !Array.isArray(to) || from.length !== to.length) {
+    throw new Error(
+      "several ranges are lists of the same length in from and to, paired in order: from [10, 200], to [40, 230] " +
+        "reads lines 10-40 and 200-230",
+    );
+  }
+  return from.map((f, i) => ({ from: Math.max(1, f), to: to[i] }));
 }
 export interface ReadFileMiss {
   path: string;
   error: string;
+}
+
+/** Where a read cut at `last` resumes: the next line, with the same end, for
+ * one range; for several, every range not yet finished, the first starting
+ * after `last`. */
+function moreAfter(ranges: readonly ReadRange[], last: number): ReadMore {
+  if (ranges.length === 1) return { from: last + 1 };
+  const rest = [...ranges]
+    .sort((a, b) => a.from - b.from)
+    .filter((r) => r.to > last)
+    .map((r) => ({ from: Math.max(r.from, last + 1), to: r.to }));
+  return { from: rest.map((r) => r.from), to: rest.map((r) => r.to) };
 }
 
 /** The lines of the files named, from the index rather than the disk - the
@@ -892,17 +1185,21 @@ export interface ReadFileMiss {
  * a caller does after the index has named the files it wants, in one call
  * rather than one read per file. Chunks are stitched by line number, so a
  * line in two overlapping windows appears once. `from`/`to` cut every file
- * to a line range; a file over READ_LINES_CAP lines comes back a page at a
- * time with `more`. A path the index does not hold is a miss beside the
- * others, never a failure of the call. */
+ * to a line range, and `ranges` to several (see `readRanges`), merged where
+ * they meet; a file over READ_LINES_CAP lines comes back a page at a time
+ * with `more`. A path the index does not hold is a miss beside the others,
+ * never a failure of the call. */
 export async function readFiles(
   handle: IndexHandle,
   paths: string[],
-  opts: { from?: number; to?: number } = {},
+  opts: { from?: number; to?: number; ranges?: ReadRange[] } = {},
 ): Promise<Array<ReadFileResult | ReadFileMiss>> {
-  const from = Math.max(1, opts.from ?? 1);
-  const to = opts.to ?? Number.MAX_SAFE_INTEGER;
-  if (to < from) throw new Error(`to (${to}) is before from (${from})`);
+  const ranges = opts.ranges ?? readRanges(opts.from, opts.to) ?? [{ from: 1, to: Number.MAX_SAFE_INTEGER }];
+  for (const r of ranges) {
+    if (r.to < r.from) throw new Error(`to (${r.to}) is before from (${r.from})`);
+  }
+  const several = ranges.length > 1;
+  const first = Math.min(...ranges.map((r) => r.from));
   const db = localDb(handle);
   const files = await Promise.all(
     paths.map(async (path): Promise<ReadFileResult | ReadFileMiss> => {
@@ -921,17 +1218,21 @@ export async function readFiles(
       }
       const numbers = [...byLine.keys()].sort((a, b) => a - b);
       const total = numbers[numbers.length - 1];
-      const wanted = numbers.filter((n) => n >= from && n <= to);
+      const wanted = numbers.filter((n) => ranges.some((r) => n >= r.from && n <= r.to));
       const page = wanted.slice(0, READ_LINES_CAP);
-      const lines = page.map((n) => `${n}${LINE_NUMBER_SEPARATOR}${byLine.get(n)}`).join("\n");
-      const last = page[page.length - 1] ?? from;
+      const numbered: string[] = [];
+      page.forEach((n, i) => {
+        if (several && i > 0 && n !== page[i - 1] + 1) numbered.push(READ_RANGE_GAP);
+        numbered.push(`${n}${LINE_NUMBER_SEPARATOR}${byLine.get(n)}`);
+      });
+      const last = page[page.length - 1] ?? first;
       return {
         path,
-        from: page[0] ?? from,
+        from: page[0] ?? first,
         to: last,
-        lines,
+        lines: numbered.join("\n"),
         total,
-        ...(wanted.length > page.length ? { more: { from: last + 1 } } : {}),
+        ...(wanted.length > page.length ? { more: moreAfter(ranges, last) } : {}),
       };
     }),
   );

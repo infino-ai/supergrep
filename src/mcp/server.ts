@@ -169,7 +169,9 @@ import {
   searchHosted,
   searchRows,
   readFiles,
+  readRanges,
   READ_LINES_CAP,
+  AUTO_CHUNK_CONTEXT,
   runSql,
   runSqlRows,
   embedsAQuery,
@@ -179,6 +181,7 @@ import {
   CONTENT_COLUMN,
   FIND_RESULT_CHAR_BUDGET,
   MAX_FIND_CONTEXT,
+  MAX_FIND_PAGES,
 } from "../core/searcher.js";
 import { renderFind } from "../core/find-text.js";
 import {
@@ -246,6 +249,24 @@ const CARD_TIER = "lean";
  * so every fan-out sentence in the descriptions below (`PREFER_SEVERAL_ASKS`)
  * was a promise the harness could not keep. */
 const READ_ONLY = { readOnlyHint: true } as const;
+
+/** A value sent as the JSON text of itself, read as the value: `"[559, 592]"`
+ * as the list, `"12"` as the number. Anything else passes through for the
+ * schema to judge. */
+function jsonOrAsIs(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+/** A line number or a list of them, for read's from and to. A list sent as
+ * its JSON text is read as the list: the demo's Haiku (2026-09-28) sent
+ * `from: "[559, 592, 623]"` in six of fifteen reads, and the schema refused
+ * each one before the read ran. */
+export const lineOrLines = z.preprocess(jsonOrAsIs, z.union([z.number().int().positive(), z.array(z.number().int().positive()).min(1)]));
 
 /** How long `sql` waits for the platform's verdict on its rows before
  * returning them without one. Short on purpose: the rows are the answer and
@@ -509,17 +530,68 @@ export const PER_PROJECT_COUNT =
   "SELECT split_part(path,'/',1) AS project, count(*) AS lines FROM token_match('chunks','content','<the " +
   "term>','and') GROUP BY 1 ORDER BY 2 DESC (GROUP BY path for the count per file).";
 
+/** The form a find carries its matches in, from what the caller set. Given
+ * neither chunks nor context, each match comes in its block trimmed to
+ * AUTO_CHUNK_CONTEXT lines around it - the comment above it and the lines
+ * below - rather than as the matching line alone: the demo's Haiku
+ * (2026-09-28) never set chunks on "where does this codebase use unsafe,
+ * and what invariant does each block rely on", took the bare lines, and read
+ * fifteen windows by hand for the SAFETY comments, where the same model with
+ * Grep asked for context unprompted. The tool text telling it when to set
+ * chunks moved Opus and Sonnet and not Haiku; a default moves every model.
+ * Either option set is the caller's choice and stands: chunks false is the
+ * matching line alone (with context, grep's -B/-A lines), chunks true the
+ * whole block. `aroundByDefault` is set when the default applied, so the
+ * result can say so and name the other forms. */
+export function findForm(
+  chunks: boolean | undefined,
+  context: number | undefined,
+): { chunks?: boolean; context?: number; aroundByDefault?: number } {
+  if (chunks === undefined && context === undefined) {
+    return { chunks: true, context: AUTO_CHUNK_CONTEXT, aroundByDefault: AUTO_CHUNK_CONTEXT };
+  }
+  return { chunks, context };
+}
+
 /** The hint on an empty find, or null when the result needs none: a query
  * with spaces is a phrase or a signature, which one exact line may never
  * hold; with `defines` on and nothing found, the name itself is in doubt.
  * A bare identifier that is simply absent gets no hint - zero is the answer. */
-export function findHint(query: string, total: number, defines: boolean, withText = total, listed = total): string | null {
+export function findHint(
+  query: string,
+  total: number,
+  defines: boolean,
+  withText = total,
+  listed = total,
+  blocks = false,
+  pages?: number[],
+): string | null {
+  // Pages: the result names where each following page starts, so the rest
+  // is one reply of finds with skip - not one find per file, which the demo
+  // wrote ten of (2026-09-28), and never a read per line.
+  if (pages && pages.length > 0) {
+    const tail = pages.length >= MAX_FIND_PAGES ? " The last of them names where the next pages start." : "";
+    return (
+      `This result carried ${withText} of the ${total} matching lines${blocks ? " with their blocks" : " with their text"}. ` +
+      `For the rest, find again with the same query and options and skip set to each of ${pages.join(", ")} - all ` +
+      `of them in the same reply, one call each; together they carry every remaining match, so no find per file ` +
+      `is needed.${tail} A saved result is not for the shell to read.`
+    );
+  }
   // A flood: the counts are complete, every place within the limit is
   // listed, and the text of the rest is one sql away - never the shell over
   // a saved result (the demo, 2026-09-24: a 58,000-character find went to a
   // file and Bash read it).
   if (total > withText) {
     const beyond = total > listed ? ` ${total - listed} more are in the total and the per-file counts but not listed.` : "";
+    // A chunks find past its budget: the rest's blocks are one more chunks
+    // find away, not a read per line.
+    if (blocks) {
+      return (
+        `${withText} of ${total} matching lines came with their block; the rest are listed by path and line after ` +
+        `them.${beyond} For their blocks, find again with chunks and skip. A saved result is not for the shell to read.`
+      );
+    }
     return (
       `${withText} of ${total} lines carry their text; the rest are listed by path and line after them.${beyond} ` +
       "For a line's text, sql: SELECT start_line, content FROM the table WHERE path = '...' AND start_line <= " +
@@ -1953,8 +2025,16 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         FIND_BY_BARE_NAME +
         // A flood keeps every place: the lines past the text budget come as
         // path and line numbers (`more`), and a line's text is a sql read.
-        " The lines around a match - what leads into an error and follows it - come with it when you ask " +
-        "for context (like grep -B/-A); no file need be opened for them. " +
+        // The demo, 2026-09-28: "where does this codebase use unsafe, and
+        // what invariant does each block rely on" was one find for the lines
+        // and then 26 reads, one per site, for the comment above each; and
+        // Haiku, told to set chunks for exactly this, did not (findForm).
+        ` Each match comes in the block of code it sits in, with the ${AUTO_CHUNK_CONTEXT} lines around it - the ` +
+        "comment above it, the lines below - numbered as a file read is and merged where they meet, so what each " +
+        "match does or relies on is in the result and no file need be opened. chunks: true carries whole blocks; " +
+        "chunks: false the matching line alone, as grep -n does, and with context the lines before and after it " +
+        "(grep -B/-A). When a result names further pages, ask for every one of them in the same reply with skip. " +
+        "Never follow a find with a read per match. " +
         "A wide result lists every matching place: the first lines with their text, the rest by path and " +
         "line after them; a line's text is one sql statement away, and the per-file counts count them all. " +
         "A count per project or per file - which projects use X, how many times each - is one sql statement, " +
@@ -2025,9 +2105,31 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           .max(MAX_FIND_CONTEXT)
           .optional()
           .describe(
-            "Lines before and after each match to carry, from the match's own window - what grep -B/-A " +
-              "shows - so the lines that lead into an error and follow it come with the match, without " +
-              "opening the file. Up to 20; more than a few matches with context is a wide result.",
+            `Lines around each match to carry. Unset, each match comes in its block with ${AUTO_CHUNK_CONTEXT} lines ` +
+              "around it. With chunks true, each block keeps this many lines around its matches; given alone or " +
+              "with chunks false, the matching line comes with this many lines before and after it, as grep -B/-A " +
+              "shows. Up to 20; more than a few matches with context is a wide result.",
+          ),
+        chunks: z
+          .boolean()
+          .optional()
+          .describe(
+            `Unset, each match comes in the block of code it sits in, trimmed to ${AUTO_CHUNK_CONTEXT} lines around ` +
+              "it, its lines numbered. true: the whole block - the chunk the index holds it in - for the body " +
+              "around a match; past two pages of whole blocks they are trimmed too, and the result says so. " +
+              "false: the matching line alone, as grep -n writes it - for a list of places or a count. A block " +
+              "holding several matches comes once, and overlapping blocks are not repeated. The text budget " +
+              "still applies; the matches of blocks past it are listed by path and line.",
+          ),
+        skip: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Matching lines to pass over before this result starts: the next page of a find its budget cut. A " +
+              "result that could not carry every match names the skip of each following page; ask for all of " +
+              "them in one reply, one call each, rather than one find per file.",
           ),
         path: z
           .string()
@@ -2039,7 +2141,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           ),
       },
     },
-    async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, path, share }) => {
+    async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, chunks, skip, path, share }) => {
       let ctx: RepoCtx;
       try {
         ctx = repoFor(path);
@@ -2084,17 +2186,21 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         const t0 = performance.now();
         // A batch shares the one text budget between its queries.
         const budget = share && share > 1 ? Math.floor(FIND_RESULT_CHAR_BUDGET / share) : undefined;
-        const result = await find(handle, query, { ignoreCase, defines, under, limit, context, budget });
+        const form = findForm(chunks, context);
+        const result = await find(handle, query, { ignoreCase, defines, under, limit, context: form.context, chunks: form.chunks, skip, budget });
         recordOf(ctx).addLines(TABLE, result.matches);
         const listed = result.matches.length + (result.more ?? []).reduce((n, m) => n + m.lines.length, 0);
-        const hint = findHint(query, result.total, Boolean(defines), result.matches.length, listed) ?? undefined;
+        const hint =
+          findHint(query, result.total, Boolean(defines), result.matches.length, listed, Boolean(result.blocks), result.pages) ??
+          undefined;
         const noted = autoIndexed ? autoIndexNote(autoIndexed) : undefined;
         const tookMs = Math.round((performance.now() - t0) * 1000) / 1000;
+        const aroundByDefault = form.aroundByDefault;
         // Written as grep writes it (`renderFind`); the receipt prices that
         // text, since it is what was returned, and rides on its last line.
         let usage: string | undefined;
         if (receiptOn) {
-          const entry = findEntry(result, false, renderFind(result, { hint, autoIndexed: noted?.note, tookMs }));
+          const entry = findEntry(result, false, renderFind(result, { hint, autoIndexed: noted?.note, tookMs, aroundByDefault }));
           recordUsage(ctx.dir, entry);
           usage = formatReceipt(entry, session);
         }
@@ -2106,7 +2212,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             took_ms: tookMs,
             ...(usage ? { usage } : {}),
           },
-          renderFind(result, { hint, autoIndexed: noted?.note, tookMs, usage }),
+          renderFind(result, { hint, autoIndexed: noted?.note, tookMs, usage, aroundByDefault }),
         );
       } catch (err) {
         return fail(`find failed: ${(err as Error).message}`);
@@ -2292,9 +2398,11 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         description:
           "The numbered lines of the files named - several files in one call, from the index, each line " +
           "as path:line. Use it after find, search, sql or ask have named the files you want, for every " +
-          "file at once, in place of one Read per file. from and to cut every file to a line range; a " +
-          `file over ${READ_LINES_CAP} lines comes back a page at a time, with more saying where the next ` +
-          "page starts. A path the index does not hold comes back as a miss beside the others. " +
+          "file at once, in place of one Read per file. from and to cut every file to a line range; lists " +
+          "in both name several ranges in one call, paired in order (from [559, 1938], to [610, 1975] reads " +
+          "559-610 and 1938-1975), for the windows around several places in a file - never one read per " +
+          `range. A file over ${READ_LINES_CAP} lines comes back a page at a time, with more saying where the ` +
+          "next page starts. A path the index does not hold comes back as a miss beside the others. " +
           "The result includes a 'usage' field, a one-line receipt of tokens returned and files.",
         inputSchema: {
           paths: z
@@ -2302,8 +2410,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             .min(1)
             .max(BATCH_MAX)
             .describe("Repo-relative paths, as find, search, sql and ask cite them - every file you want, in one call."),
-          from: z.number().int().positive().optional().describe("First line to return, in every file named. Default 1."),
-          to: z.number().int().positive().optional().describe("Last line to return, in every file named. Default the end."),
+          from: lineOrLines
+            .optional()
+            .describe("First line to return, in every file named - or a list, one per range, paired with to. Default 1."),
+          to: lineOrLines
+            .optional()
+            .describe("Last line to return, in every file named - or a list, one per range, paired with from. Default the end."),
           path: z
             .string()
             .optional()
@@ -2326,7 +2438,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         if (!autoIndexed) maybeAutoSync(ctx); // a fresh build is already current
         try {
           const t0 = performance.now();
-          const files = await readFiles(handle, paths, { from, to });
+          const files = await readFiles(handle, paths, { ranges: readRanges(from, to) });
           const got = files.filter((f): f is Exclude<typeof f, { error: string }> => !("error" in f));
           recordOf(ctx).addPlaces(TABLE, got.map((f) => ({ path: f.path, startLine: f.from })));
           let usage: string | undefined;
