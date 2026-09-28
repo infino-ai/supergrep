@@ -88,10 +88,13 @@ const ARROW_STREAM_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
 
 /** The metering headers the platform returns on every response: decimal
  * tokens (`"0.050"`), one for reads and one for writes, and the response's
- * bytes as its egress meter recorded them (an integer). */
+ * bytes as its egress meter recorded them (an integer). A call that ran a
+ * model on the caller's behalf (`sub_agent`, `cite`, `join_keys`) also
+ * carries what that inference was billed, in nanodollars (an integer). */
 const READ_TOKENS_HEADER = "x-infino-read-tokens";
 const WRITE_TOKENS_HEADER = "x-infino-write-tokens";
 const RESULT_BYTES_HEADER = "x-infino-result-bytes";
+const INFERENCE_NANODOLLARS_HEADER = "x-infino-inference-nanodollars";
 
 /** The hosts a plaintext `http://` target may name: the request never leaves
  * the machine, so the bearer credential is never on the wire in the clear. */
@@ -141,8 +144,9 @@ export interface HostedTarget {
 
 /** What one logical call cost: the final status, the round trip of the
  * attempt that answered, how many retries the cold-start loop took, the
- * tokens the platform billed and the bytes its egress meter recorded for the
- * response (all from its response headers, when present). */
+ * tokens the platform billed, the bytes its egress meter recorded for the
+ * response, and what the call's inference was billed (all from its response
+ * headers, when present). */
 export interface HostedCallInfo {
   op: string;
   status: number;
@@ -151,6 +155,7 @@ export interface HostedCallInfo {
   readTokens?: number;
   writeTokens?: number;
   resultBytes?: number;
+  inferenceNanodollars?: number;
 }
 
 export interface HostedOptions {
@@ -761,9 +766,11 @@ export class HostedDb {
       const readTokens = tokensHeader(response.headers, READ_TOKENS_HEADER);
       const writeTokens = tokensHeader(response.headers, WRITE_TOKENS_HEADER);
       const resultBytes = tokensHeader(response.headers, RESULT_BYTES_HEADER);
+      const inferenceNanodollars = tokensHeader(response.headers, INFERENCE_NANODOLLARS_HEADER);
       if (readTokens !== undefined) info.readTokens = readTokens;
       if (writeTokens !== undefined) info.writeTokens = writeTokens;
       if (resultBytes !== undefined) info.resultBytes = resultBytes;
+      if (inferenceNanodollars !== undefined) info.inferenceNanodollars = inferenceNanodollars;
 
       if (response.ok) {
         this.record(info);

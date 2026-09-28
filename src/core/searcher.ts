@@ -95,7 +95,13 @@ export { jsonify } from "./json.js";
  * part of a tool result. */
 export function hostedTelemetry(
   handle: { hosted?: HostedDb },
-): { rttMs: number; readTokens?: number; writeTokens?: number; resultBytes?: number } | undefined {
+): {
+  rttMs: number;
+  readTokens?: number;
+  writeTokens?: number;
+  resultBytes?: number;
+  inferenceNanodollars?: number;
+} | undefined {
   const info = handle.hosted?.lastCall();
   if (!info) return undefined;
   return {
@@ -105,6 +111,9 @@ export function hostedTelemetry(
     // The bytes the platform's egress meter recorded for the response,
     // filed beside the tokens so a bill reads the metered figure.
     ...(info.resultBytes !== undefined ? { resultBytes: info.resultBytes } : {}),
+    // What the call's inference was billed, as the platform metered it,
+    // for the same reason.
+    ...(info.inferenceNanodollars !== undefined ? { inferenceNanodollars: info.inferenceNanodollars } : {}),
   };
 }
 
