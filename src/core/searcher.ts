@@ -449,7 +449,17 @@ export interface FindResult {
   /** Echoed when `under` scoped the result, so a caller reading the answer
    * knows the counts describe a subtree and not the repository. */
   under?: string;
+  /** Echoed when `skip` passed over matching lines: where this page starts. */
+  skip?: number;
+  /** When matches remain after this page: the `skip` each following page
+   * starts at, computed with the same budget, so every page is one call
+   * and they can all be asked for at once. At most MAX_FIND_PAGES. */
+  pages?: number[];
 }
+
+/** Following pages a find result names at most; a result wider than this
+ * says so, and the last page names the next. */
+export const MAX_FIND_PAGES = 8;
 
 export interface FindOptions {
   /** Match regardless of letter case. Default false: case-sensitive, like grep. */
@@ -495,6 +505,13 @@ export interface FindOptions {
    * matches, merged where they meet: the form for a question over many
    * sites. */
   chunks?: boolean;
+  /** Matching lines to pass over before this result starts, in the result's
+   * own order (path, then line): the next page of a find its budget cut. A
+   * result names where each following page starts (`pages`), so the rest
+   * of a wide find is one reply of calls rather than one per file (the
+   * demo, 2026-09-28: a find told to scope follow-ups by file wrote ten of
+   * them, a second of the model's writing each). */
+  skip?: number;
   /** Characters of match text this call may carry, when the caller has less
    * than the whole budget to give it: a batch of finds shares one budget
    * (FIND_RESULT_CHAR_BUDGET) between its queries, so four queries at once
@@ -574,6 +591,10 @@ export function cutFindMatches(
   const matches: FindMatch[] = [];
   const more: FindLocations[] = [];
   let chars = 0;
+  // Once one match does not fit, none after it is carried either: what a
+  // result carries is always the first run of its matches, so `skip` can
+  // pick up exactly where it stopped.
+  let full = false;
   for (const m of rows.slice(0, limit)) {
     // A context line is written as `path-line-text`, so it costs its path
     // too: counting its text alone let a context find come back a third over
@@ -584,11 +605,12 @@ export function cutFindMatches(
       0,
     );
     const size = m.path.length + m.text.length + (m.symbol?.length ?? 0) + around + FIND_MATCH_OVERHEAD;
-    if (matches.length === 0 || chars + size <= budget) {
+    if (!full && (matches.length === 0 || chars + size <= budget)) {
       matches.push(m);
       chars += size;
       continue;
     }
+    full = true;
     const last = more.at(-1);
     if (last && last.path === m.path) last.lines.push(m.line);
     else more.push({ path: m.path, lines: [m.line] });
@@ -635,6 +657,11 @@ export function findBlocks(
   const carried = new Set<string>();
   const written = new Set<string>();
   let chars = 0;
+  // As in `cutFindMatches`: after the first block that does not fit, no
+  // later one is carried, so the carried matches are always the first run
+  // of `rows` and a `skip` resumes exactly after them. (Chunks are in path
+  // then line order, as `rows` are, so blocks are carried in row order.)
+  let full = false;
   for (const chunk of sorted) {
     const lines = chunk.content.split("\n").map((l) => l.replace(/\r$/, ""));
     if (lines.at(-1) === "") lines.pop();
@@ -659,7 +686,10 @@ export function findBlocks(
       (chunk.symbol?.length ?? 0) +
       FIND_BLOCK_OVERHEAD +
       kept.reduce((n, l) => n + l.text.length + FIND_BLOCK_LINE_OVERHEAD, 0);
-    if (blocks.length > 0 && chars + size > budget) continue;
+    if (full || (blocks.length > 0 && chars + size > budget)) {
+      full = true;
+      continue;
+    }
     chars += size;
     for (const l of kept) written.add(`${chunk.path} ${l.line}`);
     for (const line of hits) carried.add(`${chunk.path} ${line}`);
@@ -926,10 +956,26 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
     opts.budget !== undefined && Number.isFinite(opts.budget) && opts.budget > 0
       ? Math.min(Math.floor(opts.budget), FIND_RESULT_CHAR_BUDGET)
       : FIND_RESULT_CHAR_BUDGET;
-  const cut: { matches: FindMatch[]; more: FindLocations[]; blocks?: FindBlock[] } = chunksMode
-    ? findBlocks(held, rows.slice(0, limit), budget, asked)
-    : cutFindMatches(rows, limit, budget);
+  if (opts.skip !== undefined && (!Number.isInteger(opts.skip) || opts.skip < 0)) {
+    throw new Error(`skip must be a non-negative integer, got ${opts.skip}`);
+  }
+  const skip = opts.skip ?? 0;
+  // One page: the `limit` matching lines from `start`, carried while the
+  // budget lasts. Every page carries a first run of its lines (see
+  // `cutFindMatches`), so the next page starts right after them.
+  const pageAt = (start: number): { matches: FindMatch[]; more: FindLocations[]; blocks?: FindBlock[] } =>
+    chunksMode
+      ? findBlocks(held, rows.slice(start, start + limit), budget, asked)
+      : cutFindMatches(rows.slice(start), limit, budget);
+  const cut = pageAt(skip);
   const { matches, more, blocks } = cut;
+  // Where each following page starts, worked out now with the same cut, so
+  // the caller can ask for all of them in one reply.
+  const pages: number[] = [];
+  for (let next = skip + matches.length; next < rows.length && pages.length < MAX_FIND_PAGES; ) {
+    pages.push(next);
+    next += Math.max(1, pageAt(next).matches.length);
+  }
   return {
     query,
     ignoreCase,
@@ -939,10 +985,12 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
     total: rows.length,
     files: byFile.length,
     byFile,
-    ...(rows.length > limit ? { truncated: true } : {}),
+    ...(rows.length - skip > limit ? { truncated: true } : {}),
     ...(partial ? { partial } : {}),
     ...(opts.defines ? { definedFrom: matched } : {}),
     ...(under !== undefined ? { under } : {}),
+    ...(skip > 0 ? { skip } : {}),
+    ...(pages.length ? { pages } : {}),
   };
 }
 

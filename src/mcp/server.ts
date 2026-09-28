@@ -179,6 +179,7 @@ import {
   CONTENT_COLUMN,
   FIND_RESULT_CHAR_BUDGET,
   MAX_FIND_CONTEXT,
+  MAX_FIND_PAGES,
 } from "../core/searcher.js";
 import { renderFind } from "../core/find-text.js";
 import {
@@ -513,7 +514,27 @@ export const PER_PROJECT_COUNT =
  * with spaces is a phrase or a signature, which one exact line may never
  * hold; with `defines` on and nothing found, the name itself is in doubt.
  * A bare identifier that is simply absent gets no hint - zero is the answer. */
-export function findHint(query: string, total: number, defines: boolean, withText = total, listed = total, blocks = false): string | null {
+export function findHint(
+  query: string,
+  total: number,
+  defines: boolean,
+  withText = total,
+  listed = total,
+  blocks = false,
+  pages?: number[],
+): string | null {
+  // Pages: the result names where each following page starts, so the rest
+  // is one reply of finds with skip - not one find per file, which the demo
+  // wrote ten of (2026-09-28), and never a read per line.
+  if (pages && pages.length > 0) {
+    const tail = pages.length >= MAX_FIND_PAGES ? " The last of them names where the next pages start." : "";
+    return (
+      `This result carried ${withText} of the ${total} matching lines${blocks ? " with their blocks" : " with their text"}; ` +
+      `the rest are listed by path and line after them. To carry them too, find again with the same query and ` +
+      `options and skip set to each of ${pages.join(", ")} - all of them in the same reply, one call each; ` +
+      `together they carry every remaining match.${tail} A saved result is not for the shell to read.`
+    );
+  }
   // A flood: the counts are complete, every place within the limit is
   // listed, and the text of the rest is one sql away - never the shell over
   // a saved result (the demo, 2026-09-24: a 58,000-character find went to a
@@ -521,12 +542,11 @@ export function findHint(query: string, total: number, defines: boolean, withTex
   if (total > withText) {
     const beyond = total > listed ? ` ${total - listed} more are in the total and the per-file counts but not listed.` : "";
     // A chunks find past its budget: the rest's blocks are one more chunks
-    // find away, scoped to their files, not a read per line.
+    // find away, not a read per line.
     if (blocks) {
       return (
         `${withText} of ${total} matching lines came with their block; the rest are listed by path and line after ` +
-        `them.${beyond} For their blocks, find again with chunks and under naming a file or directory from that ` +
-        "list, several at once with queries if you need them. A saved result is not for the shell to read."
+        `them.${beyond} For their blocks, find again with chunks and skip. A saved result is not for the shell to read.`
       );
     }
     return (
@@ -1970,8 +1990,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         "When the question asks what each match does or relies on - the invariant behind each unsafe block, " +
         "the handler behind each route, what each caller passes - set chunks: every match comes with the block " +
         "of code it sits in, once, its lines numbered, so the answer is in the result; over many matches add " +
-        "context (6 or so) to keep only the lines around each one, which holds several times as many. Never " +
-        "follow a find with a read per match. " +
+        "context (6 or so) to keep only the lines around each one, which holds several times as many. When a " +
+        "result names further pages, ask for every one of them in the same reply with skip. Never follow a find " +
+        "with a read per match. " +
         "A wide result lists every matching place: the first lines with their text, the rest by path and " +
         "line after them; a line's text is one sql statement away, and the per-file counts count them all. " +
         "A count per project or per file - which projects use X, how many times each - is one sql statement, " +
@@ -2057,6 +2078,16 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
               "that many lines around its matches, merged where they meet - the form for many matches. The " +
               "text budget still applies; the matches of blocks past it are listed by path and line.",
           ),
+        skip: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Matching lines to pass over before this result starts: the next page of a find its budget cut. A " +
+              "result that could not carry every match names the skip of each following page; ask for all of " +
+              "them in one reply, one call each, rather than one find per file.",
+          ),
         path: z
           .string()
           .optional()
@@ -2067,7 +2098,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           ),
       },
     },
-    async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, chunks, path, share }) => {
+    async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, chunks, skip, path, share }) => {
       let ctx: RepoCtx;
       try {
         ctx = repoFor(path);
@@ -2112,10 +2143,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         const t0 = performance.now();
         // A batch shares the one text budget between its queries.
         const budget = share && share > 1 ? Math.floor(FIND_RESULT_CHAR_BUDGET / share) : undefined;
-        const result = await find(handle, query, { ignoreCase, defines, under, limit, context, chunks, budget });
+        const result = await find(handle, query, { ignoreCase, defines, under, limit, context, chunks, skip, budget });
         recordOf(ctx).addLines(TABLE, result.matches);
         const listed = result.matches.length + (result.more ?? []).reduce((n, m) => n + m.lines.length, 0);
-        const hint = findHint(query, result.total, Boolean(defines), result.matches.length, listed, Boolean(result.blocks)) ?? undefined;
+        const hint =
+          findHint(query, result.total, Boolean(defines), result.matches.length, listed, Boolean(result.blocks), result.pages) ??
+          undefined;
         const noted = autoIndexed ? autoIndexNote(autoIndexed) : undefined;
         const tookMs = Math.round((performance.now() - t0) * 1000) / 1000;
         // Written as grep writes it (`renderFind`); the receipt prices that

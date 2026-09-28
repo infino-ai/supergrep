@@ -116,7 +116,8 @@ export function renderFind(result: FindResult, extras: FindTextExtras = {}): str
     (result.under ? ` under ${result.under}` : "") +
     (result.ignoreCase ? ", ignoring case" : "") +
     (result.definedFrom !== undefined ? `; ${result.total} of ${result.definedFrom} inside a definition of it` : "") +
-    (result.truncated ? `; the first ${listed} listed` : "");
+    (result.skip ? `; from match ${result.skip + 1}` : "") +
+    (result.truncated ? `; ${result.skip ? "the next" : "the first"} ${listed} listed` : "");
   out.push(head);
   if (result.partial) out.push(`partial index: ${result.partial.note}`);
   out.push("");

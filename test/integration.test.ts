@@ -419,6 +419,29 @@ describe("find", () => {
     expect(findBlocks(chunks, rows.slice(0, 1)).blocks.map((b) => b.path)).toEqual(["a.rs"]);
   });
 
+  it("pages: each result names where the following pages start, and the pages together carry every match once", async () => {
+    // A tiny budget, so every page carries one block; chunks and lines both.
+    for (const chunks of [true, false]) {
+      const first = await find(handle, "export function", { chunks, budget: 1 });
+      expect(first.total).toBe(4);
+      // Lines: one per page. Chunks: one block per page, holding however many
+      // matches its chunk has.
+      if (!chunks) expect(first.matches.length).toBe(1);
+      expect(first.pages!.length).toBeGreaterThan(0);
+      const carried = [...first.matches.map((m) => `${m.path}:${m.line}`)];
+      for (const skip of first.pages!) {
+        const page = await find(handle, "export function", { chunks, budget: 1, skip });
+        expect(page.skip).toBe(skip);
+        carried.push(...page.matches.map((m) => `${m.path}:${m.line}`));
+      }
+      const all = (await find(handle, "export function")).matches.map((m) => `${m.path}:${m.line}`);
+      expect(carried).toEqual(all);
+    }
+    // A find that carried everything names no pages.
+    expect((await find(handle, "export function")).pages).toBeUndefined();
+    await expect(find(handle, "export function", { skip: -1 })).rejects.toThrow(/non-negative/);
+  });
+
   it("past the character budget a match keeps its place and loses its text; nothing within the limit is dropped", () => {
     const line = (i: number) => ({ path: `logs/run-${Math.floor(i / 10)}.log`, line: i, text: "x".repeat(200) });
     const rows = Array.from({ length: 50 }, (_, i) => line(i));

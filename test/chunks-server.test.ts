@@ -180,10 +180,16 @@ describe("the hint on an empty find", () => {
   it("doubts the name itself when defines found nothing for a bare identifier", () => {
     expect(findHint("maybeRefresh", 0, true)).toContain('Nothing declares "maybeRefresh"');
   });
-  it("on a chunks find past its budget, sends the rest to a scoped chunks find rather than a read per line", () => {
-    const hint = findHint("unsafe {", 136, false, 40, 136, true);
-    expect(hint).toContain("40 of 136 matching lines came with their block");
-    expect(hint).toContain("find again with chunks and under");
+  it("names every following page's skip, to be asked for in one reply, when a find could not carry every match", () => {
+    const hint = findHint("unsafe {", 136, false, 40, 136, true, [40, 81, 118]);
+    expect(hint).toContain("carried 40 of the 136 matching lines with their blocks");
+    expect(hint).toContain("skip set to each of 40, 81, 118 - all of them in the same reply");
+    expect(hint).not.toContain("under");
+    const lines = findHint("unsafe {", 136, false, 40, 136, false, [40]);
+    expect(lines).toContain("with their text");
+    expect(findHint("unsafe {", 900, false, 40, 900, true, [40, 80, 120, 160, 200, 240, 280, 320])).toContain(
+      "The last of them names where the next pages start.",
+    );
     // A line-mode flood keeps its own wording.
     expect(findHint("unsafe {", 136, false, 40, 136)).toContain("40 of 136 lines carry their text");
   });
