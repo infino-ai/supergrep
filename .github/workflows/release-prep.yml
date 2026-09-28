@@ -148,23 +148,25 @@ jobs:
           npm version "$BUMP" --no-git-tag-version
           # The Claude Code plugin launches the server through an exact npx
           # version pin, and its manifest version rides in lockstep with the
-          # package (enforced by test/plugin.test.ts) — stamp both, or CI
-          # fails the release PR.
+          # package (enforced by test/plugin.test.ts); `cx install` pins the
+          # same version from src/cli.ts (enforced by test/install.test.ts).
+          # Stamp all three, or CI fails the release PR.
           version="$(node -p "require('./package.json').version")"
           node - "$version" <<'NODE'
           const fs = require("fs");
           const version = process.argv[2];
           // Substitute just the version text so the files keep their
-          // hand-written formatting; verify the result still parses.
+          // hand-written formatting; verify a JSON result still parses.
           const sub = (path, pattern, replacement) => {
             const before = fs.readFileSync(path, "utf8");
             const after = before.replace(pattern, replacement);
             if (after === before) throw new Error(`${path}: nothing matched ${pattern}`);
-            JSON.parse(after);
+            if (path.endsWith(".json")) JSON.parse(after);
             fs.writeFileSync(path, after);
           };
           sub(".claude-plugin/plugin.json", /"version": "[^"]+"/, `"version": "${version}"`);
           sub(".mcp.json", /@infino-ai\/code-context@[^"]+/, `@infino-ai/code-context@${version}`);
+          sub("src/cli.ts", /const CLI_VERSION = "[^"]+"/, `const CLI_VERSION = "${version}"`);
           NODE
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
