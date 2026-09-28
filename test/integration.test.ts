@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { connect } from "@infino-ai/infino";
 import { indexRepo, indexRepoStaged, syncRepo } from "../src/core/indexer.js";
 import { readManifest } from "../src/core/manifest.js";
-import { analyzerOf, analyzerTokens, cutFindMatches, find, findBlocks, plainTerms, readFiles, READ_LINES_CAP, runSql, search } from "../src/core/searcher.js";
+import { analyzerOf, analyzerTokens, cutFindMatches, find, findBlocks, plainTerms, readFiles, readRanges, READ_LINES_CAP, runSql, search } from "../src/core/searcher.js";
 import { TABLE } from "../src/core/config.js";
 import type { IndexHandle } from "../src/core/context.js";
 import type { Embedder } from "../src/core/embedder.js";
@@ -518,6 +518,51 @@ describe("read", () => {
     expect(range.to).toBe(22);
     expect(range.lines.split("\n")).toEqual(["20: parse_config(Path) ABC-123 x.y Süd ok", "21: filler 21", "22: filler 22"]);
     await expect(readFiles(handle, ["notes.txt"], { from: 5, to: 2 })).rejects.toThrow(/before/);
+  });
+
+  it("reads several ranges of a file in one call, merged where they meet, a gap marked between the rest", async () => {
+    const [notes] = (await readFiles(handle, ["notes.txt"], { ranges: readRanges([20, 30, 33], [21, 34, 36]) })) as Array<{
+      lines: string;
+      from: number;
+      to: number;
+      more?: unknown;
+    }>;
+    expect(notes.from).toBe(20);
+    expect(notes.to).toBe(36);
+    expect(notes.more).toBeUndefined();
+    // 30-34 and 33-36 overlap and come back as one run; 20-21 stands apart.
+    expect(notes.lines.split("\n").map((l) => l.split(":")[0])).toEqual(["20", "21", "--", "30", "31", "32", "33", "34", "35", "36"]);
+    await expect(readFiles(handle, ["notes.txt"], { ranges: [{ from: 9, to: 3 }] })).rejects.toThrow(/before/);
+  });
+
+  it("pairs lists of from and to in order, and refuses lists that do not pair", () => {
+    expect(readRanges(undefined, undefined)).toBeUndefined();
+    expect(readRanges(5, undefined)).toEqual([{ from: 5, to: Number.MAX_SAFE_INTEGER }]);
+    expect(readRanges(undefined, 9)).toEqual([{ from: 1, to: 9 }]);
+    expect(readRanges([559, 1938], [610, 1975])).toEqual([
+      { from: 559, to: 610 },
+      { from: 1938, to: 1975 },
+    ]);
+    expect(() => readRanges([1, 2], [3])).toThrow(/same length/);
+    expect(() => readRanges([1, 2], 9)).toThrow(/same length/);
+    expect(() => readRanges([1, 2], undefined)).toThrow(/same length/);
+  });
+
+  it("pages several ranges past the line cap and names the ranges still to come", async () => {
+    const long = Array.from({ length: READ_LINES_CAP + 100 }, (_, i) => `row ${i + 1}`);
+    writeFileSync(join(root, "long2.txt"), long.join("\n") + "\n");
+    await syncRepo({ root, db: handle.db, indexDirPath: dir, embedder: fakeEmbedder });
+    const ranges = readRanges([1, READ_LINES_CAP + 10, READ_LINES_CAP + 50], [READ_LINES_CAP - 5, READ_LINES_CAP + 20, READ_LINES_CAP + 60]);
+    const [page] = (await readFiles(handle, ["long2.txt"], { ranges })) as Array<{ to: number; more?: { from: number[]; to: number[] } }>;
+    // The first range is 395 lines and the second begins the cap's last five.
+    expect(page.to).toBe(READ_LINES_CAP + 14);
+    expect(page.more).toEqual({ from: [READ_LINES_CAP + 15, READ_LINES_CAP + 50], to: [READ_LINES_CAP + 20, READ_LINES_CAP + 60] });
+    const [rest] = (await readFiles(handle, ["long2.txt"], { ranges: readRanges(page.more!.from, page.more!.to) })) as Array<{
+      lines: string;
+      more?: unknown;
+    }>;
+    expect(rest.more).toBeUndefined();
+    expect(rest.lines.split("\n")[0]).toBe(`${READ_LINES_CAP + 15}: row ${READ_LINES_CAP + 15}`);
   });
 
   it("pages a long file at the line cap and says where the next page starts", async () => {

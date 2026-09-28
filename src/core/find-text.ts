@@ -48,6 +48,10 @@ export interface FindTextExtras {
   autoIndexed?: string;
   tookMs?: number;
   usage?: string;
+  /** Set when the caller named neither chunks nor context and each block was
+   * trimmed to this many lines around its matches by default: said on the
+   * result, with the forms to ask for instead. */
+  aroundByDefault?: number;
 }
 
 /** The one definition a match sits in, when the window names exactly one;
@@ -126,6 +130,12 @@ export function renderFind(result: FindResult, extras: FindTextExtras = {}): str
   // fifteen scoped finds over several turns on the demo (2026-09-28), with
   // the page starts ignored in the hint at the bottom.
   const pages = result.pages ?? [];
+  if (extras.aroundByDefault !== undefined && result.blocks) {
+    out.push(
+      `each match in its block with the ${extras.aroundByDefault} lines around it; chunks: false for the matching ` +
+        "lines alone, chunks: true for whole blocks, context for another width",
+    );
+  }
   if (result.trimmedTo !== undefined) {
     out.push(
       `blocks trimmed to ${result.trimmedTo} lines around each match, since whole blocks would take many more pages; ` +

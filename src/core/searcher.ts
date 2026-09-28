@@ -1109,23 +1109,75 @@ export const READ_LINES_CAP = 400;
  * call. The same size as a sql result's budget. */
 export const READ_CHAR_BUDGET = 24_000;
 
+/** Stands between two ranges of one file in a read of several: grep's group
+ * separator, as a trimmed find block writes it, so the numbers on either
+ * side say what was left out. */
+const READ_RANGE_GAP = "--";
+
+/** One line range of a read, 1-based and inclusive. */
+export interface ReadRange {
+  from: number;
+  to: number;
+}
+
+/** Where the next page of a read starts: the line after the last one
+ * returned, or - for a read of several ranges - the ranges still to come,
+ * the first cut to start after that line, in the same paired form they were
+ * asked for. */
+export type ReadMore = { from: number } | { from: number[]; to: number[] };
+
 export interface ReadFileResult {
   path: string;
   /** The first and last line returned. */
   from: number;
   to: number;
-  /** The lines, each numbered with its line in the file. Empty past the
-   * result budget, with `note` saying so. */
+  /** The lines, each numbered with its line in the file; in a read of
+   * several ranges, READ_RANGE_GAP between two that do not meet. Empty past
+   * the result budget, with `note` saying so. */
   lines: string;
   /** The file's last line as the index holds it. */
   total: number;
-  /** Set when the range asked for goes past the page: where to read next. */
-  more?: { from: number };
+  /** Set when the ranges asked for go past the page: where to read next. */
+  more?: ReadMore;
   note?: string;
+}
+
+/** The ranges a read's `from` and `to` name. Plain numbers are the one range
+ * they always were (either end left open); lists pair up in order, one
+ * range per pair - `from [559, 1938], to [610, 1975]` is lines 559-610 and
+ * 1938-1975 - so the windows around several places in a file come back in
+ * one call. Measured on the demo (2026-09-28): Haiku, after a find named
+ * the unsafe sites, wrote exactly those lists in six of its fifteen reads,
+ * and each was refused and retried as one read per range. Undefined when
+ * neither end is given: the whole file. */
+export function readRanges(from: number | number[] | undefined, to: number | number[] | undefined): ReadRange[] | undefined {
+  if (from === undefined && to === undefined) return undefined;
+  if (!Array.isArray(from) && !Array.isArray(to)) {
+    return [{ from: Math.max(1, from ?? 1), to: to ?? Number.MAX_SAFE_INTEGER }];
+  }
+  if (!Array.isArray(from) || !Array.isArray(to) || from.length !== to.length) {
+    throw new Error(
+      "several ranges are lists of the same length in from and to, paired in order: from [10, 200], to [40, 230] " +
+        "reads lines 10-40 and 200-230",
+    );
+  }
+  return from.map((f, i) => ({ from: Math.max(1, f), to: to[i] }));
 }
 export interface ReadFileMiss {
   path: string;
   error: string;
+}
+
+/** Where a read cut at `last` resumes: the next line, with the same end, for
+ * one range; for several, every range not yet finished, the first starting
+ * after `last`. */
+function moreAfter(ranges: readonly ReadRange[], last: number): ReadMore {
+  if (ranges.length === 1) return { from: last + 1 };
+  const rest = [...ranges]
+    .sort((a, b) => a.from - b.from)
+    .filter((r) => r.to > last)
+    .map((r) => ({ from: Math.max(r.from, last + 1), to: r.to }));
+  return { from: rest.map((r) => r.from), to: rest.map((r) => r.to) };
 }
 
 /** The lines of the files named, from the index rather than the disk - the
@@ -1133,17 +1185,21 @@ export interface ReadFileMiss {
  * a caller does after the index has named the files it wants, in one call
  * rather than one read per file. Chunks are stitched by line number, so a
  * line in two overlapping windows appears once. `from`/`to` cut every file
- * to a line range; a file over READ_LINES_CAP lines comes back a page at a
- * time with `more`. A path the index does not hold is a miss beside the
- * others, never a failure of the call. */
+ * to a line range, and `ranges` to several (see `readRanges`), merged where
+ * they meet; a file over READ_LINES_CAP lines comes back a page at a time
+ * with `more`. A path the index does not hold is a miss beside the others,
+ * never a failure of the call. */
 export async function readFiles(
   handle: IndexHandle,
   paths: string[],
-  opts: { from?: number; to?: number } = {},
+  opts: { from?: number; to?: number; ranges?: ReadRange[] } = {},
 ): Promise<Array<ReadFileResult | ReadFileMiss>> {
-  const from = Math.max(1, opts.from ?? 1);
-  const to = opts.to ?? Number.MAX_SAFE_INTEGER;
-  if (to < from) throw new Error(`to (${to}) is before from (${from})`);
+  const ranges = opts.ranges ?? readRanges(opts.from, opts.to) ?? [{ from: 1, to: Number.MAX_SAFE_INTEGER }];
+  for (const r of ranges) {
+    if (r.to < r.from) throw new Error(`to (${r.to}) is before from (${r.from})`);
+  }
+  const several = ranges.length > 1;
+  const first = Math.min(...ranges.map((r) => r.from));
   const db = localDb(handle);
   const files = await Promise.all(
     paths.map(async (path): Promise<ReadFileResult | ReadFileMiss> => {
@@ -1162,17 +1218,21 @@ export async function readFiles(
       }
       const numbers = [...byLine.keys()].sort((a, b) => a - b);
       const total = numbers[numbers.length - 1];
-      const wanted = numbers.filter((n) => n >= from && n <= to);
+      const wanted = numbers.filter((n) => ranges.some((r) => n >= r.from && n <= r.to));
       const page = wanted.slice(0, READ_LINES_CAP);
-      const lines = page.map((n) => `${n}${LINE_NUMBER_SEPARATOR}${byLine.get(n)}`).join("\n");
-      const last = page[page.length - 1] ?? from;
+      const numbered: string[] = [];
+      page.forEach((n, i) => {
+        if (several && i > 0 && n !== page[i - 1] + 1) numbered.push(READ_RANGE_GAP);
+        numbered.push(`${n}${LINE_NUMBER_SEPARATOR}${byLine.get(n)}`);
+      });
+      const last = page[page.length - 1] ?? first;
       return {
         path,
-        from: page[0] ?? from,
+        from: page[0] ?? first,
         to: last,
-        lines,
+        lines: numbered.join("\n"),
         total,
-        ...(wanted.length > page.length ? { more: { from: last + 1 } } : {}),
+        ...(wanted.length > page.length ? { more: moreAfter(ranges, last) } : {}),
       };
     }),
   );
