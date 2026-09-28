@@ -126,6 +126,12 @@ export function renderFind(result: FindResult, extras: FindTextExtras = {}): str
   // fifteen scoped finds over several turns on the demo (2026-09-28), with
   // the page starts ignored in the hint at the bottom.
   const pages = result.pages ?? [];
+  if (result.trimmedTo !== undefined) {
+    out.push(
+      `blocks trimmed to ${result.trimmedTo} lines around each match, since whole blocks would take many more pages; ` +
+        "set context for another width",
+    );
+  }
   if (pages.length > 0) {
     const from = (result.skip ?? 0) + 1;
     out.push(

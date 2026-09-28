@@ -419,6 +419,17 @@ describe("find", () => {
     expect(findBlocks(chunks, rows.slice(0, 1)).blocks.map((b) => b.path)).toEqual(["a.rs"]);
   });
 
+  it("a chunks find given no context trims its blocks when whole ones would take more than two pages, and says so", async () => {
+    // Every notes.txt line holds "filler": three windows, one a page at this
+    // budget, so whole blocks would be three pages.
+    const trimmed = await find(handle, "filler", { chunks: true, budget: 1 });
+    expect(trimmed.trimmedTo).toBe(4);
+    // Asked-for context is never overridden, and a find that fits keeps its
+    // whole blocks.
+    expect((await find(handle, "filler", { chunks: true, budget: 1, context: 10 })).trimmedTo).toBeUndefined();
+    expect((await find(handle, "BLOCKSEEN", { chunks: true })).trimmedTo).toBeUndefined();
+  });
+
   it("pages: each result names where the following pages start, and the pages together carry every match once", async () => {
     // A tiny budget, so every page carries one block; chunks and lines both.
     for (const chunks of [true, false]) {

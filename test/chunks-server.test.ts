@@ -187,7 +187,7 @@ describe("the hint on an empty find", () => {
     expect(hint).not.toContain("under");
     const lines = findHint("unsafe {", 136, false, 40, 136, false, [40]);
     expect(lines).toContain("with their text");
-    expect(findHint("unsafe {", 900, false, 40, 900, true, [40, 80, 120, 160, 200, 240, 280, 320])).toContain(
+    expect(findHint("unsafe {", 900, false, 40, 900, true, Array.from({ length: 16 }, (_, i) => 40 * (i + 1)))).toContain(
       "The last of them names where the next pages start.",
     );
     // A line-mode flood keeps its own wording.

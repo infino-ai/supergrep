@@ -455,11 +455,28 @@ export interface FindResult {
    * starts at, computed with the same budget, so every page is one call
    * and they can all be asked for at once. At most MAX_FIND_PAGES. */
   pages?: number[];
+  /** Set when a chunks find given no context trimmed its blocks to this many
+   * lines around each match, because whole blocks would have taken more
+   * pages (see AUTO_CHUNK_CONTEXT). */
+  trimmedTo?: number;
 }
 
 /** Following pages a find result names at most; a result wider than this
- * says so, and the last page names the next. */
-export const MAX_FIND_PAGES = 8;
+ * says so, and the last page names the next. Sixteen, because at eight the
+ * demo's unsafe question (2026-09-28) needed a third message for the pages
+ * the eighth named. */
+export const MAX_FIND_PAGES = 16;
+
+/** Lines kept around each match when a chunks find was given no context and
+ * its whole blocks would need more than one further page: the width that
+ * carried the most sites with their comment in one page over the engine
+ * (2026-09-28, `unsafe {`: 44 a page against 10 for whole blocks, 23 of the
+ * 44 with their SAFETY comment). */
+export const AUTO_CHUNK_CONTEXT = 4;
+/** Further pages whole blocks may take before a chunks find with no context
+ * trims them to AUTO_CHUNK_CONTEXT: one, so a find that fits in two pages
+ * keeps its whole blocks. */
+const WHOLE_BLOCK_MAX_PAGES = 1;
 
 export interface FindOptions {
   /** Match regardless of letter case. Default false: case-sensitive, like grep. */
@@ -963,19 +980,32 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
   // One page: the `limit` matching lines from `start`, carried while the
   // budget lasts. Every page carries a first run of its lines (see
   // `cutFindMatches`), so the next page starts right after them.
-  const pageAt = (start: number): { matches: FindMatch[]; more: FindLocations[]; blocks?: FindBlock[] } =>
+  const pageAt = (start: number, around: number | undefined) =>
     chunksMode
-      ? findBlocks(held, rows.slice(start, start + limit), budget, asked)
+      ? findBlocks(held, rows.slice(start, start + limit), budget, around)
       : cutFindMatches(rows.slice(start), limit, budget);
-  const cut = pageAt(skip);
-  const { matches, more, blocks } = cut;
-  // Where each following page starts, worked out now with the same cut, so
-  // the caller can ask for all of them in one reply.
-  const pages: number[] = [];
-  for (let next = skip + matches.length; next < rows.length && pages.length < MAX_FIND_PAGES; ) {
-    pages.push(next);
-    next += Math.max(1, pageAt(next).matches.length);
+  // Where each page after `start` begins, with the same cut, so the caller
+  // can ask for all of them in one reply.
+  const pagesAfter = (start: number, first: number, around: number | undefined, cap: number): number[] => {
+    const out: number[] = [];
+    for (let next = start + first; next < rows.length && out.length < cap; ) {
+      out.push(next);
+      next += Math.max(1, pageAt(next, around).matches.length);
+    }
+    return out;
+  };
+  // A chunks find given no context keeps whole blocks while they fit in two
+  // pages; past that it trims them, since whole windows made the demo's
+  // unsafe question twelve pages where trimmed ones make three (2026-09-28).
+  // The page computed from `skip` 0 decides, so every page of one find
+  // trims alike.
+  let around = asked;
+  if (chunksMode && asked === undefined && pagesAfter(0, pageAt(0, undefined).matches.length, undefined, WHOLE_BLOCK_MAX_PAGES + 1).length > WHOLE_BLOCK_MAX_PAGES) {
+    around = AUTO_CHUNK_CONTEXT;
   }
+  const cut: { matches: FindMatch[]; more: FindLocations[]; blocks?: FindBlock[] } = pageAt(skip, around);
+  const { matches, more, blocks } = cut;
+  const pages = pagesAfter(skip, matches.length, around, MAX_FIND_PAGES);
   return {
     query,
     ignoreCase,
@@ -991,6 +1021,7 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
     ...(under !== undefined ? { under } : {}),
     ...(skip > 0 ? { skip } : {}),
     ...(pages.length ? { pages } : {}),
+    ...(around !== asked ? { trimmedTo: around } : {}),
   };
 }
 
