@@ -64,7 +64,7 @@ function applyHosted(flags: HostedFlags, root: string): void {
 
 /** Published version of this package. `cx install` pins it into the `npx`
  * entry it writes, so a client resolves the same build on every start. */
-const CLI_VERSION = "0.5.1";
+const CLI_VERSION = "0.6.0";
 
 const program = new Command();
 

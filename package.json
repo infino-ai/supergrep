@@ -1,6 +1,6 @@
 {
   "name": "@infino-ai/code-context",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "mcpName": "io.github.infino-ai/code-context",
   "description": "SuperGrep: retrieval subagents for Claude Sonnet. find and plain sql run locally over an index in plain files, no account needed; search, a ranked sql statement and ask run in the cloud over the same index's platform copy.",
   "license": "Apache-2.0",
