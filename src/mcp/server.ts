@@ -513,13 +513,22 @@ export const PER_PROJECT_COUNT =
  * with spaces is a phrase or a signature, which one exact line may never
  * hold; with `defines` on and nothing found, the name itself is in doubt.
  * A bare identifier that is simply absent gets no hint - zero is the answer. */
-export function findHint(query: string, total: number, defines: boolean, withText = total, listed = total): string | null {
+export function findHint(query: string, total: number, defines: boolean, withText = total, listed = total, blocks = false): string | null {
   // A flood: the counts are complete, every place within the limit is
   // listed, and the text of the rest is one sql away - never the shell over
   // a saved result (the demo, 2026-09-24: a 58,000-character find went to a
   // file and Bash read it).
   if (total > withText) {
     const beyond = total > listed ? ` ${total - listed} more are in the total and the per-file counts but not listed.` : "";
+    // A chunks find past its budget: the rest's blocks are one more chunks
+    // find away, scoped to their files, not a read per line.
+    if (blocks) {
+      return (
+        `${withText} of ${total} matching lines came with their block; the rest are listed by path and line after ` +
+        `them.${beyond} For their blocks, find again with chunks and under naming a file or directory from that ` +
+        "list, several at once with queries if you need them. A saved result is not for the shell to read."
+      );
+    }
     return (
       `${withText} of ${total} lines carry their text; the rest are listed by path and line after them.${beyond} ` +
       "For a line's text, sql: SELECT start_line, content FROM the table WHERE path = '...' AND start_line <= " +
@@ -1955,6 +1964,14 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         // path and line numbers (`more`), and a line's text is a sql read.
         " The lines around a match - what leads into an error and follows it - come with it when you ask " +
         "for context (like grep -B/-A); no file need be opened for them. " +
+        // The demo, 2026-09-28: "where does this codebase use unsafe, and
+        // what invariant does each block rely on" was one find for the lines
+        // and then 26 reads, one per site, for the comment above each.
+        "When the question asks what each match does or relies on - the invariant behind each unsafe block, " +
+        "the handler behind each route, what each caller passes - set chunks: every match comes with the block " +
+        "of code it sits in, once, its lines numbered, so the answer is in the result; over many matches add " +
+        "context (6 or so) to keep only the lines around each one, which holds several times as many. Never " +
+        "follow a find with a read per match. " +
         "A wide result lists every matching place: the first lines with their text, the rest by path and " +
         "line after them; a line's text is one sql statement away, and the per-file counts count them all. " +
         "A count per project or per file - which projects use X, how many times each - is one sql statement, " +
@@ -2029,6 +2046,17 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
               "shows - so the lines that lead into an error and follow it come with the match, without " +
               "opening the file. Up to 20; more than a few matches with context is a wide result.",
           ),
+        chunks: z
+          .boolean()
+          .optional()
+          .describe(
+            "Carry each match with the whole block of code it sits in - the chunk the index holds it in, its " +
+              "lines numbered - instead of the matching line alone: for what each match does or relies on (the " +
+              "comment above it, the body around it), so no file need be read. A block holding several matches " +
+              "comes once, and overlapping blocks are not repeated. With context too, each block keeps only " +
+              "that many lines around its matches, merged where they meet - the form for many matches. The " +
+              "text budget still applies; the matches of blocks past it are listed by path and line.",
+          ),
         path: z
           .string()
           .optional()
@@ -2039,7 +2067,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           ),
       },
     },
-    async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, path, share }) => {
+    async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, chunks, path, share }) => {
       let ctx: RepoCtx;
       try {
         ctx = repoFor(path);
@@ -2084,10 +2112,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         const t0 = performance.now();
         // A batch shares the one text budget between its queries.
         const budget = share && share > 1 ? Math.floor(FIND_RESULT_CHAR_BUDGET / share) : undefined;
-        const result = await find(handle, query, { ignoreCase, defines, under, limit, context, budget });
+        const result = await find(handle, query, { ignoreCase, defines, under, limit, context, chunks, budget });
         recordOf(ctx).addLines(TABLE, result.matches);
         const listed = result.matches.length + (result.more ?? []).reduce((n, m) => n + m.lines.length, 0);
-        const hint = findHint(query, result.total, Boolean(defines), result.matches.length, listed) ?? undefined;
+        const hint = findHint(query, result.total, Boolean(defines), result.matches.length, listed, Boolean(result.blocks)) ?? undefined;
         const noted = autoIndexed ? autoIndexNote(autoIndexed) : undefined;
         const tookMs = Math.round((performance.now() - t0) * 1000) / 1000;
         // Written as grep writes it (`renderFind`); the receipt prices that

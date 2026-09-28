@@ -180,6 +180,13 @@ describe("the hint on an empty find", () => {
   it("doubts the name itself when defines found nothing for a bare identifier", () => {
     expect(findHint("maybeRefresh", 0, true)).toContain('Nothing declares "maybeRefresh"');
   });
+  it("on a chunks find past its budget, sends the rest to a scoped chunks find rather than a read per line", () => {
+    const hint = findHint("unsafe {", 136, false, 40, 136, true);
+    expect(hint).toContain("40 of 136 matching lines came with their block");
+    expect(hint).toContain("find again with chunks and under");
+    // A line-mode flood keeps its own wording.
+    expect(findHint("unsafe {", 136, false, 40, 136)).toContain("40 of 136 lines carry their text");
+  });
   it("says nothing when a bare identifier is simply absent, or when anything matched", () => {
     expect(findHint("refresh(", 0, false)).toBeNull();
     expect(findHint("private void refresh(String source)", 3, false)).toBeNull();

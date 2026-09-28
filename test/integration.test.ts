@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { connect } from "@infino-ai/infino";
 import { indexRepo, indexRepoStaged, syncRepo } from "../src/core/indexer.js";
 import { readManifest } from "../src/core/manifest.js";
-import { analyzerOf, analyzerTokens, cutFindMatches, find, plainTerms, readFiles, READ_LINES_CAP, runSql, search } from "../src/core/searcher.js";
+import { analyzerOf, analyzerTokens, cutFindMatches, find, findBlocks, plainTerms, readFiles, READ_LINES_CAP, runSql, search } from "../src/core/searcher.js";
 import { TABLE } from "../src/core/config.js";
 import type { IndexHandle } from "../src/core/context.js";
 import type { Embedder } from "../src/core/embedder.js";
@@ -62,6 +62,11 @@ export function replayLog(): number { return 42; }
   notes[29] = "run git -C repo status --max-files 5";
   notes[39] = 'log("hello wörld there")';
   notes[54] = "OVERLAP_MARK sits in two windows";
+  // One marker in the overlap of the first two windows (line 58) and one in
+  // the second window alone (line 70): a chunks find carries both windows,
+  // each line once.
+  notes[57] = "BLOCKSEEN early";
+  notes[69] = "BLOCKSEEN late";
   notes[129] = "z".repeat(600) + " FAR_MARK " + "z".repeat(300);
   writeFileSync(join(root, "notes.txt"), notes.join("\n") + "\n");
   writeFileSync(join(root, ".gitignore"), "ignored.ts\n");
@@ -340,6 +345,78 @@ describe("find", () => {
     expect(r.total).toBe(plain.total);
     // Clamped to the cap rather than refused.
     expect((await find(handle, "Session(", { context: 999 })).matches[0].before!.length).toBeLessThanOrEqual(20);
+  });
+
+  it("with chunks, carries each match's block once and no line twice where windows overlap", async () => {
+    const r = await find(handle, "BLOCKSEEN", { chunks: true });
+    expect(r.total).toBe(2);
+    expect(r.matches.map((m) => m.line)).toEqual([58, 70]);
+    const blocks = r.blocks!;
+    // Line 58 is in both windows and goes to the first; line 70 is in the
+    // second alone, whose block starts after the first one's last line.
+    expect(blocks.map((b) => [b.path, b.start, b.end, b.hits])).toEqual([
+      ["notes.txt", 1, 60, [58]],
+      ["notes.txt", 61, 110, [70]],
+    ]);
+    const textAt = (b: (typeof blocks)[number], n: number) => b.lines.find((l) => l.line === n)?.text;
+    expect(textAt(blocks[0], 58)).toBe("BLOCKSEEN early");
+    expect(textAt(blocks[1], 70)).toBe("BLOCKSEEN late");
+    const written = blocks.flatMap((b) => b.lines.map((l) => l.line));
+    expect(new Set(written).size).toBe(written.length);
+    // A line in two windows is still one block.
+    const overlap = await find(handle, "OVERLAP_MARK", { chunks: true });
+    expect(overlap.blocks!.length).toBe(1);
+    expect(overlap.blocks![0].hits).toEqual([55]);
+  });
+
+  it("with chunks and context, each block keeps only the lines near its matches, merged, none written twice", async () => {
+    const r = await find(handle, "BLOCKSEEN", { chunks: true, context: 2 });
+    expect(r.blocks!.map((b) => b.lines.map((l) => l.line))).toEqual([
+      [56, 57, 58, 59, 60],
+      [68, 69, 70, 71, 72],
+    ]);
+    // Near matches merge into one run rather than repeating their overlap.
+    const wide = await find(handle, "BLOCKSEEN", { chunks: true, context: 8 });
+    const lines = wide.blocks!.flatMap((b) => b.lines.map((l) => l.line));
+    expect(new Set(lines).size).toBe(lines.length);
+    expect(lines[0]).toBe(50);
+    expect(lines.at(-1)).toBe(78);
+  });
+
+  it("with chunks, the block around a match carries what a line-only find leaves out", async () => {
+    const line = await find(handle, "revokeSession");
+    expect(line.blocks).toBeUndefined();
+    const r = await find(handle, "revokeSession", { chunks: true });
+    expect(r.total).toBe(line.total);
+    const text = r.blocks!.flatMap((b) => b.lines.map((l) => l.text)).join("\n");
+    expect(text).toContain("tombstone the session record");
+    expect(r.matches.every((m) => m.before === undefined)).toBe(true);
+  });
+
+  it("with chunks, blocks past the budget keep their matches' places; the first block always comes back", () => {
+    const chunk = (path: string, start: number, lines: number, hitAt: number) => ({
+      path,
+      start,
+      content: Array.from({ length: lines }, (_, i) => (start + i === hitAt ? "HIT" : "y".repeat(100))).join("\n"),
+    });
+    const chunks = [chunk("a.rs", 1, 20, 5), chunk("b.rs", 1, 20, 7), chunk("c.rs", 1, 20, 9)];
+    const rows = [
+      { path: "a.rs", line: 5, text: "HIT" },
+      { path: "b.rs", line: 7, text: "HIT" },
+      { path: "c.rs", line: 9, text: "HIT" },
+    ];
+    // Each block is about 2,200 characters: a 3,000 budget carries one.
+    const tight = findBlocks(chunks, rows, 3_000);
+    expect(tight.blocks.map((b) => b.path)).toEqual(["a.rs"]);
+    expect(tight.matches.map((m) => m.path)).toEqual(["a.rs"]);
+    expect(tight.more).toEqual([
+      { path: "b.rs", lines: [7] },
+      { path: "c.rs", lines: [9] },
+    ]);
+    expect(findBlocks(chunks, rows, 10).blocks.length).toBe(1);
+    expect(findBlocks(chunks, rows).blocks.length).toBe(3);
+    // A chunk holding no match within the limit is not carried.
+    expect(findBlocks(chunks, rows.slice(0, 1)).blocks.map((b) => b.path)).toEqual(["a.rs"]);
   });
 
   it("past the character budget a match keeps its place and loses its text; nothing within the limit is dropped", () => {

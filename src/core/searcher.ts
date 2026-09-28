@@ -386,6 +386,30 @@ export interface FindMatch {
   after?: string[];
 }
 
+/** One line a block carries: its number in the file and its text, cut to
+ * FIND_LINE_CAP. */
+export interface FindBlockLine {
+  line: number;
+  text: string;
+}
+
+/** One block of code a chunks-mode find carries: the lines of the chunk that
+ * holds its matches, numbered - all of them, or with `context` the ones near
+ * a match. Overlapping windows are carried once: a line an earlier block in
+ * the same file wrote is not written again. */
+export interface FindBlock {
+  path: string;
+  /** First and last line carried, 1-based and inclusive. */
+  start: number;
+  end: number;
+  /** Definition name(s) of the chunk, when known. */
+  symbol?: string;
+  /** The lines carried, in order; a gap in the numbers is lines left out. */
+  lines: FindBlockLine[];
+  /** The matching lines the block holds, in order. */
+  hits: number[];
+}
+
 /** Matching lines in one file - the `grep -c` view. */
 export interface FindFileCount {
   path: string;
@@ -396,8 +420,12 @@ export interface FindResult {
   query: string;
   ignoreCase: boolean;
   /** Matching lines in path then line order, cut at the limit, with their
-   * text while the character budget lasts. */
+   * text while the character budget lasts. In chunks mode, the matches whose
+   * block is carried. */
   matches: FindMatch[];
+  /** Chunks mode only: the blocks of code the carried matches sit in, each
+   * once, in path then line order. */
+  blocks?: FindBlock[];
   /** The matching lines within the limit that the text budget did not
    * reach: every one of them, as path and line numbers by file, no excerpt. */
   more?: FindLocations[];
@@ -455,6 +483,18 @@ export interface FindOptions {
    * context on the match it has no reason to. Clamped to MAX_FIND_CONTEXT;
    * a window is about sixty lines, so context past its edge is cut there. */
   context?: number;
+  /** Carry each match with the whole chunk it sits in, once, instead of the
+   * matching line alone. For a question about what each match does or
+   * relies on: the demo's "where does this codebase use unsafe, and what
+   * invariant does each block rely on" (2026-09-28) came back as 136 lines
+   * in one find, the invariant of none of them - it lives in the SAFETY
+   * comment above the line - and the model then read 26 windows by hand.
+   * Overlapping windows are carried once (see `findBlocks`); the text budget
+   * is the same, and blocks past it keep their matches' places. With
+   * `context` set too, each block keeps only that many lines around its
+   * matches, merged where they meet: the form for a question over many
+   * sites. */
+  chunks?: boolean;
   /** Characters of match text this call may carry, when the caller has less
    * than the whole budget to give it: a batch of finds shares one budget
    * (FIND_RESULT_CHAR_BUDGET) between its queries, so four queries at once
@@ -507,9 +547,12 @@ const FIND_LINE_CAP = 240;
  * just capping rows and dropping them that would suck"). */
 export const FIND_RESULT_CHAR_BUDGET = 24_000;
 
-/** Characters a match costs beyond its path and text: the line number and
- * the JSON around them, as the result is written. */
+/** Characters a match costs beyond its path and text: the line number, the
+ * separators and the bracketed definition, as the result is written. */
 const FIND_MATCH_OVERHEAD = 40;
+/** Characters a context line costs beyond its text and its path, which grep's
+ * shape writes on every line: the line number and the two separators. */
+const FIND_CONTEXT_LINE_OVERHEAD = 8;
 
 /** The matches past the text budget, by file: every place, no excerpt. A
  * line's text is one sql statement away (SELECT start_line, content FROM
@@ -532,7 +575,14 @@ export function cutFindMatches(
   const more: FindLocations[] = [];
   let chars = 0;
   for (const m of rows.slice(0, limit)) {
-    const around = [...(m.before ?? []), ...(m.after ?? [])].reduce((n, l) => n + l.length + 4, 0);
+    // A context line is written as `path-line-text`, so it costs its path
+    // too: counting its text alone let a context find come back a third over
+    // the budget (measured 2026-09-28: 31,000 characters written against a
+    // 24,000 budget for `unsafe {` with three lines of context).
+    const around = [...(m.before ?? []), ...(m.after ?? [])].reduce(
+      (n, l) => n + l.length + m.path.length + FIND_CONTEXT_LINE_OVERHEAD,
+      0,
+    );
     const size = m.path.length + m.text.length + (m.symbol?.length ?? 0) + around + FIND_MATCH_OVERHEAD;
     if (matches.length === 0 || chars + size <= budget) {
       matches.push(m);
@@ -544,6 +594,96 @@ export function cutFindMatches(
     else more.push({ path: m.path, lines: [m.line] });
   }
   return { matches, more };
+}
+
+/** A chunk a find read its matches from: where it starts and what it holds. */
+export interface FindChunk {
+  path: string;
+  start: number;
+  content: string;
+  symbol?: string;
+}
+
+/** Characters a block costs beyond its lines: the header naming its place,
+ * its definition and its matching lines. */
+const FIND_BLOCK_OVERHEAD = 60;
+/** Characters a carried line costs beyond its text: its number and `: `. */
+const FIND_BLOCK_LINE_OVERHEAD = 8;
+
+/** The blocks a chunks-mode find carries for `rows` (the matches within the
+ * limit): each match goes to the first chunk, by path then start line, that
+ * holds it; a chunk with no match of its own is not carried; and a line an
+ * earlier carried block in the same file wrote is not written again, so
+ * fixed windows that overlap are written once. With `around`, a block keeps
+ * only the lines within that many of one of its matches - the comment above
+ * each and the lines below, merged where they meet - rather than the whole
+ * window: the shape a question over many sites needs, since a whole window
+ * is about 2,500 characters and the budget holds nine (measured 2026-09-28,
+ * `unsafe {` over the engine). Blocks are carried while `budget` lasts - the
+ * first always, so one long block still comes back - and the matches of the
+ * rest keep their places in `more`, as a line-mode find's do. */
+export function findBlocks(
+  chunks: readonly FindChunk[],
+  rows: readonly FindMatch[],
+  budget = FIND_RESULT_CHAR_BUDGET,
+  around?: number,
+): { blocks: FindBlock[]; matches: FindMatch[]; more: FindLocations[] } {
+  const wanted = new Set(rows.map((m) => `${m.path} ${m.line}`));
+  const assigned = new Set<string>();
+  const sorted = [...chunks].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : a.start - b.start));
+  const blocks: FindBlock[] = [];
+  const carried = new Set<string>();
+  const written = new Set<string>();
+  let chars = 0;
+  for (const chunk of sorted) {
+    const lines = chunk.content.split("\n").map((l) => l.replace(/\r$/, ""));
+    if (lines.at(-1) === "") lines.pop();
+    const end = chunk.start + lines.length - 1;
+    const hits: number[] = [];
+    for (let line = chunk.start; line <= end; line++) {
+      const key = `${chunk.path} ${line}`;
+      if (wanted.has(key) && !assigned.has(key)) {
+        assigned.add(key);
+        hits.push(line);
+      }
+    }
+    if (hits.length === 0) continue;
+    const near = (line: number) => around === undefined || hits.some((h) => Math.abs(h - line) <= around);
+    const kept: FindBlockLine[] = [];
+    for (let line = chunk.start; line <= end; line++) {
+      if (written.has(`${chunk.path} ${line}`) || !near(line)) continue;
+      kept.push({ line, text: lines[line - chunk.start].slice(0, FIND_LINE_CAP) });
+    }
+    const size =
+      chunk.path.length +
+      (chunk.symbol?.length ?? 0) +
+      FIND_BLOCK_OVERHEAD +
+      kept.reduce((n, l) => n + l.text.length + FIND_BLOCK_LINE_OVERHEAD, 0);
+    if (blocks.length > 0 && chars + size > budget) continue;
+    chars += size;
+    for (const l of kept) written.add(`${chunk.path} ${l.line}`);
+    for (const line of hits) carried.add(`${chunk.path} ${line}`);
+    blocks.push({
+      path: chunk.path,
+      start: kept[0]?.line ?? hits[0],
+      end: kept.at(-1)?.line ?? hits.at(-1)!,
+      ...(chunk.symbol ? { symbol: chunk.symbol } : {}),
+      lines: kept,
+      hits,
+    });
+  }
+  const matches: FindMatch[] = [];
+  const more: FindLocations[] = [];
+  for (const m of rows) {
+    if (carried.has(`${m.path} ${m.line}`)) {
+      matches.push({ path: m.path, line: m.line, text: m.text, ...(m.symbol ? { symbol: m.symbol } : {}) });
+      continue;
+    }
+    const last = more.at(-1);
+    if (last && last.path === m.path) last.lines.push(m.line);
+    else more.push({ path: m.path, lines: [m.line] });
+  }
+  return { blocks, matches, more };
 }
 
 /** Characters kept ahead of the match when a long line is cut to a window, so
@@ -727,8 +867,13 @@ function checkFindQuery(query: string, analyzer: Analyzer, column: string, limit
 export async function find(handle: IndexHandle, query: string, opts: FindOptions = {}): Promise<FindResult> {
   const limit = checkFindQuery(query, analyzerOf(handle.manifest), CONTENT_COLUMN, opts.limit);
   const ignoreCase = opts.ignoreCase ?? false;
-  const context = Math.min(Math.max(0, Math.trunc(opts.context ?? 0)), MAX_FIND_CONTEXT);
+  const chunksMode = opts.chunks === true;
+  const asked = opts.context === undefined ? undefined : Math.min(Math.max(0, Math.trunc(opts.context)), MAX_FIND_CONTEXT);
+  // In chunks mode the context trims the block rather than being cut out
+  // around each match a second time.
+  const context = chunksMode ? 0 : (asked ?? 0);
   const partial = partialIndex(handle.manifest);
+  const held: FindChunk[] = [];
 
   const terms = plainTerms(query);
   const candidates = localDb(handle).openTable(TABLE).tokenMatch(CONTENT_COLUMN, terms, { mode: "and", projection: FIND_PROJECTION });
@@ -746,7 +891,11 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
     if (under !== undefined && path !== under && !path.startsWith(`${under}/`)) continue;
     const symbol = row.symbol ? String(row.symbol) : undefined;
     const declares = definesName(symbol, query, ignoreCase);
-    for (const m of matchLines(String(row.content), Number(row.start_line), query, ignoreCase, context)) {
+    const found = matchLines(String(row.content), Number(row.start_line), query, ignoreCase, context);
+    if (chunksMode && found.length > 0) {
+      held.push({ path, start: Number(row.start_line), content: String(row.content), ...(symbol ? { symbol } : {}) });
+    }
+    for (const m of found) {
       const key = `${path} ${m.line}`;
       if (declares) declaring.add(key);
       if (seen.has(key)) continue;
@@ -777,11 +926,15 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
     opts.budget !== undefined && Number.isFinite(opts.budget) && opts.budget > 0
       ? Math.min(Math.floor(opts.budget), FIND_RESULT_CHAR_BUDGET)
       : FIND_RESULT_CHAR_BUDGET;
-  const { matches, more } = cutFindMatches(rows, limit, budget);
+  const cut: { matches: FindMatch[]; more: FindLocations[]; blocks?: FindBlock[] } = chunksMode
+    ? findBlocks(held, rows.slice(0, limit), budget, asked)
+    : cutFindMatches(rows, limit, budget);
+  const { matches, more, blocks } = cut;
   return {
     query,
     ignoreCase,
     matches,
+    ...(blocks ? { blocks } : {}),
     ...(more.length ? { more } : {}),
     total: rows.length,
     files: byFile.length,
