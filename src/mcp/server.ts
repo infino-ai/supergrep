@@ -529,10 +529,10 @@ export function findHint(
   if (pages && pages.length > 0) {
     const tail = pages.length >= MAX_FIND_PAGES ? " The last of them names where the next pages start." : "";
     return (
-      `This result carried ${withText} of the ${total} matching lines${blocks ? " with their blocks" : " with their text"}; ` +
-      `the rest are listed by path and line after them. To carry them too, find again with the same query and ` +
-      `options and skip set to each of ${pages.join(", ")} - all of them in the same reply, one call each; ` +
-      `together they carry every remaining match.${tail} A saved result is not for the shell to read.`
+      `This result carried ${withText} of the ${total} matching lines${blocks ? " with their blocks" : " with their text"}. ` +
+      `For the rest, find again with the same query and options and skip set to each of ${pages.join(", ")} - all ` +
+      `of them in the same reply, one call each; together they carry every remaining match, so no find per file ` +
+      `is needed.${tail} A saved result is not for the shell to read.`
     );
   }
   // A flood: the counts are complete, every place within the limit is

@@ -120,6 +120,21 @@ export function renderFind(result: FindResult, extras: FindTextExtras = {}): str
     (result.truncated ? `; ${result.skip ? "the next" : "the first"} ${listed} listed` : "");
   out.push(head);
   if (result.partial) out.push(`partial index: ${result.partial.note}`);
+  // More pages: said first, in so many words, and the matches they carry
+  // are NOT listed by file below. Listed by file, they read as a to-do list
+  // of files, and the model took them a file at a time - ten and then
+  // fifteen scoped finds over several turns on the demo (2026-09-28), with
+  // the page starts ignored in the hint at the bottom.
+  const pages = result.pages ?? [];
+  if (pages.length > 0) {
+    const from = (result.skip ?? 0) + 1;
+    out.push(
+      `this result carries matches ${from}-${from + result.matches.length - 1} of ${result.total}. The rest are in ` +
+        `${pages.length} more page${pages.length === 1 ? "" : "s"}: call find now with the same query and options and ` +
+        `skip ${pages.join(", skip ")} - ${pages.length === 1 ? "that call" : `all ${pages.length} calls in this one reply`}, ` +
+        "not a find per file.",
+    );
+  }
   out.push("");
   if (result.blocks) {
     result.blocks.forEach((b, i) => {
@@ -133,7 +148,7 @@ export function renderFind(result: FindResult, extras: FindTextExtras = {}): str
       out.push(...renderMatch(m));
     });
   }
-  if (result.more?.length) {
+  if (result.more?.length && pages.length === 0) {
     out.push("");
     out.push(
       result.blocks
