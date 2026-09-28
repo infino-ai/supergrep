@@ -150,15 +150,11 @@ cx index --db https://api.supergrep.infino.ai/<database>
 
 ## Indexing from object storage
 
-For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in S3 - write it out as Parquet or JSON, leave it there, and have the platform build the index next to it. Nothing is downloaded to your machine and no row passes through your laptop or through the API.
+For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in a bucket as Parquet or JSON - leave it there, point the platform at the bucket, and it builds the index from there. Nothing is copied, nothing is downloaded to your machine, and no row passes through your laptop or through the API.
 
-**1. Stage your Parquet or JSON files** under the database's own `_source/` prefix:
+**1. Grant read on your bucket** to Infino's service account - we give you its address - on the prefix you want indexed: `roles/storage.objectViewer` on GCS, `s3:GetObject` + `s3:ListBucket` on S3. Read only: the platform writes nothing there.
 
-```bash
-aws s3 cp ./logs/ s3://<your-bucket>/<database-root>/_source/logs/ --recursive
-```
-
-**2. Submit the job.** One `POST`, and it returns straight away - the build runs on the platform, not in the request:
+**2. Submit the job.** One `POST`, naming the bucket and prefix, and it returns straight away - the build runs on the platform, not in the request:
 
 ```bash
 curl -sS -X POST https://api.supergrep.infino.ai/v1/hydrate/<database> \
@@ -166,11 +162,13 @@ curl -sS -X POST https://api.supergrep.infino.ai/v1/hydrate/<database> \
   -H 'content-type: application/json' \
   -d '{
         "table": "logs",
-        "source": { "kind": "prefix", "prefix": "_source/logs/" },
+        "source": { "kind": "bucket", "bucket": "<your-bucket>", "prefix": "exports/logs/" },
         "fts":    [ { "column": "message" } ],
         "embed":  { "column": "embedding", "source": ["message"] }
       }'
 ```
+
+(A database that lives in your own bucket can also read shards staged under its own `_source/` prefix: `"source": { "kind": "prefix", "prefix": "_source/logs/" }`.)
 
 ```json
 { "job": "hydrate/<customer>/<database>/logs", "state": "pending" }
@@ -191,7 +189,7 @@ States are `pending`, `running`, `cancelling`, `stopped`, `succeeded`, `failed`.
 # resume where it left off
 curl -sS -X POST https://api.supergrep.infino.ai/v1/hydrate/<database> -H "authorization: Bearer $(cat ~/.infino/key)" \
   -H 'content-type: application/json' \
-  -d '{"table":"logs","source":{"kind":"prefix","prefix":"_source/logs/"},"resume":true}'
+  -d '{"table":"logs","source":{"kind":"bucket","bucket":"<your-bucket>","prefix":"exports/logs/"},"resume":true}'
 
 # stop a running job at its next commit boundary
 curl -sS -X DELETE "https://api.supergrep.infino.ai/v1/hydrate/<database>?table=logs" \
