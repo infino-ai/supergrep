@@ -1,92 +1,91 @@
 # SuperGrep
 
-> Retrieval subagents for Claude Sonnet. `find`, `search` and `sql` run
-> locally over an index in plain files inside the repo - no accounts, no API
-> keys, no server. `explore` and `ask` run in the cloud over the same
-> index's platform copy, when a database is configured. Keyword (BM25)
-> search is live seconds after indexing starts, semantic and hybrid search
-> unlock as vectors backfill, and SQL composes ranked search with GROUP BY
-> so "which files have the most code about X" is one query. The package,
-> the CLI and the MCP server are still named `code-context`.
+> Retrieval + inference offload for AI coding agents. Four tools over an
+> Infino index kept in two places: `find` and plain `sql` run on your
+> machine over the keyword index; `search`, a `sql` statement with a ranked
+> search inside it, and `ask` run in the Infino cloud over the same index's
+> platform copy, where the embeddings are computed. `ask` hands a question
+> to small models on the service that work the index and return the rows
+> they found, cited `path:line`, rather than prose. The package, the CLI
+> (`cx`) and the MCP server are still named `code-context`.
 
-SuperGrep is built on infino (https://github.com/infino-ai/infino), an
-embedded retrieval engine; the same engine and index format also serve
-logs, docs, and agent memory.
+SuperGrep is built on infino (https://github.com/infino-ai/infino), a
+retrieval engine that runs SQL, full-text (BM25) and vector search over one
+copy of the data. Try it live at https://infino.ai/supergrep.
 
 ## Start here
 
-- [README](README.md): what it is, quick start (npm install or one-command
-  Claude Code setup via npx), measured results, tool surface, CLI
-  reference, and configuration.
+- [README](README.md): what it is, the one-command install, what it saves,
+  where it wins and where it does not, indexing from object storage.
 
 ## Using it
 
-- Install: `npm install -g @infino-ai/code-context` (bins `code-context`
-  and `cx`), then `cx index` in a repo.
-- Zero-install for Claude Code (recommended; `alwaysLoad` keeps the tools in
-  view when many MCP servers are configured):
-  `claude mcp add-json code-context -s user '{"command":"npx","args":["-y","@infino-ai/code-context","mcp"],"alwaysLoad":true}'`.
-  A Claude Code plugin (`/plugin marketplace add infino-ai/code-context`) bakes the same config in.
-  These ship the three local tools; the cloud tools are on the
-  `feat/platform-backend` branch, built from source with `--db`.
-- MCP tools (stdio), local: `find` (every line containing an exact string,
-  cited path:line like grep -n; complete and unranked - the grep
-  replacement), `search` (exact terms AND meaning, one ranked pass, hits
-  carry chunk content with path:line ranges), `sql` (read-only SELECT/WITH
-  over `chunks(path, start_line, end_line, lang, symbol, content)`, ranked
-  search functions (bm25_search/hybrid_search) usable as table-valued
-  relations so search composes with GROUP BY). Cloud, with `--db`: `ask`
-  (one retrieval, returned as the rows found rather than as prose) and
-  `explore` (a question that spans the repository, answered in writing with
-  the facts and chain of queries behind it). No reindex tool: the server
-  auto-syncs in the background as queries arrive, and a first query on a
-  never-indexed repo builds the index inline and answers on the same call
-  (keyword live in seconds, vectors backfilling); `CX_AUTO_INDEX=0` restores
-  a strict "index it first" error. `find`, `search` and `sql` take an
-  optional `path` (absolute repo root) so one server serves multiple local
-  repos in a session; `ask` and `explore` are scoped to the one platform
-  database the server was started with.
-- CLI: `cx index` (incremental; `--full`, `--watch`), `cx find`,
-  `cx search`, `cx sql`, `cx status`, `cx mcp`.
+- Install: the Claude Code plugin, once per machine -
+  `claude plugin marketplace add infino-ai/supergrep` then
+  `claude plugin install code-context@infino-ai`. Any directory a session
+  opens is indexed on its first question; `find`, `sql` and `read` need no
+  account and upload nothing. `search` and `ask` need one: the person runs
+  `npx -y @infino-ai/code-context login --platform https://api.supergrep.infino.ai` once, in a
+  terminal - it asks, creates a free account (key at `~/.infino/key`, mode
+  600), and every directory after that has all four tools, each in its own
+  database, uploaded the first time `search` or `ask` is used in it. `cx
+  install` writes a per-repository `.mcp.json` entry for other clients.
+- MCP tools (stdio): `find` (every line containing an exact string, written
+  like `grep -n` with per-file counts; complete and unranked), `search` (one
+  ranked pass fusing exact terms with meaning; hits carry the code and their
+  citation), `sql` (read-only SELECT/WITH over
+  `chunks(path, start_line, end_line, lang, symbol, content)`, with
+  `bm25_search`, `hybrid_search`, `vector_search` and `token_match` as
+  table-valued relations so a search composes with GROUP BY), `ask` (a
+  question that spans the repository, returned as the rows found). `read`
+  returns the numbered lines of files the index named, several in one call.
+  `find`, `search` and `sql` take `queries`, several in one call, and an
+  optional `path` (absolute repository root) so one server serves several
+  local repositories; `ask` is scoped to the one platform database the
+  server was started with. No reindex tool: the first query builds the
+  index and every query re-syncs it.
+- CLI: `cx install`, `cx login`, `cx index` (incremental; `--full`,
+  `--watch`, `--no-embed`, `--max-files`), `cx find`, `cx search`, `cx sql`,
+  `cx status`, `cx usage`, `cx mcp`.
+- Corpora that do not fit on a laptop are written out as Parquet in object
+  storage and indexed there by the platform (`POST /v1/hydrate`); nothing
+  passes through the machine.
 
 ## Evidence
 
-- [The numbers](README.md#the-numbers): real agent runs (claude-sonnet-4-6)
-  on a repo the model has not memorized, 36 questions in five categories.
-  Sonnet's own bill falls 70% against its own Explore subagents, 58% all-in
-  once the cloud tools' cost is counted; against plain file tools, 2.4x. A
-  blind judge finds the quality gap real: it holds pinpoint symbol lookup
-  and known-file questions, and loses aggregation, comprehension and
-  by-meaning to a model reading the files itself - stated in the README as
-  a loss, not glossed over.
+- [What it saves](README.md#what-it-saves): the same 36 questions about a
+  256,000-line codebase, with and without SuperGrep, on Claude models,
+  every claim checked against the code. Cheaper on every model; more fully
+  correct answers on the cheapest; level on the larger ones.
+- [Where it wins, and where it does not](README.md#where-it-wins-and-where-it-does-not):
+  by kind of question.
 - [Embedder eval](docs/embedder-eval.md): how the local embedding model
-  was chosen.
+  behind `--embed-provider local` was chosen.
 
 ## Concepts, FAQ, limits
 
 - [Code search for coding agents](docs/concepts/code-search-for-coding-agents.md):
-  the crawl-vs-retrieve model, when an index saves tokens, and where a plain
-  grep is still the right tool.
-- [FAQ](docs/faq.md): what it is, when an agent should use it, the five-tool
-  MCP surface, local-vs-platform guarantees, freshness.
-- [Tradeoffs](docs/tradeoffs.md): honest limits - the quality gap against a
-  model reading files itself, no structural code intelligence, no token win
-  on pinpoint lookups, one-time vector cost.
+  the crawl-vs-retrieve model and when an index saves tokens.
+- [FAQ](docs/faq.md): what it is, when an agent should use it, the tools,
+  local-vs-platform guarantees, freshness.
+- [Tradeoffs](docs/tradeoffs.md): the limits beyond the measured ones.
+- [Reference](docs/reference.md): tools, flags, configuration, CLI,
+  architecture.
 
 ## Operational notes
 
-- The local index lives in `.infino/` in the repo root (added to your
-  `.gitignore` automatically on first index): plain files you can copy or
-  cache in CI. With `--db`, the same chunks also load into a platform
-  database over HTTPS, authenticated by a bearer key that is never passed
-  as a command-line argument.
-- Staged readiness: the keyword index commits before the embedding model
-  finishes downloading; a failed vector stage degrades to keyword-only
-  search instead of failing the index.
+- The local index lives in `.infino/` in the directory root (added to
+  `.gitignore` on the first build): plain files you can copy or cache in CI.
+  With an account the same chunks also load into a platform database over
+  HTTPS, authenticated by a bearer key that is never passed as a
+  command-line argument.
+- Keyword search is live within seconds of the first build; the platform's
+  vectors backfill behind it and semantic ranking unlocks when they land.
 - Incremental sync re-chunks and re-embeds only changed files (size/mtime
   prefilter, then content hash); an unchanged tree is a fast no-op, and
-  every sync updates both copies when `--db` is set.
+  every sync updates both copies.
 - Config via env: `CX_ROOT`, `CX_INDEX_DIR`, `CX_AUTO_INDEX`, `CX_AUTO_SYNC`,
   `CX_SYNC_INTERVAL_SECS`, `CX_NO_EMBED`, `CX_MAX_FILES`,
-  `CX_MAX_FILE_BYTES`. Platform settings are command-line flags on
-  `cx index` and `cx mcp` - see [the reference](docs/reference.md).
+  `CX_MAX_FILE_BYTES`, `CX_TABLE`, `CX_TEXT_COLUMN`. Platform settings are
+  command-line flags on `cx index` and `cx mcp`; see
+  [the reference](docs/reference.md).

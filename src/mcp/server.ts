@@ -65,6 +65,7 @@ import {
   DEFAULT_FIND_LIMIT,
   MAX_FIND_LIMIT,
   hostedTarget,
+  hostedAccount,
   hostedLabel,
   hostedAnalyzer,
   embedProvider,
@@ -80,6 +81,7 @@ import {
   subagentMaxWallSecs,
 } from "../core/config.js";
 import { keyFilePath, readStoredAccount } from "../core/keystore.js";
+import { createDatabase } from "../core/account-api.js";
 import { runRetrievalAgent } from "../core/retrieval-agent.js";
 import { answerDisplayMode, hookDeliveryText, relayDeliveryText, type AnswerDisplay } from "../core/answer-display.js";
 import { readManifest, readPlatformManifest, type Manifest } from "../core/manifest.js";
@@ -96,6 +98,32 @@ export function outOfCreditSteps(): string {
     `local index and cost nothing - but ask needs a balance. To restore it, the ` +
     `account's owner adds their billing details and a card to this same account at ${where} ` +
     `(the key on this machine keeps working and nothing needs reinstalling), then retries`
+  );
+}
+
+/** The platform a first sign-in asks for a free account, when the deployment
+ * that installed this server named one (the plugin's MCP entry carries it).
+ * Nothing in the source names a host: which platform a published client
+ * signs people up to is a release decision (see `install`). */
+const PLATFORM_URL_ENV = "CX_PLATFORM_URL";
+
+/** What a server with no account says, in its instructions and on the calls
+ * that need one: which tools are off, which are on, and the one command that
+ * turns the rest on - run by the person, in a terminal. Said that way on
+ * purpose. The step creates an account and agrees to file contents leaving
+ * the machine, and the agent must never be the one who agrees (the rule is
+ * core/consent.ts's): so the model is told whose command it is and told not
+ * to run it, and the command asks the person itself before it does anything.
+ * No key is ever typed into a conversation. */
+export function noAccountSteps(): string {
+  const platform = process.env[PLATFORM_URL_ENV]?.trim() || "<the platform's URL>";
+  return (
+    "search and ask are off on this server: this machine has no Infino account, or has not agreed to uploads. " +
+    "find, sql and read run on the local index and need nothing. To turn search and ask on, the person - not " +
+    `you - runs once, in a terminal: \`npx -y @infino-ai/code-context login --platform ${platform}\`. It asks ` +
+    "them first, creates a free account (no email, no card), stores its key on this machine, and every " +
+    "directory they open after that has all four tools once the session restarts. Do not run that command " +
+    "yourself, and never ask for or paste a key"
   );
 }
 
@@ -978,27 +1006,20 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // startup, not on the first tool call. The key stays inside the target;
   // only `hostedLabel` ever reaches a log line.
   const hosted = hostedTarget();
+  // The account the target came from, when no --db named a database: then
+  // every repository a session opens gets its own database on it (see
+  // RepoRegistry), registered here before its first build.
+  const account = hostedAccount();
 
-  // The local model: query embedding for search/sql and the sync's small
-  // batches. Null under CX_NO_EMBED.
+  const noEmbed = Boolean(process.env.CX_NO_EMBED);
+  // The local model exists for exactly one job now: `--embed-provider local`
+  // computes the vectors the PLATFORM table's embedding column carries.
+  // Locally is always lexical (owner, 2026-09-09: "all vector search happens
+  // on the cloud"), so nothing here ever runs without an account, and never
+  // when the provider is the platform's own model.
+  const wantsLocalEmbed = hosted !== null && !noEmbed && embedProvider() === "local";
   let embedder: Embedder | null = null;
-  const getEmbedder = (): Embedder | null => (process.env.CX_NO_EMBED ? null : (embedder ??= createEmbedder()));
-
-  // CX_REMOTE_SEARCH=1 makes `search` read the HOSTED index instead of the
-  // local one, when a platform database is configured. Off by default, and
-  // deliberately a switch rather than the new behaviour: every measurement
-  // taken so far read the local index under this tool's name, and silently
-  // changing what it reads would reinterpret all of them. (A `sql` statement
-  // that embeds a query goes to the platform with or without the switch -
-  // see the sql tool; a plain one is local either way.)
-  //
-  // It exists because the hosted index could not be read without the
-  // platform's answering loop. `ask` was the only remote retrieval, and it
-  // runs that loop, so the two things a caller might want separately - the
-  // index and the decider - could only be taken together.
-  // With this on, a cheap local agent can hold the hosted index directly,
-  // which is the configuration to beat before the loop is worth its cost.
-  const remoteSearch = ["1", "true", "yes"].includes((process.env.CX_REMOTE_SEARCH ?? "").toLowerCase());
+  const getEmbedder = (): Embedder | null => (wantsLocalEmbed ? (embedder ??= createEmbedder()) : null);
 
   // --- per-repo state ---------------------------------------------------------
   // One server serves every repo a session touches: the optional `path` tool
@@ -1009,6 +1030,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const registry = new RepoRegistry(defaultRoot, {
     connect,
     ...(hosted ? { hosted: { target: hosted, ...(hostedOptions ? { options: hostedOptions } : {}) } } : {}),
+    ...(account ? { account } : {}),
   });
   const repoFor = (requested?: string): RepoCtx => registry.get(requested);
 
@@ -1028,7 +1050,6 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * on the CLI: with no local embedder, the `local` provider gives the
    * platform table no embedding column either. The analyzer is passed only
    * when a flag named one; otherwise a build keeps the table's own. */
-  const noEmbed = Boolean(process.env.CX_NO_EMBED);
   const analyzer = hostedAnalyzer();
   const indexTargets = (ctx: RepoCtx): Pick<IndexOptions, "root" | "db" | "hosted" | "indexDirPath" | "embedProvider" | "analyzer" | "caps"> => ({
     root: ctx.root,
@@ -1092,7 +1113,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   /** Fresh build-scoped embedder: full builds embed in a child process so the
    * bulk pipeline's memory leaves with it (issue #9). Query and sync
    * embedding keep the warm in-process singleton via getEmbedder(). */
-  const buildEmbedder = (): Embedder | null => (noEmbed ? null : createIndexingEmbedder());
+  const buildEmbedder = (): Embedder | null => (wantsLocalEmbed ? createIndexingEmbedder() : null);
 
   /** Let the build finish in-process - vectors backfill (the manifest flips
    * to "ready"), then the platform table loads when one is configured - and
@@ -1115,12 +1136,32 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     ctx.completion = held;
   };
 
+  /** On the stored account, the repository's database has to exist before
+   * its table can: registered here once per repository for the server's
+   * life, as `cx install` registers it - a name the account already holds is
+   * the outcome wanted, not a failure. Nothing to do when `--db` named the
+   * database: it was registered by whoever named it. A refusal (a key the
+   * platform will not take, an account that cannot spend) fails the build
+   * with the platform's words and the fix, and the next query tries again. */
+  const registered = new Set<string>();
+  const ensureDatabase = async (ctx: RepoCtx): Promise<void> => {
+    if (!account || !ctx.hosted || registered.has(ctx.root)) return;
+    const database = ctx.hosted.target.database;
+    try {
+      await createDatabase(account, database, { fetch: hostedOptions?.fetch });
+    } catch (err) {
+      throw new Error(`could not register the database ${database} on ${account.baseUrl} for ${ctx.root}: ${(err as Error).message}${refusalHint(err)}`);
+    }
+    registered.add(ctx.root);
+  };
+
   /** Acquire the repo's mutation lock and run a staged build; resolves at
    * keyword-live with stage-1 stats, or null if a build is already in flight.
    * The build's completion (vectors, then the platform table when one is
    * configured) runs on in the background, held on `ctx.completion`. */
   const buildIndex = (ctx: RepoCtx): Promise<IndexStats> | null =>
     exclusive(ctx, async () => {
+      await ensureDatabase(ctx);
       const emb = buildEmbedder();
       const run = await indexRepoStaged({ ...indexTargets(ctx), embedder: emb });
       backfill(ctx, run, emb);
@@ -1128,6 +1169,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     });
 
   const doSync = async (ctx: RepoCtx): Promise<SyncOutcome> => {
+    await ensureDatabase(ctx);
     const outcome = await syncRepo({ ...indexTargets(ctx), embedder: getEmbedder() });
     // A rebuild for every reason but "a build is already in flight" (the
     // vector stage, or the platform load - a second build would race it).
@@ -1415,9 +1457,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const answerDisplay = answerDisplayMode();
 
   // What the default root's doors run against (TableMode), decided here and
-  // once. With CX_REMOTE_SEARCH, a platform database and a CX_TABLE that is
-  // not the default, the table's schema says whether it is the chunks table
-  // or another shape, and the tool text below is registered to match - so
+  // once. With a platform database and a CX_TABLE that is not the default,
+  // the table's schema says whether it is the chunks table or another shape,
+  // and the tool text below is registered to match - so
   // the text and the calls cannot disagree, whichever way the probe went.
   // Resolved through the default root's own client, with its normal
   // cold-start budget: for that table the answer decides the mode, so a
@@ -1450,7 +1492,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // asked beside its siblings it would come back carrying the platform's
   // joins, and no key reaches the tool text - the model calls join_keys.
   const siblingNames = hosted ? siblingTables() : [];
-  if (hosted && remoteSearch && TABLE !== DEFAULT_TABLE) {
+  if (hosted && TABLE !== DEFAULT_TABLE) {
     try {
       const shape = await resolveTableShape(registry.get().hosted!, TABLE, CARD_TIER, noCard, TEXT_COLUMN);
       card = shape.card;
@@ -1642,7 +1684,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         : mode.kind === "unresolved"
         ? unresolvedInstructions(TABLE, mode.cause, agentTools)
         : logIndex
-        ? logIndexInstructions(agentTools, startManifest?.files ?? 0, startManifest?.chunks ?? 0)
+        ? logIndexInstructions(agentTools, startManifest?.files ?? 0, startManifest?.chunks ?? 0) + (platformTools ? "" : ` ${noAccountSteps()}.`)
         : // The first move was ls and cat CLAUDE.md, every run, before any of
           // these tools (the demo, 2026-09-24): the model looks around a
           // checkout it has been told nothing about. It has been told: the
@@ -1723,12 +1765,22 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         " Read files with read, every path in one call; Claude's own Read only for a hit marked truncated. " +
         "Every tool takes an optional 'path' (an absolute repo root) to target another repository. " +
         "A 'partial' marker means files over the index cap were left out, so a missing match is not " +
-        "proof of absence.") +
+        "proof of absence." +
+        // Without an account the two platform tools are not registered, and
+        // a model that finds them missing needs to know why and what the
+        // person can do - once, from a terminal - rather than conclude the
+        // server is broken or go looking for a key.
+        (platformTools ? "" : ` ${noAccountSteps()}.`)) +
         (apiTools ? apiToolsInstruction(Boolean(rows)) : "") +
         (siblingNames.length > 0 ? siblingsInstruction(TABLE, siblingNames, agentTools) : ""),
     },
   );
 
+  // Registered only with an account: local vectors don't exist any more (the
+  // owner's decision, 2026-09-09 - see wantsLocalEmbed above), so a local
+  // "search" would just be a thinner bm25_search under a misleading name.
+  // Without an account, reach for sql's bm25_search/token_match instead.
+  if (platformTools) {
   server.registerTool(
     "search",
     {
@@ -1832,65 +1884,52 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // Reading the hosted index needs no local index at all, so this comes
       // before ensureIndexed: requiring a local build first would make the
       // hosted path depend on the very thing it exists to do without.
-      if (remoteSearch && ctx.hosted) {
-        const notReady = await platformNotReady("search", ctx);
-        if (notReady) return notReady;
-        try {
-          const t0 = performance.now();
-          // The hosted table's analyzer decides which lines carry a term
-          // (`lines`): the platform manifest this machine wrote when it loaded
-          // the table records it; a table loaded some other way is read with
-          // the platform's default for a bare column, as analyzerOf says.
-          const hostedAnalyzer = analyzerOf(readPlatformManifest(ctx.dir) ?? { origin: "hosted" });
-          const result = await searchHosted(ctx.hosted, query, k, { lines, analyzer: hostedAnalyzer });
-          recordOf(ctx).addPlaces(TABLE, result.hits);
-          let usage: string | undefined;
-          if (receiptOn) {
-            // withPlatform, as the ask path does: the platform
-            // returns the tokens it metered for this call, and without this
-            // a remote search is the one hosted path whose read tokens never
-            // reach the ledger. They were being estimated at a measured rate
-            // per search instead, which is a made-up number standing in for
-            // one the response already carried.
-            const entry = withPlatform(searchEntry(result, ctx.root), ctx);
-            recordUsage(ctx.dir, entry);
-            usage = formatReceipt(entry, session);
-          }
-          return ok({
-            ...result,
-            index: "platform",
-            took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
-            ...(usage ? { usage } : {}),
-          });
-        } catch (err) {
-          return fail(`search failed: ${(err as Error).message}${refusalHint(err)}`);
-        }
+      // ctx.hosted is set for the default root whenever this tool is
+      // registered at all; it is unset only when `path` names a different,
+      // local-only repository (RepoRegistry carries the platform client for
+      // the default root alone) - there is no local vector fallback to fall
+      // back to any more, so that case is a clear refusal, not a degraded run.
+      if (!ctx.hosted) {
+        return fail(
+          "search needs an account; the default repository has one but " +
+            `'${path}' does not. Use sql's bm25_search/token_match for keyword ranking there instead.`,
+        );
       }
-      const ensured = await localIndex(ctx);
-      if ("failed" in ensured) return ensured.failed;
-      const { handle, autoIndexed } = ensured;
-      if (!autoIndexed) maybeAutoSync(ctx); // a fresh build is already current
+      const notReady = await platformNotReady("search", ctx);
+      if (notReady) return notReady;
       try {
         const t0 = performance.now();
-        const result = await search(handle, getEmbedder(), query, k, { lines });
+        // The hosted table's analyzer decides which lines carry a term
+        // (`lines`): the platform manifest this machine wrote when it loaded
+        // the table records it; a table loaded some other way is read with
+        // the platform's default for a bare column, as analyzerOf says.
+        const hostedAnalyzer = analyzerOf(readPlatformManifest(ctx.dir) ?? { origin: "hosted" });
+        const result = await searchHosted(ctx.hosted, query, k, { lines, analyzer: hostedAnalyzer });
         recordOf(ctx).addPlaces(TABLE, result.hits);
         let usage: string | undefined;
         if (receiptOn) {
-          const entry = searchEntry(result, ctx.root);
+          // withPlatform, as the ask path does: the platform
+          // returns the tokens it metered for this call, and without this
+          // a remote search is the one hosted path whose read tokens never
+          // reach the ledger. They were being estimated at a measured rate
+          // per search instead, which is a made-up number standing in for
+          // one the response already carried.
+          const entry = withPlatform(searchEntry(result, ctx.root), ctx);
           recordUsage(ctx.dir, entry);
           usage = formatReceipt(entry, session);
         }
         return ok({
           ...result,
-          ...(autoIndexed ? { auto_indexed: autoIndexNote(autoIndexed) } : {}),
+          index: "platform",
           took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
           ...(usage ? { usage } : {}),
         });
       } catch (err) {
-        return fail(`search failed: ${(err as Error).message}`);
+        return fail(`search failed: ${(err as Error).message}${refusalHint(err)}`);
       }
     }),
   );
+  }
 
   server.registerTool(
     "find",
@@ -2172,6 +2211,17 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         const notReady = await platformNotReady("sql", ctx);
         if (notReady) return notReady;
         return sqlOnPlatform(ctx, query, embeds, question, { numbered: true });
+      }
+      // No account, and the statement embeds a query: there is nowhere for
+      // it to run. The local index carries no vector column at all - only
+      // the platform's copy ever does (see wantsLocalEmbed above) - so
+      // refuse plainly rather than let the engine fail on a missing column.
+      if (!ctx.hosted && embedsAQuery(query)) {
+        return fail(
+          "this statement embeds a query (hybrid_search/vector_search), which needs an account - " +
+            "there is no local vector index. Use bm25_search or token_match for keyword ranking instead. " +
+            `${noAccountSteps()}.`,
+        );
       }
       const ensured = await localIndex(ctx);
       if ("failed" in ensured) return ensured.failed;

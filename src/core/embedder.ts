@@ -1,26 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 //
-// Embedding is local by default: a transformers.js model downloaded once on
-// first use - no API key, no per-query network, code never leaves the
-// machine. Chunks and queries embed with the SAME model so they align.
+// A transformers.js model, downloaded once on first use, that runs on this
+// machine - no API key, no per-query network. Chunks and queries embed with
+// the SAME model so they align.
 //
-// Semantic search is optional by design: indexing commits the keyword index
-// first and backfills vectors after, so a failed model download degrades to
-// keyword-only search instead of blocking indexing.
+// The local index never carries a vector column - vector search runs on the
+// platform (owner, 2026-09-09: "all vector search happens on the cloud"; see
+// server.ts's wantsLocalEmbed and indexer.ts's stage 2). What is built here
+// exists for exactly one caller: `--embed-provider local`, which computes
+// the vectors the PLATFORM table's embedding column carries instead of the
+// platform's own model doing it server-side. Nothing in this file runs
+// without both an account and that provider configured.
 //
 // Two embedders, one model:
-//   createEmbedder()          in-process pipeline; stays warm for query-time
-//                             embedding (one short string per call - arenas
-//                             stay small) and small incremental syncs.
+//   createEmbedder()          in-process pipeline; stays warm for small
+//                             incremental syncs (one short string per call -
+//                             arenas stay small).
 //   createIndexingEmbedder()  a short-lived child process for full builds;
 //                             the ONNX runtime's arenas grow with everything
 //                             ever embedded and never shrink, so bulk work
 //                             runs where exit() can give the memory back.
-//
-// Both constructors embed the LOCAL index. Who fills the platform table's
-// vectors (--embed-provider: the platform's own model by default, or these
-// vectors shipped) is the indexer's business; nothing here changes with it.
 //
 // CX_EMBED_MODEL / CX_EMBED_DTYPE exist for development and evaluation (see
 // docs/embedder-eval.md) and are deliberately undocumented product surface.

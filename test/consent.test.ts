@@ -46,7 +46,9 @@ describe("the notice", () => {
 
   it("says which tools do not upload, and that no is a working outcome", () => {
     const text = consentNotice(PLATFORM, "my-repo", "/home/me/code");
-    expect(text).toContain("find, search and sql do not upload anything");
+    // Not "search": it reads the platform copy now, so naming it here would
+    // promise a tool the no leaves off.
+    expect(text).toContain("find and plain sql do not upload anything");
     expect(text).toContain("keep working if you say no");
   });
 

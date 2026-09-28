@@ -9,20 +9,21 @@ server are still named `code-context`.
 | tool | runs | what it does | when Claude uses it |
 |---|---|---|---|
 | `find` | local | every line containing an exact string, `path:line` like `grep -n`, with per-file counts like `grep -c`; complete and unranked, and every hit is a real occurrence | where it would grep: every use or definition of an identifier, an error message, a config key |
-| `search` | local | one ranked pass fusing exact keyword matching (BM25) with semantic similarity; hits carry the code, or with `lines` only the lines of each chunk that carry the query's words, with two lines of context | how a subsystem works, code by meaning or exact term, similar implementations; `lines` over logs and other long records, where the matching lines are the answer |
-| `sql` | local | read-only SQL over the index, with `bm25_search` and `hybrid_search` as table functions | counts, rankings and aggregates over the whole repository in one query |
+| `search` | platform | one ranked pass fusing exact keyword matching (BM25) with semantic similarity; hits carry the code and their citation (`cite`), or with `lines` only the lines of each chunk that carry the query's words, with two lines of context | how a subsystem works, code by meaning or exact term, similar implementations; `lines` over logs and other long records, where the matching lines are the answer |
+| `sql` | local, or platform when a statement embeds | read-only SQL over the index, with `bm25_search`, `hybrid_search`, `vector_search` and `token_match` as table functions | counts, rankings and aggregates over the whole repository in one query |
 | `read` | local | the numbered lines of the files named, several files in one call, from the index; `from` and `to` cut to a range, and a long file comes back a page at a time | after the index has named the files: every one of them at once, in place of one read per file |
-| `ask` | platform | a question or task in plain language; returns the rows it retrieved - `path`, `start_line`, `end_line` and the code - never a summary | how does X work, where is X handled, when Claude wants facts to compose from rather than an answer |
+| `ask` | platform | a question or task in plain language; returns the rows it retrieved, each with its citation, `path`, `start_line`, `end_line` and the code, never a summary | how does X work, where is X handled, when Claude wants facts to compose from rather than an answer |
 
-`ask` is registered only when the server has `--db`.
-`find`, `search` and `sql` take an optional `path` (an absolute repository
-root) so one server can serve several repositories in a session, each with
-its own local index; `ask` reads one platform database and
-refuses a `path` naming a different repository. Each of the three also
-takes `queries`, a list of up to sixteen strings or statements in place of
-`query`: they run at the same time and the results come back in the same
-order, each under its query, so several lookups are one call and one turn
-of the agent rather than one per lookup.
+`search` and `ask` are registered when the server has an account (`install
+--platform`, or `--db` by hand); without one the server is `find`, plain
+`sql` and `read` over the local index. `find`, `search` and `sql` take an
+optional `path` (an absolute repository root) so one server can serve
+several repositories in a session, each with its own local index; `ask`
+reads one platform database and refuses a `path` naming a different
+repository. Each of the three also takes `queries`, a list of up to sixteen
+strings or statements in place of `query`: they run at the same time and
+the results come back in the same order, each under its query, so several
+lookups are one call and one turn of the agent rather than one per lookup.
 
 ### The SQL move
 
@@ -46,13 +47,19 @@ server-side, so agents never handle raw vectors.
 
 ### One index in two places
 
-`cx index --db` builds the local index and loads the same chunks into a
-platform database; every sync after it (the explicit `cx index`, or the
+With the machine signed in (`cx login`), the first `search` or `ask` in a
+directory builds the local index and loads the same chunks into that
+directory's own database on the account; `cx index --db` does it by hand for
+a database you name. Every sync after it (the explicit `cx index`, or the
 server's auto-sync as queries arrive) applies the same diff to both, so they
 never drift. `find` and plain `sql` read the local copy; `search`, a `sql`
 with a ranked search in it, and `ask` run on the platform copy, where every
-embedding is computed. Without `--db` the server is the local keyword index
-alone, and nothing leaves the machine: no account, no key, no telemetry.
+embedding is computed. Without an account the server is the local keyword
+index alone, and nothing leaves the machine: no account, no key, no
+telemetry. A stored key alone is not an account here: the person has to have
+agreed to the upload (`cx login --platform` asks; `cx login --yes` for a key
+you already had), and until then the server says which tools are off and
+what turns them on.
 
 The keyword index commits first - about a second on a 3,000-chunk
 repository - so `find` works within seconds; the platform's vectors backfill
@@ -67,7 +74,7 @@ that touch it, `cx index` and `cx mcp`:
 
 | flag | default | purpose |
 |---|---|---|
-| `--db <url>` | (local index only) | the platform database, `https://host/<database>` (plain `http://` only for localhost) |
+| `--db <url>` | the directory's own database on the stored account; the local index alone without one | the platform database, `https://host/<database>` (plain `http://` only for localhost) |
 | `--api-key-file <path>` | `INFINO_API_KEY` | file holding the bearer key. The key is never an argument, since a process's arguments are visible to every other process on the machine; the environment variable is the one alternative |
 | `--embed-provider <platform\|local>` | `platform` | who fills the platform table's vectors: the platform's own model, or this machine's (vectors shipped with the rows) |
 | `--analyzer <ascii_lower\|standard>` | the table's own; `ascii_lower` for a first load | `cx index` only: the full-text analyzer the platform table is created with. `ascii_lower` splits code identifiers on `.`, `_`, and `::`. Without the flag a rebuild keeps the analyzer the table has; naming a different one rebuilds it |
@@ -95,15 +102,22 @@ network.
 | `CX_SYNC_INTERVAL_SECS` | 30 | auto-sync debounce between staleness checks |
 | `CX_NO_EMBED` | off | keyword-only mode (with `--db`, the platform copy is keyword-only too) |
 | `CX_NO_RECEIPT` | off | `1` turns off usage accounting - the per-call receipt on results and the `cx usage` ledger |
+| `CX_TABLE` | `chunks` | the hosted table the server reads, for a table loaded from object storage rather than built by `cx index` |
+| `CX_TEXT_COLUMN` | chosen from the table's shape | with `CX_TABLE`, the column the doors search on a table that has several indexed text columns |
 
 Every result carries a **usage receipt**: the tokens it returned, the files
 it spanned, and a running session total. For the platform tools the receipt
-names the platform's metered spend for the call ("N model tokens"), which
-the platform bills; the Sonnet side is on your Anthropic bill as usual.
+names what the platform metered for the call, which the platform bills; your
+model's side is on your own model bill as usual.
 
 ## CLI
 
 ```
+cx login --platform <url>    get a free account (asks first), store its key at mode 600: every directory has all four tools
+cx login --db <url> --yes < key   store a key you already have, agreed to uploads
+cx login --show | --logout   what is stored / forget the key
+cx install                   write this repository's MCP entry into .mcp.json, for clients other than the plugin
+                             (--platform <url> signs up too; --local-only: find and plain sql, nothing uploaded)
 cx index [path]           sync the index (incremental; --full rebuilds, --watch follows edits)
 cx find <text>            every line containing the exact text, path:line  (-i, -c per-file counts, --limit)
 cx search <query>         exact terms + meaning, one ranked pass           (-k hits, --lines for the matching lines only)
@@ -131,9 +145,10 @@ their standard server config. Point the server at a repository with
 not the repository.
 
 The npm release (`npx -y @infino-ai/code-context mcp`) and the Claude Code
-plugin (`/plugin marketplace add infino-ai/supergrep`, then
-`/plugin install code-context@infino-ai`) ship the local index alone today;
-the platform tools are on the `feat/platform-backend` branch.
+plugin are the same server: with no `--db` it serves the directory it is
+started in on the stored account, once `cx login` has stored one, and every
+`path` a call names on the same account, each directory in its own database.
+`--db` pins one database instead, for a table loaded some other way.
 
 ## What it is, and what it isn't
 
@@ -151,7 +166,9 @@ stack.
 - **Chunking:** tree-sitter (WASM, no native compiles) cuts at definition
   boundaries for TypeScript/JS, Python, Rust, Go, Java, C/C++, Ruby, C#, PHP;
   Markdown splits at headings; everything else falls back to fixed windows.
-  Every chunk carries `path, start_line, end_line, lang, content`.
+  Every chunk carries `path, start_line, end_line, lang, symbol, content`,
+  the symbol being the definitions the chunk holds, or the definition it is
+  part of and that definition's span.
 - **Index:** [infino](https://github.com/infino-ai/infino) tables - BM25 and
   IVF vector indexes over a single copy of the data - queried in-process
   through the Node binding locally, and the same table on an Infino platform

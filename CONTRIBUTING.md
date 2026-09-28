@@ -4,14 +4,21 @@ Thanks for your interest in SuperGrep!
 
 ## Getting started
 
+Node 22 or newer. Using SuperGrep needs none of this - the README's install
+is the Claude Code plugin and the npm package - but a change to it does:
+
 ```
+git clone https://github.com/infino-ai/supergrep && cd supergrep
 npm ci
 npm run build     # tsc → dist/
 npm test          # vitest - unit + engine-integration tests, no network needed
 ```
 
 `node dist/cli.js --help` runs your local build; `npm link` puts local
-`code-context`/`cx` bins on your PATH.
+`code-context`/`cx` bins on your PATH. To run your build as the MCP server
+in a repository, `node dist/cli.js install` there writes an entry naming it
+(a source build writes its own `dist/cli.js`; an installed package writes
+`npx` pinned to its version).
 
 ## Before you open a PR
 

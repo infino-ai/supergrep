@@ -6,6 +6,12 @@
 // the on-disk spills - and the spills must vanish when the vector stage
 // settles, success or failure. Fixtures are sized past APPEND_BATCH so the
 // multi-wave paths actually run; fake embedders keep CI off the network.
+//
+// The embed/spill stage only ever runs with an account and
+// `--embed-provider local` now (the local table itself is always lexical -
+// owner, 2026-09-09), so every build and sync below carries a fake platform
+// target for exactly that reason: it is what makes stage 2 run at all, not
+// something these tests otherwise care about.
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,10 +19,17 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { connect, type Connection } from "@infino-ai/infino";
 import { APPEND_BATCH, EMBED_BATCH } from "../src/core/config.js";
 import { indexRepo, indexRepoStaged, syncRepo, type SyncResult } from "../src/core/indexer.js";
-import { readManifest } from "../src/core/manifest.js";
+import { readManifest, readPlatformManifest } from "../src/core/manifest.js";
 import { search } from "../src/core/searcher.js";
 import { unpackRows, type Embedder } from "../src/core/embedder.js";
 import type { IndexHandle } from "../src/core/context.js";
+import { fakePlatform } from "./indexer.hosted.test.js";
+
+/** Every build/sync below wants the same thing: an account, so stage 2 runs
+ * at all, and the client provider, so the fake embedder above is what fills
+ * the vectors instead of the (nonexistent, in this fake) platform model. */
+const withAccount = (platform: ReturnType<typeof fakePlatform>) =>
+  ({ hosted: platform.db(), embedProvider: "local" as const });
 
 const DIM = 16; // engine minimum
 
@@ -83,18 +96,21 @@ afterAll(() => {
 });
 
 describe("streamed staged build", () => {
-  it("crosses APPEND_BATCH, lands hybrid search, and cleans its spills", async () => {
-    const stats = await indexRepo({ root, db, indexDirPath: dir, embedder: float32Fake });
-    expect(stats.vectors).toBe("ready");
+  it("crosses APPEND_BATCH, ships client vectors to the platform, and cleans its spills", async () => {
+    const platform = fakePlatform();
+    const stats = await indexRepo({ root, db, indexDirPath: dir, embedder: float32Fake, ...withAccount(platform) });
     expect(stats.chunks).toBeGreaterThan(APPEND_BATCH);
+    expect(stats.embedError).toBeUndefined();
+    expect(readPlatformManifest(dir)!.vectors).toBe("ready");
 
-    // Every spilled row made it into the rebuilt table.
+    // Every spilled row made it into the local (keyword-only) table too.
     const [{ n }] = db.querySql(`SELECT COUNT(*) AS n FROM chunks`) as [{ n: unknown }];
     expect(Number(n)).toBe(stats.chunks);
+    expect(platform.rows()).toHaveLength(stats.chunks);
 
     const handle: IndexHandle = { root, dir, db, manifest: readManifest(dir)! };
     const r = await search(handle, float32Fake, "streamingfixture3 pipeline", 5);
-    expect(r.ranking).toBe("hybrid");
+    expect(r.ranking).toBe("keyword"); // local; the account's vectors went to the platform, not here
     expect(r.hits.length).toBeGreaterThan(0);
 
     // Handoff files are gone once the vector stage settles.
@@ -102,9 +118,10 @@ describe("streamed staged build", () => {
   });
 
   it("builds through embed() alone when embedToFloat32 is absent", async () => {
-    const stats = await indexRepo({ root, db, indexDirPath: dir, embedder: embedOnlyFake });
-    expect(stats.vectors).toBe("ready");
+    const platform = fakePlatform();
+    const stats = await indexRepo({ root, db, indexDirPath: dir, embedder: embedOnlyFake, ...withAccount(platform) });
     expect(stats.embedError).toBeUndefined();
+    expect(readPlatformManifest(dir)!.vectors).toBe("ready");
     expect(spillNames(dir)).toEqual([]);
   });
 
@@ -119,11 +136,15 @@ describe("streamed staged build", () => {
         throw new Error("model download failed");
       },
     };
-    const run = await indexRepoStaged({ root, db, indexDirPath: dir, embedder: broken });
-    expect(run.text.vectors).toBe("building");
+    const platform = fakePlatform();
+    const run = await indexRepoStaged({ root, db, indexDirPath: dir, embedder: broken, ...withAccount(platform) });
+    expect(run.text.vectors).toBe("none"); // local; always
     const final = await run.completion;
-    expect(final.vectors).toBe("none");
     expect(final.embedError).toContain("model download failed");
+    // The platform table still loads - keyword-only, since the client's
+    // vectors never arrived.
+    expect(final.hosted).toBeDefined();
+    expect(readPlatformManifest(dir)!.vectors).toBe("none");
 
     // Keyword search still answers from the stage-1 table.
     const handle: IndexHandle = { root, dir, db, manifest: readManifest(dir)! };
@@ -145,20 +166,22 @@ describe("streamed staged build", () => {
         return { vectors, dim: DIM };
       },
     };
-    const run = await indexRepoStaged({ root, db, indexDirPath: dir, embedder: short });
+    const platform = fakePlatform();
+    const run = await indexRepoStaged({ root, db, indexDirPath: dir, embedder: short, ...withAccount(platform) });
     const final = await run.completion;
-    expect(final.vectors).toBe("none");
     expect(final.embedError).toMatch(/floats|mismatch/);
+    expect(readPlatformManifest(dir)!.vectors).toBe("none");
     expect(spillNames(dir)).toEqual([]);
   });
 });
 
 describe("streamed incremental sync", () => {
   it("re-embeds a multi-wave changeset in bounded batches", async () => {
-    // Rebuild to a clean hybrid state, then grow the tree by several files
-    // whose chunks cross EMBED_BATCH several times over.
-    const stats = await indexRepo({ root, db, indexDirPath: dir, embedder: float32Fake });
-    expect(stats.vectors).toBe("ready");
+    // Rebuild to a clean state, then grow the tree by several files whose
+    // chunks cross EMBED_BATCH several times over.
+    const platform = fakePlatform();
+    const stats = await indexRepo({ root, db, indexDirPath: dir, embedder: float32Fake, ...withAccount(platform) });
+    expect(readPlatformManifest(dir)!.vectors).toBe("ready");
 
     const added = 3;
     for (let f = 100; f < 100 + added; f++) {
@@ -171,31 +194,33 @@ describe("streamed incremental sync", () => {
       writeFileSync(join(root, "src", `mod${f}.js`), lines.join("\n") + "\n");
     }
 
-    const outcome = (await syncRepo({ root, db, indexDirPath: dir, embedder: float32Fake })) as SyncResult;
+    const outcome = (await syncRepo({ root, db, indexDirPath: dir, embedder: float32Fake, ...withAccount(platform) })) as SyncResult;
     expect(outcome.action).toBe("synced");
     expect(outcome.filesAdded).toBe(added);
     expect(outcome.chunksAdded).toBeGreaterThan(EMBED_BATCH * 3);
     expect(outcome.chunks).toBe(stats.chunks + outcome.chunksAdded);
+    expect(readPlatformManifest(dir)!.vectors).toBe("ready");
 
     const handle: IndexHandle = { root, dir, db, manifest: readManifest(dir)! };
     const r = await search(handle, float32Fake, "syncwavefixture101", 3);
-    expect(r.ranking).toBe("hybrid");
+    expect(r.ranking).toBe("keyword"); // local; the vectors went to the platform
     expect(r.hits.some((h) => h.path === "src/mod101.js")).toBe(true);
   });
 });
 
 describe("review-confirmed regressions", () => {
-  it("indexes an empty corpus to vectors:ready, not a spurious spill error", async () => {
+  it("indexes an empty corpus to a complete platform table, not a spurious spill error", async () => {
     const emptyRoot = mkdtempSync(join(tmpdir(), "cx-empty-"));
     const emptyDir = join(emptyRoot, ".infino");
     // One binary file: walked, fingerprinted, but yields zero chunks.
     writeFileSync(join(emptyRoot, "blob.js"), Buffer.from([0, 1, 2, 0, 3]));
     const emptyDb = connect(emptyDir);
     try {
-      const stats = await indexRepo({ root: emptyRoot, db: emptyDb, indexDirPath: emptyDir, embedder: float32Fake });
+      const platform = fakePlatform();
+      const stats = await indexRepo({ root: emptyRoot, db: emptyDb, indexDirPath: emptyDir, embedder: float32Fake, ...withAccount(platform) });
       expect(stats.chunks).toBe(0);
       expect(stats.embedError).toBeUndefined();
-      expect(stats.vectors).toBe("ready");
+      expect(readPlatformManifest(emptyDir)!.vectors).toBe("ready");
       expect(spillNames(emptyDir)).toEqual([]);
     } finally {
       rmSync(emptyRoot, { recursive: true, force: true });
@@ -213,13 +238,11 @@ describe("review-confirmed regressions", () => {
         return float32Fake.embedToFloat32!(texts);
       },
     };
-    const runA = await indexRepoStaged({ root, db, indexDirPath: dir, embedder: slow });
-    const runB = await indexRepoStaged({ root, db, indexDirPath: dir, embedder: float32Fake });
+    const runA = await indexRepoStaged({ root, db, indexDirPath: dir, embedder: slow, ...withAccount(fakePlatform()) });
+    const runB = await indexRepoStaged({ root, db, indexDirPath: dir, embedder: float32Fake, ...withAccount(fakePlatform()) });
     const [a, b] = await Promise.all([runA.completion, runB.completion]);
     expect(a.embedError).toBeUndefined();
     expect(b.embedError).toBeUndefined();
-    expect(a.vectors).toBe("ready");
-    expect(b.vectors).toBe("ready");
     // Whichever build won, the table is complete and consistent.
     const [{ n }] = db.querySql(`SELECT COUNT(*) AS n FROM chunks`) as [{ n: unknown }];
     expect(Number(n)).toBe(a.chunks);
@@ -227,8 +250,9 @@ describe("review-confirmed regressions", () => {
   });
 
   it("sync embeds before deleting: an embed failure leaves the index intact", async () => {
-    const stats = await indexRepo({ root, db, indexDirPath: dir, embedder: float32Fake });
-    expect(stats.vectors).toBe("ready");
+    const platform = fakePlatform();
+    const stats = await indexRepo({ root, db, indexDirPath: dir, embedder: float32Fake, ...withAccount(platform) });
+    expect(readPlatformManifest(dir)!.vectors).toBe("ready");
     const [{ n: before }] = db.querySql(`SELECT COUNT(*) AS n FROM chunks`) as [{ n: unknown }];
 
     writeFileSync(join(root, "src", "mod0.js"), "export function replacement() { return 1; }\n");
@@ -238,9 +262,9 @@ describe("review-confirmed regressions", () => {
         throw new Error("endpoint down");
       },
     };
-    await expect(syncRepo({ root, db, indexDirPath: dir, embedder: failing })).rejects.toThrow("endpoint down");
+    await expect(syncRepo({ root, db, indexDirPath: dir, embedder: failing, ...withAccount(platform) })).rejects.toThrow("endpoint down");
 
-    // Nothing was deleted or appended; the old rows still serve hybrid search.
+    // Nothing was deleted or appended; the old rows still serve keyword search.
     const [{ n: after }] = db.querySql(`SELECT COUNT(*) AS n FROM chunks`) as [{ n: unknown }];
     expect(Number(after)).toBe(Number(before));
     const handle: IndexHandle = { root, dir, db, manifest: readManifest(dir)! };
@@ -249,13 +273,14 @@ describe("review-confirmed regressions", () => {
     expect(spillNames(dir)).toEqual([]);
 
     // A later sync with a healthy embedder heals the same changeset.
-    const outcome = (await syncRepo({ root, db, indexDirPath: dir, embedder: float32Fake })) as SyncResult;
+    const outcome = (await syncRepo({ root, db, indexDirPath: dir, embedder: float32Fake, ...withAccount(platform) })) as SyncResult;
     expect(outcome.action).toBe("synced");
     expect(outcome.filesChanged).toBe(1);
   });
 
   it("sync reports phases in the pre-streaming order with embed progress", async () => {
-    await indexRepo({ root, db, indexDirPath: dir, embedder: float32Fake });
+    const platform = fakePlatform();
+    await indexRepo({ root, db, indexDirPath: dir, embedder: float32Fake, ...withAccount(platform) });
     writeFileSync(join(root, "src", "mod1.js"), "export function phasedProbe() { return 2; }\n");
     const phases: string[] = [];
     let progressed = 0;
@@ -264,6 +289,7 @@ describe("review-confirmed regressions", () => {
       db,
       indexDirPath: dir,
       embedder: float32Fake,
+      ...withAccount(platform),
       onPhase: (p) => phases.push(p),
       onProgress: () => progressed++,
     });

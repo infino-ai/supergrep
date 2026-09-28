@@ -222,11 +222,16 @@ function includePatterns(opts: IndexCmdOptions): string[] {
 export async function indexCmd(path: string | undefined, opts: IndexCmdOptions): Promise<void> {
   const target = openForIndexing(path);
   const { root, dir, db, hosted } = target;
-  const embedder = opts.embed === false ? undefined : createEmbedder();
   // --no-embed means no vectors anywhere: with no local embedder, `local`
   // gives the platform table no embedding column either. Otherwise the
   // platform table's column is filled as --embed-provider says.
   const provider: EmbedProvider = opts.embed === false ? "local" : embedProvider();
+  // The local model exists only to feed `--embed-provider local`: the local
+  // index itself is always lexical (owner, 2026-09-09: "all vector search
+  // happens on the cloud"), so without an account, or with the platform's
+  // own model doing the embedding, no local embedder is ever built.
+  const wantsLocalEmbed = Boolean(hosted) && provider === "local" && opts.embed !== false;
+  const embedder = wantsLocalEmbed ? createEmbedder() : undefined;
   // The analyzer only when --analyzer named one: otherwise a build keeps the
   // table's own (the recorded one, or the default for a first load), and a
   // sync asks for nothing.
@@ -261,7 +266,7 @@ export async function indexCmd(path: string | undefined, opts: IndexCmdOptions):
 
   if (!opts.json) {
     console.log(`${bold("code-context")} - indexing ${root}`);
-    const embedding = opts.embed === false ? "off (--no-embed)" : embedderInfo();
+    const embedding = wantsLocalEmbed ? embedderInfo() : "none (local index is keyword-only)";
     console.log(dim(`index: ${dir} · embedder: ${embedding}`));
     if (hosted) {
       const platformEmbedding = opts.embed === false ? "off (--no-embed)" : platformEmbedderInfo();
@@ -289,7 +294,7 @@ export async function indexCmd(path: string | undefined, opts: IndexCmdOptions):
   const full = async (): Promise<void> => {
     // Full builds embed in a child process (bulk arenas leave with it);
     // sync keeps the in-process embedder for its small warm batches.
-    const buildEmb = opts.embed === false ? undefined : createIndexingEmbedder();
+    const buildEmb = wantsLocalEmbed ? createIndexingEmbedder() : undefined;
     const run = await indexRepoStaged({ ...baseOpts, embedder: buildEmb });
     if (!opts.json) {
       progressDone();
@@ -303,10 +308,14 @@ export async function indexCmd(path: string | undefined, opts: IndexCmdOptions):
       return;
     }
     progressDone();
-    if (final.vectors === "ready") {
-      console.log(green("✓") + ` semantic search ready - vectors built in ${fmtMs(final.embedMs ?? 0)}`);
+    // The local table never carries a vector column - only the platform's
+    // copy does - so there is nothing local to report ready here. `embedMs`
+    // and `embedError` describe --embed-provider local's vectors for that
+    // platform table, when it applies.
+    if (wantsLocalEmbed && final.embedMs !== undefined) {
+      console.log(green("✓") + ` vectors computed for the platform table in ${fmtMs(final.embedMs)}`);
     } else if (final.embedError) {
-      console.log(yellow(`! vector stage failed (${final.embedError}) - keyword search stays live; re-run \`cx index\` to retry`));
+      console.log(yellow(`! embedding for the platform table failed (${final.embedError}) - it will be keyword-only; re-run to retry`));
     }
     if (hosted) {
       if (final.hosted) {

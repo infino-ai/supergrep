@@ -7,7 +7,8 @@ import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseHostedUrl, DEFAULT_TIMEOUT_MS, DEFAULT_COLD_START_SECS, type HostedTarget } from "./hosted.js";
 import { isAnalyzer, type Analyzer } from "./analyzer.js";
-import { keyFilePath, readStoredKey } from "./keystore.js";
+import { keyFilePath, readStoredAccount, readStoredKey, type StoredAccount } from "./keystore.js";
+import { databaseNameFor } from "./account-api.js";
 
 /** Directory name of the on-disk index, created in the repo root: the local
  * catalog, the two manifests, the file state, the usage ledger and build
@@ -73,10 +74,23 @@ export interface SubagentSettings {
   k: number;
 }
 
+/** The account this machine is signed in to, when the platform target came
+ * from it rather than from `--db`: the base URL every repository's database
+ * hangs off, and the key. With this set, a repository other than the startup
+ * root gets its own database on the same account (RepoRegistry), named from
+ * its directory as `install` names it, so one server started anywhere
+ * serves every directory a session opens. */
+export interface AccountSettings {
+  baseUrl: string;
+  apiKey: string;
+}
+
 /** Everything the platform database is configured with, resolved and
  * validated once. */
 export interface HostedSettings {
   target: HostedTarget;
+  /** Set when the target was derived from the stored account (no `--db`). */
+  account?: AccountSettings;
   embedProvider: EmbedProvider;
   /** Per-request wall clock, in milliseconds. */
   timeoutMs: number;
@@ -136,6 +150,16 @@ function optionalPositiveIntFlag(flag: string, raw: string | undefined): number 
   return positiveIntFlag(flag, raw, 0);
 }
 
+/** What a command without `--db` may fall back on: the directory whose
+ * database the stored account would serve, and - for tests - where the account
+ * is read from. With no `accountRoot` there is no fallback, and no `--db` means
+ * no platform, as it always did. */
+export interface AccountFallback {
+  /** The repository the command runs for: its directory names its database. */
+  accountRoot?: string;
+  storedAccount?: () => StoredAccount | undefined;
+}
+
 /** Resolve the platform settings from the command line, or null when --db was
  * not given (no platform database: the local index alone).
  *
@@ -149,27 +173,52 @@ function optionalPositiveIntFlag(flag: string, raw: string | undefined): number 
  *
  * A database with no key from any of the three is refused here rather than
  * failing on the first request. Any other platform flag without --db is a
- * usage error rather than a silently ignored option. */
+ * usage error rather than a silently ignored option.
+ *
+ * Without `--db`, the stored account stands in when the caller names the
+ * repository it runs for (`fallback.accountRoot`) and the person at this
+ * machine has agreed to uploads (`uploadConsentAt`, recorded by `cx login`):
+ * the database is the one `cx install` would have registered for that
+ * directory, on the account's platform. This is what lets the Claude Code
+ * plugin - whose MCP entry names no database, because it is one entry for
+ * every project - serve the platform tools in any directory a session opens,
+ * with no file written anywhere. A stored account without that agreement is
+ * not used: the thing being consented to is file contents leaving the machine,
+ * and a `login` that only stored a key never asked. */
 export function hostedSettingsFromFlags(
   flags: HostedFlags,
   env: NodeJS.ProcessEnv = process.env,
   storedKey: () => string | undefined = readStoredKey,
+  fallback: AccountFallback = {},
 ): HostedSettings | null {
+  let baseUrl: string;
+  let database: string;
+  let apiKey: string;
+  let account: AccountSettings | undefined;
   if (flags.db === undefined || flags.db === "") {
-    const stray = HOSTED_ONLY_FLAGS.find(([key]) => flags[key] !== undefined);
-    if (stray) throw new Error(`${stray[1]} needs --db <url>: it configures the platform database`);
-    return null;
-  }
-  const { baseUrl, database } = parseHostedUrl(flags.db);
-  const apiKey =
-    flags.apiKeyFile !== undefined
-      ? readFileSync(flags.apiKeyFile, "utf8").trim()
-      : (env[API_KEY_ENV] ?? storedKey() ?? "");
-  if (apiKey.length === 0) {
-    throw new Error(
-      `--db needs a key, and this machine has none: run \`cx login --db ${baseUrl}\` to store one ` +
-        `(it goes in ${keyFilePath()}, mode 600), or pass --api-key-file <path>, or set ${API_KEY_ENV}`,
-    );
+    const stored = fallback.accountRoot !== undefined ? (fallback.storedAccount ?? readStoredAccount)() : undefined;
+    const key = stored?.uploadConsentAt !== undefined ? (env[API_KEY_ENV] ?? storedKey() ?? "") : "";
+    if (!stored || key.length === 0) {
+      const stray = HOSTED_ONLY_FLAGS.find(([key]) => flags[key] !== undefined);
+      if (stray) throw new Error(`${stray[1]} needs --db <url>: it configures the platform database`);
+      return null;
+    }
+    baseUrl = stored.baseUrl.replace(/\/+$/, "");
+    database = databaseNameFor(fallback.accountRoot!);
+    apiKey = key;
+    account = { baseUrl, apiKey };
+  } else {
+    ({ baseUrl, database } = parseHostedUrl(flags.db));
+    apiKey =
+      flags.apiKeyFile !== undefined
+        ? readFileSync(flags.apiKeyFile, "utf8").trim()
+        : (env[API_KEY_ENV] ?? storedKey() ?? "");
+    if (apiKey.length === 0) {
+      throw new Error(
+        `--db needs a key, and this machine has none: run \`cx login --db ${baseUrl}\` to store one ` +
+          `(it goes in ${keyFilePath()}, mode 600), or pass --api-key-file <path>, or set ${API_KEY_ENV}`,
+      );
+    }
   }
   const providerRaw = (flags.embedProvider ?? DEFAULT_HOSTED_EMBED_PROVIDER).toLowerCase();
   if (providerRaw !== "local" && providerRaw !== "platform") {
@@ -180,6 +229,7 @@ export function hostedSettingsFromFlags(
   }
   return {
     target: { baseUrl, database, apiKey },
+    ...(account ? { account } : {}),
     embedProvider: providerRaw,
     timeoutMs: positiveIntFlag("--db-timeout-ms", flags.dbTimeoutMs, DEFAULT_DB_TIMEOUT_MS),
     coldStartSecs: positiveIntFlag("--cold-start-secs", flags.coldStartSecs, DEFAULT_DB_COLD_START_SECS),
@@ -219,6 +269,19 @@ export function isHosted(): boolean {
  * target. */
 export function hostedTarget(): HostedTarget | null {
   return hosted?.target ?? null;
+}
+
+/** The account the platform target came from, or null when `--db` named the
+ * database (then there is one database, the named one) or no platform is
+ * configured. */
+export function hostedAccount(): AccountSettings | null {
+  return hosted?.account ?? null;
+}
+
+/** The platform target of the repository at `root` on the stored account:
+ * its own database, named from its directory. */
+export function accountTargetFor(account: AccountSettings, root: string): HostedTarget {
+  return { baseUrl: account.baseUrl, database: databaseNameFor(root), apiKey: account.apiKey };
 }
 
 /** Who fills the platform table's embedding column: the --embed-provider

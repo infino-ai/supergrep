@@ -5,9 +5,9 @@ crawl (glob, grep, then read whole files into the context window until it has
 enough to answer), or it can retrieve (ask a ranked index for the most
 relevant code and read only that). SuperGrep is the retrieval path, and it
 offers it two ways: `find`, `search` and `sql` for the agent to retrieve
-itself against a local index, and `ask` to hand the retrieval to a
-subagent entirely, over the same index's platform copy, so the exploration
-never enters the caller's own context at all.
+itself, and `ask` to hand the retrieval to small models on the Infino
+service, over the same index's platform copy, so the exploration never
+enters the caller's own context at all.
 
 ## Why crawling is expensive
 
@@ -29,14 +29,12 @@ files read one at a time.
   relevant chunks with their content and `path:line` ranges, so the agent
   answers and cites from the results and opens a file only for what the
   chunks do not show.
-- **Aggregation** ("which files have the most code about X", "tally the
-  codebase by language"): search composed with SQL `GROUP BY` computes the
-  answer in one engine pass, where file tools would have to read the whole
-  repo to tally it. That is a cost win, not a quality one: on a blind judge
-  this is the category the retrieval path loses hardest, because a total over
-  a ranked search is a fact about that query rather than about the
-  repository, and the judge marks the gap - see
-  [tradeoffs](../tradeoffs.md#the-quality-gap-is-real-and-it-is-not-close).
+- **Aggregation** ("which files have the most code about X", "every
+  occurrence of Y"): a search composed with SQL `GROUP BY`, or a
+  `token_match` over every row, computes the answer in one engine pass,
+  where file tools read the repository to tally it and grep stops at its
+  first matches. This is the kind of question SuperGrep wins on every
+  model; the README says where it does not.
 - **Finding by meaning**: the semantic half matches renamed symbols and
   paraphrases, so "where is auth handled" works without knowing the exact
   identifier.
@@ -59,16 +57,15 @@ error strings rank through the keyword half, paraphrases and renamed symbols
 through the semantic half. There is no separate lexical tool to choose
 between; one search covers both.
 
-## Local, in files, always fresh
+## One index in two places, always fresh
 
-The local index lives in plain files inside the repo (`.infino/`), built and
-queried in-process with a local embedding model - no accounts, no keys, no
-server. Keyword search is live seconds after indexing starts; vectors
-backfill in the background; and edits re-sync incrementally, so the index
-tracks the working tree without anyone asking. With `--db` the same chunks
-also load into a platform database, kept in sync the same way, where
-`ask` runs; that half needs a bearer key and is billed by the
-platform.
+The local index lives in plain files inside the directory (`.infino/`), and
+the same chunks load into a database on the platform, where the embeddings
+are computed. Keyword search is live seconds after indexing starts; vectors
+backfill in the background; and edits re-sync incrementally to both copies,
+so the index tracks the working tree without anyone asking. `find` and plain
+`sql` read the local copy and need no account; `search`, a ranked `sql` and
+`ask` run on the platform copy and are metered there.
 
-See the [README](../../README.md#the-numbers) for measured cost and quality
-on real agent runs, and [tradeoffs](../tradeoffs.md) for the honest limits.
+See the [README](../../README.md#what-it-saves) for measured cost and quality
+on real agent runs, and [tradeoffs](../tradeoffs.md) for the limits.
