@@ -58,7 +58,6 @@ import {
   indexDir,
   resolveRoot,
   TABLE,
-  TEXT_COLUMN,
   DEFAULT_TABLE,
   DEFAULT_CAPS,
   DEFAULT_SEARCH_K,
@@ -74,6 +73,9 @@ import {
   agentToolsEnabled,
   answerToolEnabled,
   apiToolsEnabled,
+  configuredCardTier,
+  configuredTextColumn,
+  LEAN_CARD_TIER,
   siblingNotes,
   siblingTables,
   subagentK,
@@ -82,7 +84,7 @@ import {
 } from "../core/config.js";
 import { keyFilePath, readStoredAccount } from "../core/keystore.js";
 import { createDatabase } from "../core/account-api.js";
-import { runRetrievalAgent } from "../core/retrieval-agent.js";
+import { completeTruncated, runRetrievalAgent } from "../core/retrieval-agent.js";
 import { answerDisplayMode, hookDeliveryText, relayDeliveryText, type AnswerDisplay } from "../core/answer-display.js";
 import { readManifest, readPlatformManifest, type Manifest } from "../core/manifest.js";
 
@@ -173,9 +175,12 @@ import {
   runSql,
   runSqlRows,
   embedsAQuery,
+  guardSql,
   jsonify,
+  normalizeQueryPlaceholders,
   numberRowLines,
   partialIndex,
+  withoutComments,
   CONTENT_COLUMN,
   FIND_RESULT_CHAR_BUDGET,
   MAX_FIND_CONTEXT,
@@ -196,7 +201,7 @@ import {
   formatReceipt,
   recordUsage,
 } from "../core/usage.js";
-import { ENGINE_ID_COLUMN, resolveTableShape, SNIPPET_CHARS, type TableShape } from "../core/table-shape.js";
+import { chunkingNote, ENGINE_ID_COLUMN, fetchCard, resolveTableShape, SNIPPET_CHARS, type TableShape } from "../core/table-shape.js";
 import { joinGate, joinRefusal, type PlatformJoin } from "../core/join-gate.js";
 import { topKAggregateRefusal } from "../core/topk-aggregate.js";
 import {
@@ -225,18 +230,32 @@ import { ensureIndexed, type EnsureResult } from "./ensure.js";
  * every aggregation statement in the bench that aggregated at all was a
  * directory guess measuring file lengths; and the scan clause naming every
  * predicate rather than ILIKE alone. */
-/** The card tier folded into the `sql` description on a platform database.
+/** The card tier folded into the `sql` description on a platform database:
+ * the enriched card by default (DEFAULT_CARD_TIER), the lean one where a
+ * table has no enriched card, and with it the sibling tables' meanings
+ * beside their columns (`siblingsNote`). CX_CARD_TIER=lean folds in the lean
+ * card alone.
  *
- * Lean, on a measurement (2026-09-11, 16 questions on the engine repo,
- * `hosted-index` lane, three arms differing by the prompt alone): the lean
- * card took 37% off the wall clock of the ten aggregation questions and the
- * enriched card 41%, while enriched cost +32% on the six comprehension
- * questions against lean's +14% and carried three times the prompt. A blind
- * grounded Opus judge scored both level against no card (7-7-1 and 7-7-2),
- * and cost moved ±3% either way: this is a latency change, not a spend or
- * quality one. So the cheap tier is nearly all of the win and half of the
- * harm. Move it only with a measurement that says otherwise. */
-const CARD_TIER = "lean";
+ * Measured on the demo, 2026-10-01: Sonnet as the caller on the Berka
+ * tables, the same questions with the text folding in either tier. The
+ * Infino arm answered 7 of 7 right on the enriched card against 31 of 36 on
+ * the lean one, at 30.9 s and $0.050 a question against 34.3 s and $0.061
+ * on the same host that hour. Three of the five lean misses were facts only
+ * the semantic layer states: how a client's birth number encodes their sex
+ * (two), and what loan statuses A to D mean (one). The longer text - Berka's
+ * from 5,952 to 16,388 characters - cost nothing measurable. The owner:
+ * "lean card for inner loop and enriched card for outer loop".
+ *
+ * The lean card had been the default since 2026-09-11, when 16 questions on
+ * the engine repo, with the whole card's JSON in the system prompt rather
+ * than folded into this text, put the enriched card at +32% wall clock on
+ * six comprehension questions against lean's +14%, level on quality and
+ * within 3% on cost. That was the other mechanism on a code corpus; the code
+ * corpora have not been measured on this one. */
+const CARD_TIER = configuredCardTier((line) => console.error(line));
+/** Whether the text carries the semantic layer: on the enriched tier only, so
+ * the lean text stays what it was measured as. */
+const WITH_SEMANTICS = CARD_TIER !== LEAN_CARD_TIER;
 
 /** Every tool here reads the index; none writes. Said out loud because a
  * caller that runs a message's tool calls concurrently only when each one is
@@ -303,6 +322,88 @@ const CARD_PREAMBLE =
   ` The table's own measured shape, computed from it - use it to choose columns and write the ` +
   `statement without discovering the shape first:\n`;
 
+/** Three rules the platform's retrieval loop writes its statements under
+ * (ask/src/ask/surface.rs, `retrieval_system_prompt`), given to the caller
+ * too, because both write statements over the same tables (the owner,
+ * 2026-09-30: "both inner and outer loops whenever you are changing the
+ * prompts"). The first two are the loop's words, word for word.
+ *
+ * A question about some of the rows is answered over those rows alone:
+ * "which centuries come up in village articles" was once answered by a
+ * count over every article. */
+export const KEEP_CONDITIONS_SENTENCE =
+  "Keep every condition the question names in the statement: a question about some of the rows (the village " +
+  "articles, one project's files) is answered over those rows alone, never over the whole table. ";
+/** "Related to" in a question is a join or a question of meaning (the owner,
+ * 2026-09-30), so the statement ranks by meaning. Said only where the table
+ * has a vector to rank by. */
+export const RELATED_TO_SENTENCE =
+  "A question asking what is related to something is a join or a question of meaning: include hybrid_search or " +
+  "vector_search in the statement or the search. ";
+/** A question asking how many is answered with the counts: asked which
+ * threats to species come up most, the Infino arm's answer had no numbers,
+ * where the index-only and Snowflake arms gave a count per threat
+ * (2026-09-30). The loop's sentence is about its statement; this one is
+ * about the caller's statement and its answer. */
+export const COUNTS_IN_THE_ANSWER =
+  "A question that asks how many (a count, a total, which have the most) is answered with the aggregated values " +
+  "themselves: a statement that returns each count beside the column naming its group, and an answer that states them.";
+/** The whole question in one statement (the owner, 2026-10-01: "put as
+ * much as it can into a single query"). Asked which news organisations the
+ * Wikipedia articles cite most and which subjects cite them, the Infino arm
+ * wrote seven statements - one regexp_match over every outlet, then one per
+ * outlet - with 32.7 s of tool time, and its counts were wrong. One
+ * statement, a UNION ALL of one token_match per outlet grouped by subject
+ * and ranked per outlet with ROW_NUMBER(), answered both parts in 0.28 s on
+ * the platform. Worded with no search function's name, since a table with no
+ * full-text column is told none. The loop's text carries the same sentence
+ * (ask/src/ask/surface.rs, `SQL_ONE_STATEMENT`). */
+export const ONE_STATEMENT_SENTENCE =
+  "Put as much of the question as you can into one statement: WITH, UNION ALL, joins, CASE, GROUP BY and window " +
+  "functions such as ROW_NUMBER() OVER (PARTITION BY ...) compose in one, so a question in several parts - several " +
+  "things each counted, the top rows of each group, a count beside the rows it counts - is one statement, never a " +
+  "query per part. ";
+/** Several terms counted in one statement, over a table that can match
+ * words: one token_match per term, so a row holding two counts for both. The
+ * run above grouped by regexp_match over a pattern of alternatives, which
+ * reads the first match alone (ROWS_REGEX_SENTENCE), and counted each article
+ * for the first outlet it named: 13,216 for the New York Times where one
+ * count per outlet gives 23,719. Run on the platform before it was written
+ * here. The loop's text carries the same (`SQL_SEVERAL_TERMS`). */
+export function severalTermsSentence(table: string, column: string): string {
+  return (
+    `Several terms counted at once are one token_match per term, side by side in a UNION ALL - SELECT 'a' AS term, ` +
+    `COUNT(*) AS n FROM token_match('${table}','${column}','a','and') UNION ALL SELECT 'b', COUNT(*) FROM ` +
+    `token_match('${table}','${column}','b','and') - so a row holding two of them counts for both. `
+  );
+}
+/** What an ask is: a targeted question, never the caller's own passed on
+ * (the owner, 2026-10-01: "its questions should be targeted and not just a
+ * repeat of its task question it needs to think clearly about what it wants
+ * the subagent to answer"). Measured on the demo the same day: asked for
+ * "articles about brexit by indian authors", Sonnet's ask was "articles
+ * about Brexit written by Indian authors or editors" - the question back -
+ * and the loop found no statement that answered it in four turns; the run
+ * before, its asks named what to fetch ("Find articles about Brexit ... For
+ * each article, return the url, name, editor name ... the top 20") and came
+ * back with rows. Said beside PREFER_SEVERAL_ASKS wherever that is said. */
+export const TARGETED_ASKS =
+  "Each ask is a targeted question, never your own question passed on: decide first what you need back to answer - " +
+  "which rows, which counts, which columns, over which part of the data - and ask for exactly that.";
+/** The regex functions of the platform's dialect, for a table of rows; the
+ * loop's dialect note (ask/src/ask/surface.rs, `SQL_DIALECT_NOTE`) carries
+ * the same sentence. Models write regexp_extract, which Snowflake, Spark and
+ * BigQuery have and DataFusion does not: it appeared in the demo's Wikipedia
+ * statements on every host since 2026-09-25, and on 2026-10-01 a caller lost
+ * a turn to "Invalid function 'regexp_extract'". regexp_match(...)[1] gives
+ * the same rows, NULL where nothing matches, and a table of rows shows the
+ * list regexp_match returns - each run on the platform before it was written
+ * here. The chunks table's text says the same for its own renderer. */
+export const ROWS_REGEX_SENTENCE =
+  "The dialect is Apache DataFusion, which has no regexp_extract: regexp_match(text, 'pattern')[1] is the first " +
+  "capture group of the first match alone (NULL where nothing matches), so a pattern of alternatives yields one of " +
+  "them per row and never counts several, regexp_like(text, 'pattern') tests and regexp_replace rewrites. ";
+
 /** A `card` TOOL was built and measured first and is deliberately not here.
  * Registered, offered and working, it was simply not called: asked a real
  * aggregation question the model went straight to `sql` (2026-09-11), which
@@ -338,22 +439,39 @@ export const SQL_DESCRIPTION =
   "a reason not to: it fuses exact terms with meaning, so it reaches the code whether or not " +
   "the question's words are the code's words, and they rarely are. That covers a concept, a " +
   "subsystem, 'code about X', 'files that do Y' - the shape of almost every ranking question. " +
+  RELATED_TO_SENTENCE +
+  KEEP_CONDITIONS_SENTENCE +
+  ONE_STATEMENT_SENTENCE +
   `bm25_search('${TABLE}','content','terms', k) is keyword only: reach for it when the topic ` +
   "is itself a literal string you know appears in the source and you want counts a reader can " +
   `check as occurrences. vector_search('${TABLE}','embedding', {{q}}, k) is meaning alone - for a ` +
   "question whose words will not be the code's words: SELECT path, start_line, content FROM " +
   `vector_search('${TABLE}','embedding', {{q}}, 20). token_match('${TABLE}','content','the terms','and') is ` +
-  "every row holding every term, unranked and complete - an identifier, an exact phrase, a count a reader " +
-  `can check: SELECT count(*) FROM token_match('${TABLE}','content','<the identifier>','and'). ` +
+  "every row holding every WORD given, unranked and complete - a count a reader can check: " +
+  `SELECT count(*) FROM token_match('${TABLE}','content','<the words>','and'). Its unit is the word: ` +
+  "in_bulk is the two words in and bulk, and 122 Django files hold both where 30 hold the identifier. " +
+  "An identifier, an error text, an exact phrase is find's, never token_match's. " +
+  severalTermsSentence(TABLE, CONTENT_COLUMN) +
   `exact_match('${TABLE}','content','value') is the rows whose whole value equals the string - a lookup on ` +
   "a short indexed column, never on content. " +
   "The {{name}} placeholders are filled server-side from the embed " +
-  "map, so they cost you nothing but the name. Which files have the most code about a topic, " +
-  "ranked - the whole question in one statement, filtered on the " +
-  "same pass, with your own words in place of the example's: SELECT path, SUM(end_line - start_line + 1) " +
+  "map, so they cost you nothing but the name. " +
+  // The whole question as one statement, each clause one job, in place of
+  // the ranking example that showed the aggregate alone (the owner,
+  // 2026-10-04, on a question that hid six jobs - count, group, join,
+  // filter, keyword search, semantic search: "should we break down this
+  // question like this as an example for the inner and outer models in our
+  // tool descriptions? ... do it"). Run on the platform before it was
+  // written here; the inner loop's sql text carries the same shape in its
+  // table's names (ask/src/ask/surface.rs `worked_example`).
+  "The whole question as one statement, each clause one job - filter, keyword and meaning search, " +
+  "group, count - with your own words in place of the example's: SELECT path, SUM(end_line - start_line + 1) " +
   `AS ranked_lines, COUNT(*) AS chunks FROM hybrid_search('${TABLE}','content','merge small superfiles','embedding', {{q}}, 300) WHERE ` +
-  "path LIKE 'src/%' GROUP BY path ORDER BY ranked_lines DESC LIMIT 15, with embed " +
-  '{"q":"how small superfiles are merged into larger ones"}. Where the topic is a literal ' +
+  "path LIKE 'src/%' AND lang = 'rs' GROUP BY path ORDER BY ranked_lines DESC LIMIT 15, with embed " +
+  '{"q":"how small superfiles are merged into larger ones"}: the terms are the keyword job and the {{q}} ' +
+  "text the meaning job, the WHERE the filter, the GROUP BY with its aggregates the which and the how many; " +
+  `a second table joins into the same statement (FROM ... AS ${TABLE} JOIN <other> ON <its keys>) where the ` +
+  "database has one - one call, not a search, then a filter, then a count. Where the topic is a literal " +
   "string you want counted as occurrences, the same shape over " +
   `bm25_search('${TABLE}','content','compaction', 300) instead - every row then holds the word, ` +
   "so a reader can check it. " +
@@ -482,6 +600,26 @@ export const PREFER_SEVERAL_ASKS =
   "Prefer several asks in one reply, one per part of the question, over one broad ask or a chain of " +
   "your own searches. Ask narrow: one named thing, one mechanism, one file's role per ask - a narrow " +
   "ask comes back in seconds with the lines, a broad one comes back thin and sends you looking yourself.";
+
+/** The tools' names as a client lists them, not as these instructions write
+ * them. The instructions and every tool text say "ask", "sql", "find" - the
+ * bare names - and Claude Code registers each tool as `mcp__code-context__<name>`;
+ * a model that copies the bare name is refused ("No such tool available:
+ * sql"), spends the turn, and calls again under the full name. Measured on
+ * the demo's Wikipedia runs, 2026-10-03: 4 of some 60 Infino arms in ninety
+ * minutes, up to three refusals in one run (the owner: "it should say
+ * infino:sql why is it just saying sql"). One sentence at the end of every
+ * variant of the instructions (`withListedNames`), since the instructions are
+ * fixed before the client has named itself. */
+export const CALL_BY_LISTED_NAME =
+  "Call each tool by the name your client lists for it - in Claude Code that is mcp__code-context__ask, " +
+  "mcp__code-context__sql, mcp__code-context__find and so on - never by the bare name written here, which " +
+  "the client refuses as no such tool.";
+
+/** The instructions with `CALL_BY_LISTED_NAME` as their last line. */
+export function withListedNames(instructions: string): string {
+  return `${instructions}\n${CALL_BY_LISTED_NAME}`;
+}
 
 /** The order among the tools a model holds beside this server's: the index
  * first. Claude Code's own prompt prefers dedicated file and search tools
@@ -673,6 +811,7 @@ export function logIndexInstructions(agentTools: boolean, files: number, chunks:
     "only where the thing you name sits - never the hit's whole line range, which spans the window. " +
     CITE_EXACTLY +
     CITE_FROM_HIT +
+    ` ${COUNTS_IN_THE_ANSWER}` +
     " A 'partial' marker means files over the index cap were left out, so a missing match is not proof of absence."
   );
 }
@@ -690,13 +829,83 @@ export function logIndexInstructions(agentTools: boolean, files: number, chunks:
  * because the softer "call join_keys first" was measured skipped. */
 export const JOIN_KEYS_RULE = "YOU MUST CALL join_keys BEFORE ANY sql CALL IF THE QUERY INVOLVES MORE THAN ONE TABLE.";
 
-export function siblingsNote(table: string, siblings: TableShape[], unresolved: string[], notes: string): string {
+/** Whether a statement over `primary` and its siblings can have a search in
+ * it: some table among them has a full-text column, or could not be
+ * described and may. `primary` is null for the chunks table, which always
+ * has one, and for a primary that could not be described, which may. Without
+ * any, the JOIN the sibling texts write is over the tables
+ * themselves - the Berka tables (2026-10-01), eight of numbers and codes
+ * hydrated with no full-text index, would have been shown a hybrid_search
+ * over a column none of them has. */
+export function siblingsSearchable(primary: TableShape | null, siblings: TableShape[], unresolved: string[]): boolean {
+  return !primary || primary.primaryText !== "" || unresolved.length > 0 || siblings.some((s) => s.primaryText !== "");
+}
+
+/** What a card says a table and its columns mean, in a line: the dataset's
+ * context from the semantic layer, then each column its card describes or
+ * decodes - its synonyms, its description, and what its codes stand for.
+ * Empty for a card that says none of these. Written for a sibling table,
+ * whose whole card would not fit beside the primary's: the measured
+ * statistics and sample rows stay with the primary. */
+export function cardMeanings(card: RowRecord | undefined): string {
+  if (!card) return "";
+  const source = card.data_source as { context?: unknown } | undefined;
+  const context = typeof source?.context === "string" ? source.context.trim() : "";
+  const columns = (Array.isArray(card.schema) ? card.schema : [])
+    .map((col: Record<string, unknown>) => {
+      const synonyms = Array.isArray(col.synonyms) ? col.synonyms.filter((s) => typeof s === "string") : [];
+      const description = typeof col.description === "string" ? col.description : "";
+      // A text column's sections and the markers that begin them, when the
+      // card has them: what a value is made of, which its description alone
+      // does not say.
+      const structure = typeof col.structure === "string" ? col.structure : "";
+      const values = col.values && typeof col.values === "object" ? Object.entries(col.values as Record<string, unknown>) : [];
+      const codes = values.map(([code, meaning]) => `${JSON.stringify(code)} = ${String(meaning)}`).join("; ");
+      // The JSON field the column was measured to hold, and the one named
+      // like it that it does not: what its name alone gets wrong - a
+      // `lastvisit` column that holds `metadata.auto.lastupdated`.
+      const equals = typeof col.equals_field === "string" ? col.equals_field : "";
+      const differs = typeof col.differs_from_field === "string" ? col.differs_from_field : "";
+      const said = [
+        description,
+        structure ? `structure: ${structure}` : "",
+        codes ? `codes: ${codes}` : "",
+        equals ? `equals_field: ${equals}` : "",
+        differs ? `differs_from_field: ${differs}` : "",
+      ]
+        .filter(Boolean)
+        .join(", ");
+      return said ? `${String(col.name)}${synonyms.length ? ` (${synonyms.join(", ")})` : ""}: ${said}` : "";
+    })
+    .filter(Boolean);
+  return [context, columns.length ? `Columns - ${columns.join("; ")}.` : ""].filter(Boolean).join(" ");
+}
+
+/** Whether a card carries the model-written semantic layer - the dataset's
+ * description, or a column's. The lean card a missing enriched one falls
+ * back to carries neither. */
+export function carriesSemantics(card: RowRecord | undefined): boolean {
+  if (!card) return false;
+  if (card.data_source && typeof card.data_source === "object") return true;
+  const schema = Array.isArray(card.schema) ? card.schema : [];
+  return schema.some((col: Record<string, unknown>) => typeof col?.description === "string" && col.description !== "");
+}
+
+export function siblingsNote(table: string, siblings: TableShape[], unresolved: string[], notes: string, searchable = true, semantics = false): string {
   const described = siblings.map(
     (s) =>
       `${s.table}(${columnList(s)})` +
       (s.textColumns.length ? `, full-text indexed on ${s.textColumns.join(", ")}` : "") +
       (s.vectorColumn ? `, vector column ${s.vectorColumn}` : ""),
   );
+  // With the semantic layer folded in, each sibling's meanings follow the
+  // list - the primary's ride in its card at the end of the text.
+  const meanings = semantics
+    ? siblings
+        .map((s) => [s.table, cardMeanings(s.card)] as const)
+        .filter(([, said]) => said !== "")
+        .map(([name, said]) => `${name}: ${said}`)
+    : [];
   const partner = siblings[0]?.table ?? table;
   return (
     // The rule first, in the owner's words (2026-09-24, after Opus was
@@ -706,20 +915,31 @@ export function siblingsNote(table: string, siblings: TableShape[], unresolved: 
     ` Also in this database, and joinable with ${table} in one statement: ${described.join("; ")}.` +
     (unresolved.length ? ` (${unresolved.join(", ")} could not be described when this server started; name them by their columns as you know them.)` : "") +
     ` Every statement here runs on the platform, so a JOIN, a subquery or a UNION across these tables is one call, ` +
-    `and the search functions take any of them as their first argument and their rows join like a table's: ` +
+    (searchable
+      ? `and the search functions take any of them as their first argument and their rows join like a table's: `
+      : `and none of these tables has a full-text column, so the JOIN is over the tables themselves: `) +
     // The join is the move, written out as a shape: a model that had the
     // tables still answered one table at a time and read the rest from
     // files (the owner, 2026-09-24: "i don't think opus or the models are
     // using joins. that's the key advantage we have we have to be explicit").
-    `write the JOIN - FROM hybrid_search('${partner}', '<text column>', '<terms>', 'embedding', {{q}}, 50) AS ${partner} ` +
+    `write the JOIN - FROM ${searchable ? `hybrid_search('${partner}', '<text column>', '<terms>', 'embedding', {{q}}, 50) AS ${partner}` : partner} ` +
     `JOIN ${table} ON <the predicate join_keys returned> WHERE ... - and not one query per table. ` +
-    `The keys are not written here: call join_keys with the tables first and paste its predicate into ON.` +
-    (notes ? ` ${notes}` : "")
+    // The semantic layer names the keys in its descriptions (the owner,
+    // 2026-10-01: "everything, keys included"), so with it folded in the
+    // text no longer says they are absent; the predicate is still
+    // join_keys's to return.
+    (semantics
+      ? "Call join_keys with the tables first and paste its predicate into ON."
+      : "The keys are not written here: call join_keys with the tables first and paste its predicate into ON.") +
+    (notes ? ` ${notes}` : "") +
+    (meanings.length ? ` What the other tables hold, from their cards: ${meanings.join(" ")}` : "")
   );
 }
 
-/** The routing line for a server with sibling tables. */
-export function siblingsInstruction(table: string, siblings: string[], agentTools: boolean): string {
+/** The routing line for a server with sibling tables. `searchable` is
+ * `siblingsSearchable`'s answer: without a full-text column among the
+ * tables, the JOIN has no search functions to hold. */
+export function siblingsInstruction(table: string, siblings: string[], agentTools: boolean, searchable = true): string {
   const names = siblings.join(", ");
   // Ask first across the tables: the loop sees their cards and writes the
   // joins itself, several statements at once; the model's own sql is for
@@ -727,14 +947,16 @@ export function siblingsInstruction(table: string, siblings: string[], agentTool
   // The keys are join_keys's to return, never written here or in the sql
   // text, so a statement across tables never guesses a key from a column
   // name and never reads one we typed.
+  // "Sees every one of them": it said "all three", the count of the corpus
+  // it was written on, and the Berka corpus has eight tables.
   return agentTools
-    ? `\n- ${JOIN_KEYS_RULE} A question that touches two of these tables - ${table}, ${names} - is an ask first: the loop sees all ` +
-        "three, writes the joins itself, several statements at once, and returns the rows. sql joins them too, " +
+    ? `\n- ${JOIN_KEYS_RULE} A question that touches two of these tables - ${table}, ${names} - is an ask first: the loop sees every ` +
+        "one of them, writes the joins itself, several statements at once, and returns the rows. sql joins them too, " +
         "for one statement you already know: call join_keys with the tables for the keys, then write the JOIN; " +
         "their columns and the statement's shape are in the sql tool's text. Never one query per table, never a " +
         "walk through files.\n"
     : `\n- ${JOIN_KEYS_RULE} sql also joins ${table} with ${names} in one statement - a question that touches two of these tables ` +
-        "is one JOIN, with the search functions inside it, not one query per table and not a walk through " +
+        `is one JOIN, ${searchable ? "with the search functions inside it, " : ""}not one query per table and not a walk through ` +
         "files: call join_keys with the tables for the keys, then write the JOIN; their columns and the " +
         "statement's shape are in the sql tool's text.\n";
 }
@@ -761,22 +983,90 @@ export function indexFirst(agentTools: boolean, table = "chunks"): string {
   );
 }
 
-/** How a hit names a row and where the rest of the row is: the sentence the
- * instructions and the search text share. */
-function citeRows(shape: TableShape): string {
+/** What an answer cites a row of a table by, by the owner's rule
+ * (2026-10-01: "either have those ids be links or not show them on non-code
+ * corpora"): a table with a link column (`linkColumn`) cites a row as a
+ * markdown link to it, the row's name as the text; a table without one cites
+ * no row by an id. Until then every rows text said "cite a row by its <key>",
+ * and on the Wikipedia table, keyed by the engine's `_id`, the answer printed
+ * 32-digit ids in parentheses as inline code, which name nothing a reader can
+ * open. The key stays the lookup - the whole of a row is one sql away by it
+ * (`citeRows`) - and is never the citation. A code table cites path:line and
+ * never reads this. */
+export function rowCitation(shape: TableShape): string {
+  const { keyColumn: key, linkColumn: link, titleColumn: title } = shape;
+  const ids = key === ENGINE_ID_COLUMN ? `its ${ENGINE_ID_COLUMN}` : `its ${key} or ${ENGINE_ID_COLUMN}`;
+  if (link) {
+    const text = title ? `its ${title} as the text - [<${title}>](<${link}>) -` : `words naming the row as the text - [<the row>](<${link}>) -`;
+    // A row held without its link - an aggregate's, or a statement's that
+    // selected other columns - is named, never linked: a link the rows did
+    // not carry is one the model made up from the row's name.
   return (
-    `Answer from the hits and cite a row by its ${shape.keyColumn}; the whole of a row is one sql away ` +
+      `Cite a row as a markdown link to its ${link}, with ${text} never by an id such as ${ids}. ` +
+      `A row that came without its ${link} is named by ${title ? `its ${title}` : "its own values"}, never given a link it did not carry.`
+    );
+  }
+  return `Cite no row by an id: ${ids} looks a row up and never goes in the answer as a reference - answer with the rows' own values.`;
+}
+
+/** The `projection` the platform's loop is asked for over a table of rows:
+ * the columns every search and find fact it returns carries in place of the
+ * table's own keys (the worker's ask route sets them as the keys). The
+ * table's key, so a fact can be looked up by it; and where the table has a
+ * link column, the link and the row's name, so a fact can be cited as its
+ * link (`rowCitation`). Without them the loop's search and find facts on the
+ * Wikipedia table came back as the engine's `_id`, the searched text and a
+ * score (2026-10-01): the caller was told to cite a row as its url and held
+ * none. The engine's `_id` is never named - it is no column of the table's,
+ * and the platform refuses a projection naming none of a table's columns -
+ * so a table with no key of its own and no link sends none, and the loop
+ * gives each fact the row id itself. */
+export function rowsProjection(shape: TableShape): string[] {
+  const { keyColumn: key, linkColumn: link, titleColumn: title } = shape;
+  const named = [key === ENGINE_ID_COLUMN ? null : key, link, link ? title : null];
+  return [...new Set(named.filter((name): name is string => name !== null))];
+}
+
+/** How an answer names a row and where the rest of the row is: the sentence
+ * the instructions and the search and ask texts share. `from` is what the
+ * caller holds - a search's hits, or the rows of a table that has none. */
+function citeRows(shape: TableShape, from = "hits"): string {
+  return (
+    `Answer from the ${from}. ${rowCitation(shape)} The whole of a row is one sql away ` +
     `(SELECT * FROM ${shape.table} WHERE ${shape.keyColumn} = '...').`
+  );
+}
+
+/** What stands in for find, search and the search functions on a table with
+ * no full-text column, said in the routing where they would have been named:
+ * neither door is offered there (the engine refuses a token match or a BM25
+ * search over a column with no index), and a statement filters, groups and
+ * joins the columns - or ranks by meaning alone, when the platform embeds
+ * one. The Berka tables (2026-10-01) are eight of numbers and codes,
+ * hydrated with no full-text index and no vector. */
+function noFullTextSentence(shape: TableShape): string {
+  const { table, vectorColumn } = shape;
+  return (
+    `No column of ${table} is full-text indexed, so there is no find or search over it` +
+    (vectorColumn
+      ? `; vector_search('${table}','${vectorColumn}', {{q:"..."}}, k) ranks its rows by meaning alone, and the rest is ` +
+        "filtering, grouping and joining its columns."
+      : " and no search function in a statement: filter, group and join its columns.")
   );
 }
 
 export function rowsInstructions(shape: TableShape, platformTools: boolean): string {
   const { table, keyColumn: key, primaryText: text } = shape;
+  const rowIs = shape.chunking ? `one row per passage of a record's ${shape.chunking.column}` : "one row per record";
   return (
-    `code-context is an index of the ${table} table, one row per record. Which tool for which question:\n` +
-    `- find - every row whose ${text} holds every word of an exact phrase, where you would grep: complete ` +
+    `code-context is an index of the ${table} table, ${rowIs}. Which tool for which question:\n` +
+    // A table with no full-text column is offered neither door (see
+    // `searchDoors` in serveMcp), so the routing names neither.
+    (text
+      ? `- find - every row whose ${text} holds every word of an exact phrase, where you would grep: complete ` +
     "and unranked, with the table-wide count.\n" +
-    `- search - which rows are about X: exact terms and meaning in one ranked pass over ${text}.\n` +
+        `- search - which rows are about X: exact terms and meaning in one ranked pass over ${text}.\n`
+      : "") +
     // On a table every question reads as counts and rankings, so the code
     // text's sql line ("counts, rankings, filters") claimed all of them and
     // the caller never delegated (zero ask on the first day's jobs runs,
@@ -785,22 +1075,28 @@ export function rowsInstructions(shape: TableShape, platformTools: boolean): str
     // about X ask for - are named on ask here, and sql is the tool for one
     // statement the caller already knows.
     "- sql - one statement you already know: a count, a filter, a lookup by " +
-    `${key}, a ranking in one SELECT. Ranking rows by how much they are about a topic goes through ` +
+    `${key}, a ranking in one SELECT. ` +
+    (text
+      ? "Ranking rows by how much they are about a topic goes through " +
     "hybrid_search, not bm25, when the topic is a concept; a total over a search relation counts the top " +
     `k, never the table - a complete count comes from token_match, a WHERE, or the ${table} table with no ` +
-    "search function.\n" +
+        "search function.\n"
+      : `${noFullTextSentence(shape)}\n`) +
     (platformTools
       ? "- ask - a question or task in plain language about the rows - which rows are about X, how many and " +
-        "where, who has the most and where - it runs the searches and statements itself and returns the rows " +
-        "it retrieved (facts as rows, with their columns and the text cut to snippets), not an answer: compose " +
-        `from them. ${PREFER_SEVERAL_ASKS}\n` +
+        `where, who has the most and where - it runs the ${text ? "searches and statements" : "statements"} itself and returns the rows ` +
+        `it retrieved (facts as rows, with their columns${text ? " and the text cut to snippets" : ""}), not an answer: compose ` +
+        `from them. ${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS}\n` +
         "  A question that spans the table - who is hiring for X and what those roles ask for, how two groups " +
         "of rows compare - is one ask per part: they run at the same time, and you compose from the rows " +
         "they return.\n"
       : "") +
     `${SWEEP_TO_A_TOOL}\n` +
-    `Hits are rows: a score, the row's ${key}, its scalar columns, and its text columns cut to a snippet of ` +
-    `${SNIPPET_CHARS} characters. ${citeRows(shape)} ` +
+    (text
+      ? `Hits are rows: a score, the row's ${key}, its scalar columns, and its text columns cut to a snippet of ` +
+        `${SNIPPET_CHARS} characters. ${citeRows(shape)}`
+      : `Rows come back with the columns their statement selected. ${citeRows(shape, "rows")}`) +
+    ` ${COUNTS_IN_THE_ANSWER} ` +
     "Every tool takes an optional 'path' (an absolute repo root) to target a repository instead, whose local " +
     "code index it then reads."
   );
@@ -866,55 +1162,83 @@ export function rowsSqlDescription(shape: TableShape): string {
         'the text inside {{q:"..."}} are yours to fill in, not literals to copy - unless you have a reason not ' +
         "to: it fuses exact terms with meaning, so it reaches the rows whether or not the question's words are " +
         "the rows' words, and they rarely are. That covers a concept, a subject, 'rows about X' - the shape of " +
-        "almost every ranking question. "
+        "almost every ranking question. " +
+        RELATED_TO_SENTENCE
       : "") +
     `bm25_search('${table}','${text}','terms', k) is keyword only: reach for it when the topic is a literal ` +
     `phrase you know appears in ${text} and you want counts a reader can check as occurrences. ` +
     (vectorColumn ? `vector_search('${table}','${vectorColumn}', {{q:"..."}}, k) is meaning alone. ` : "") +
     `token_match('${table}','${text}','terms','and') is unranked and complete: every row holding every term, ` +
     "with no k, so a COUNT over it is the table's count and not a share of the top k. " +
+    severalTermsSentence(table, text) +
     // One sentence, no more: on 2026-09-11 a caller wrote ILIKE '%...%' over
     // the jobs table's 6.7 GB description column three times at 38-45 s each,
     // where token_match on the same words runs in under a second. A longer
     // version of this warning made the caller write many small statements
-    // instead; the text around it is otherwise the measured wording.
+    // instead; the text around it is otherwise the measured wording. Its
+    // figure is the jobs table's, and it had stated it as every table's.
     `Match words on ${textColumns} with these functions, never with LIKE '%word%', which scans the stored text ` +
-    "(38-45 s per query on this table's description column against under a second through token_match). " +
+    "(38-45 s per query on the jobs table's description column against under a second through token_match). " +
     (vectorColumn
       ? 'The {{q:"..."}} placeholder is embedded on the platform with the table\'s own model, so it costs you ' +
         "nothing but the text (a bare {{q}} with the embed map is folded into it). "
       : "") +
     "Every search function returns _id, the table's scalar columns and score, so select and filter them " +
     `directly: SELECT ${key}, ${scalar}, score FROM ${ranked} WHERE ${scalar} = '...' ORDER BY score DESC ` +
-    `LIMIT 20. Which ${scalar} values have the most rows about a topic, ranked - the whole question in one ` +
-    `statement, with your own words in place of the example's: SELECT ${scalar}, COUNT(*) AS ranked_rows FROM ` +
-    `${ranked} GROUP BY ${scalar} ORDER BY ranked_rows DESC LIMIT 15. What such a total means: a search ` +
+    // The whole question as one statement, each clause one job, in the
+    // table's own names (the owner, 2026-10-04: "do it"; the code index's
+    // text and the inner loop's carry the same shape).
+    `LIMIT 20. The whole question as one statement, each clause one job - filter, ${vectorColumn ? "keyword and meaning search (the terms, then the {{q:\"...\"}} text)" : "keyword search"}, ` +
+    `group, count - with your own words in place of the example's: SELECT ${scalar}, COUNT(*) AS ranked_rows FROM ` +
+    `${ranked} AS ${table} WHERE ${table}.<another scalar column> = '...' GROUP BY ${scalar} ORDER BY ranked_rows DESC LIMIT 15; ` +
+    `a second table joins into the same statement (JOIN <other> ON <the predicate join_keys returned>) where the ` +
+    "database has one - one call, not a search, then a filter, then a count. What such a total means: a search " +
     "relation holds only the top k rows of that query, so a COUNT over it is the rows that ranked within the " +
     "top k - a share of the table about the topic - and never the table's count; report it as 'rows ranked " +
     "in the top 300 for <topic>', and expect values outside the top k, including common ones, to be missing " +
     "from it. A question with no topic in it - how many rows, the largest values, a count over the whole " +
     `table - comes from ${table} with no search function: SELECT ${scalar}, COUNT(*) AS rows FROM ${table} ` +
     `GROUP BY ${scalar} ORDER BY rows DESC LIMIT 15. `
+    : // With no full-text column the functions that need one - bm25_search,
+      // hybrid_search, token_match - are refused by the engine, so none is
+      // named; vector_search needs only the embedding, and is named alone
+      // where the platform embeds a column.
+      (vectorColumn
+        ? `No column here is full-text indexed, so of the search functions only vector_search('${table}',` +
+          `'${vectorColumn}', {{q:"..."}}, k) applies, ranking rows by meaning alone (the {{q:"..."}} text is ` +
+          "embedded on the platform with the table's own model); the rest is plain SQL over the columns above - "
     : "No column here is full-text indexed, so the search functions do not apply to this table: answer from " +
-      `plain SQL over the columns above - SELECT ${scalar}, COUNT(*) AS rows FROM ${table} GROUP BY ${scalar} ` +
-      "ORDER BY rows DESC LIMIT 15. ";
+          "plain SQL over the columns above - ") +
+      `SELECT ${scalar}, COUNT(*) AS rows FROM ${table} GROUP BY ${scalar} ORDER BY rows DESC LIMIT 15. `;
+  // The columns a row is selected with to be cited: its link and its name
+  // where the table has a link (`rowCitation`), else the key it is looked
+  // up by - which the answer never cites.
+  const { linkColumn: link, titleColumn: title } = shape;
   const textGuide = text
     ? `${textColumns} hold long text${/html/i.test(textColumns) ? " (HTML where the name says so)" : ""}: select ` +
-      `substr(${text}, 1, 300) rather than the column unless you mean to quote it, and select ${key} beside it ` +
-      "so a row can be cited. "
+      `substr(${text}, 1, 300) rather than the column unless you mean to quote it, and select ` +
+      (link ? `${link}${title ? ` and ${title}` : ""} beside it so a row can be cited as its link. ` : `${key} beside it so the row can be looked up. `)
     : "";
   return (
     `Read-only SQL, one SELECT or WITH, over ${table}(${columnList(shape)}) - for counts, rankings, filters ` +
     `and GROUP BY across the whole table. Full-text indexed: ${textColumns}` +
-    (shape.textColumnsInferred
+    // Said only of a list there is: with no LargeUtf8 column and no card,
+    // there is nothing to have inferred.
+    (shape.textColumnsInferred && shape.textColumns.length > 0
       ? " (inferred from the schema - the table has no card naming its indexes yet, so its long-text columns " +
         "are taken as the indexed ones; one the platform only embeds may be among them)"
       : "") +
     ". " +
+    chunkingNote(shape.chunking) +
+    KEEP_CONDITIONS_SENTENCE +
+    ONE_STATEMENT_SENTENCE +
     (vectorColumn
       ? `Vector column: ${vectorColumn}, the platform's embedding of ${vectorSource.join(", ") || text}. `
-      : "No vector column: rank by terms alone. ") +
+      : text
+      ? "No vector column: rank by terms alone. "
+      : "No vector column. ") +
     searchGuide +
+    ROWS_REGEX_SENTENCE +
     (shape.listColumns.length > 0
       ? `A list column (${shape.listColumns.join(", ")}) holds several values per row: filter it with ` +
         `array_has(${shape.listColumns[0]}, '...') or unnest it, not with equality. `
@@ -925,17 +1249,30 @@ export function rowsSqlDescription(shape: TableShape): string {
 }
 
 export function rowsAskDescription(shape: TableShape, devContextNote: string): string {
-  const { table, keyColumn: key } = shape;
+  const { table, keyColumn: key, primaryText: text } = shape;
+  // What a fact carries is what the loop selected, not the whole row: it
+  // said "the row's key, its scalar and list columns", and a search or find
+  // fact carries the columns the projection names (`rowsProjection`) and the
+  // text it matched - `_id` alone where the projection names none. The row
+  // is looked up by the first of those, the one every such fact holds.
+  const places = rowsProjection(shape);
+  const lookup = places[0] ?? key;
+  // A table with no full-text column has no searches to run, no text to cut
+  // and no find to hand a phrase to, so the text names none of them.
   return (
     `Ask the ${table} table's index a question or task in plain language: a read-only retrieval subagent ` +
-    "chooses and runs the searches and statements itself over the whole table and returns the rows it " +
+    `chooses and runs the ${text ? "searches and statements" : "statements"} itself over the whole table and returns the rows it ` +
     "found, never hits - " +
-    `each the row's ${key}, its scalar and list columns, and its text columns cut to a snippet of ` +
-    `${SNIPPET_CHARS} characters - plus aggregate rows (counts, rankings) and the SQL whose rows answer the ` +
+    (text
+      ? `each with the columns its statement selected, a search's or a find's with the row's ` +
+        `${(places.length > 0 ? places : [ENGINE_ID_COLUMN]).join(", ")} and the text it matched, cut to a snippet of ` +
+        `${SNIPPET_CHARS} characters`
+      : "each with the columns its statement selected") +
+    " - plus aggregate rows (counts, rankings) and the SQL whose rows answer the " +
     "question - never a summary. Use it for which rows are about X, how many and where, what the rows about X have in common. " +
-    `${PREFER_SEVERAL_ASKS} For every row holding ` +
-    `an exact phrase use find; for a row you already know, sql by its ${key}. Answer from the rows and cite ` +
-    `them by ${key}. ` +
+    `${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS} ` +
+    (text ? "For every row holding an exact phrase use find; for a row you already know, " : "For a row you already know, ") +
+    `sql by its ${lookup}. Answer from the rows. ${rowCitation(shape)} ` +
     devContextNote +
     "The result includes a 'usage' field, a one-line receipt of what the call cost."
   );
@@ -1464,7 +1801,8 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // Resolved through the default root's own client, with its normal
   // cold-start budget: for that table the answer decides the mode, so a
   // database still coming up is waited for here, at startup, the one place
-  // a wait costs no query. (The probe's two reads - schema and card - are
+  // a wait costs no query. (The probe's reads - schema, card, the load's
+  // record, and the search by meaning that checks a vector column - are
   // per-spawn overhead and go to no ledger: they are the price of knowing
   // what the tools are, not of any answer.) On a failure the table goes
   // `unresolved`, because the chunks text over a table of another shape
@@ -1494,7 +1832,25 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const siblingNames = hosted ? siblingTables() : [];
   if (hosted && TABLE !== DEFAULT_TABLE) {
     try {
-      const shape = await resolveTableShape(registry.get().hosted!, TABLE, CARD_TIER, noCard, TEXT_COLUMN);
+      // With the load's record: a table cut into passages says so in the
+      // tool text (`chunkingNote`), and a `vector` column the load embedded
+      // is a candidate for search by meaning (`vectorCandidate`), and is
+      // searched by meaning once the platform has embedded a query for it -
+      // the platform's check that the model it embeds with is the one that
+      // filled the column (`platformEmbedsQueriesFor`). That check is one
+      // attempt, with no cold-start retries: an embedding server that is
+      // starting takes longer than the handshake can wait (see above), and
+      // the column is then not offered for the session. The text column the
+      // deployment named (CX_TEXT_COLUMN) is the one the doors search. A
+      // column the shape passed over is said on stderr, so a search that
+      // runs by keyword alone on a table with vectors, or over a column
+      // other than the one named, is visible in the log.
+      const onNote = (line: string) => console.error(`${TABLE}: ${line}`);
+      const shape = await resolveTableShape(registry.get().hosted!, TABLE, CARD_TIER, noCard, true, {
+        textColumn: configuredTextColumn(),
+        onNote,
+        checkWith: hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0 }),
+      });
       card = shape.card;
       if (!shape.isChunks) mode = { kind: "rows", shape };
     } catch (err) {
@@ -1518,7 +1874,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     // server at all. No cold-start retries (`coldStartSecs: 0`), for the
     // reason above: one attempt, and the handshake goes ahead.
     try {
-      const record = await hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0 }).tableCard(TABLE, CARD_TIER);
+      const record = await fetchCard(hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0 }), TABLE, CARD_TIER, (line) => console.error(line));
       card = (record.card ?? record) as RowRecord;
     } catch (err) {
       noCard(err);
@@ -1529,7 +1885,8 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // may join with the primary. Each is described once here, best-effort as
   // the card is - one that cannot be described is named in the text as such
   // rather than dropped, since the join is still the model's to write. Each
-  // is asked for alone (see above).
+  // is asked for alone (see above), and a vector column of one is checked
+  // as the primary's is, through the same client with no cold-start wait.
   const siblings: TableShape[] = [];
   const siblingsUnresolved: string[] = [];
   if (siblingNames.length > 0) {
@@ -1584,13 +1941,6 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     };
   };
 
-  /** The `projection` the platform's loop is asked for in rows mode: the
-   * column that keys a row, so every fact can be cited by it; none when the
-   * table has no key of its own and the engine's id stands in, since that
-   * is no column of the table's and the platform refuses a projection
-   * naming none - omitted, it gives each fact the row id itself. */
-  const rowsProjection = (shape: TableShape): readonly string[] => (shape.keyColumn === ENGINE_ID_COLUMN ? [] : [shape.keyColumn]);
-
   /** A `sql` statement run on the platform, whichever table it is over: the
    * statement with its `{{name}}` placeholders folded into the platform's
    * own `{{q:"..."}}`, which it embeds with the table's model - no local
@@ -1619,7 +1969,8 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // the file's whole length in the row the model reads, and an ordered
       // result's rows carry their place in its order (core/facts.ts).
       const { rows: folded, verdict } = foldValidationFacts(placed, judged);
-      const rowsOut = rankRows(folded, query);
+      // Ordered by what the statement's code says, not its comments.
+      const rowsOut = rankRows(folded, withoutComments(query));
       let usage: string | undefined;
       if (receiptOn) {
         // The statement's own metered tokens, then the verdict's: two
@@ -1655,10 +2006,24 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   };
 
   const rows = mode.kind === "rows" ? mode.shape : null;
+  // Whether find and search are offered: always over the chunks table, and
+  // over a table of rows only when it has a full-text column. Over one with
+  // none the engine refuses every token match and BM25 search, and a tool
+  // that cannot run is a tool the model calls and a turn it loses (the Berka
+  // tables, 2026-10-01, hydrated with no full-text index and no vector). An
+  // unresolved table keeps both: their calls report the cause.
+  const searchDoors = !rows || rows.primaryText !== "";
+  // Whether a statement across the tables can hold a search at all.
+  const joinSearchable = siblingsSearchable(rows, siblings, siblingsUnresolved);
   // The sibling tables come second, right after what the statement runs
   // over, on the code text; the other texts take them at the end.
   // No key reaches the tool text: the model calls join_keys for them.
-  const siblingText = siblingNames.length > 0 ? siblingsNote(TABLE, siblings, siblingsUnresolved, siblingNotes()) : "";
+  // The semantic layer's wording only where a card that carries it was
+  // served: a table with no enriched card falls back to its lean one, and
+  // the lean text stays what it was measured as.
+  const semanticsServed = WITH_SEMANTICS && [card, ...siblings.map((s) => s.card)].some(carriesSemantics);
+  const siblingText =
+    siblingNames.length > 0 ? siblingsNote(TABLE, siblings, siblingsUnresolved, siblingNotes(), joinSearchable, semanticsServed) : "";
   let sqlDescription = rows
     ? rowsSqlDescription(rows) + siblingText
     : mode.kind === "unresolved"
@@ -1666,7 +2031,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     : SQL_DESCRIPTION_OPENING + (siblingText ? `${siblingText.trimStart()} ` : "") + SQL_DESCRIPTION.slice(SQL_DESCRIPTION_OPENING.length);
   if (platformTools && !apiTools) {
     sqlDescription += VALIDATION_NOTE;
-    if (card) sqlDescription += CARD_PREAMBLE + JSON.stringify(card);
+    // jsonify, not JSON.stringify: a card's statistics over a 64-bit column
+    // (a log table's nanosecond timestamps) are bigints, and a refusal here
+    // stops the server before it serves a single tool.
+    if (card) sqlDescription += CARD_PREAMBLE + jsonify(card);
   }
   if (apiTools) sqlDescription += API_TOOLS_SQL_NOTE;
 
@@ -1679,7 +2047,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const server = new McpServer(
     { name: "code-context", version: "0.1.2" },
     {
-      instructions: (rows
+      instructions: withListedNames((rows
         ? rowsInstructions(rows, agentTools)
         : mode.kind === "unresolved"
         ? unresolvedInstructions(TABLE, mode.cause, agentTools)
@@ -1710,7 +2078,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             // reply: a tool that had the platform write the answer in one long
             // call (`explore`) lost to this twice on the judged passes - see the
             // note on `retrieve` - and the routing the model reads is this list.
-            `- ask - a question or task in plain language, first for most questions; returns the rows it retrieved (facts with path:line and the code), not an answer: compose from them. It runs the searches and the statements itself, several at once, over every table in scope. ${PREFER_SEVERAL_ASKS} How many - files, projects, places - is an ask or one sql statement, never a walk through files; a question across projects or tables is ask's, several at once.\n` +
+            `- ask - a question or task in plain language, first for most questions; returns the rows it retrieved (facts with path:line and the code), not an answer: compose from them. It runs the searches and the statements itself, several at once, over every table in scope. ${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS} How many - files, projects, places - is an ask or one sql statement, never a walk through files; a question across projects or tables is ask's, several at once.\n` +
             // Several asks in one reply beat a loop that waits on itself for a
             // question that splits into independent parts (measured
             // 2026-09-12: one exploration took longer than four asks running
@@ -1762,6 +2130,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         "range, which spans the chunk. " +
         CITE_EXACTLY +
         CITE_FROM_HIT +
+        ` ${COUNTS_IN_THE_ANSWER}` +
         " Read files with read, every path in one call; Claude's own Read only for a hit marked truncated. " +
         "Every tool takes an optional 'path' (an absolute repo root) to target another repository. " +
         "A 'partial' marker means files over the index cap were left out, so a missing match is not " +
@@ -1772,14 +2141,18 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         // server is broken or go looking for a key.
         (platformTools ? "" : ` ${noAccountSteps()}.`)) +
         (apiTools ? apiToolsInstruction(Boolean(rows)) : "") +
-        (siblingNames.length > 0 ? siblingsInstruction(TABLE, siblingNames, agentTools) : ""),
+        (siblingNames.length > 0 ? siblingsInstruction(TABLE, siblingNames, agentTools, joinSearchable) : "")),
     },
   );
 
-  // Registered only with an account: local vectors don't exist any more (the
-  // owner's decision, 2026-09-09 - see wantsLocalEmbed above), so a local
-  // "search" would just be a thinner bm25_search under a misleading name.
-  // Without an account, reach for sql's bm25_search/token_match instead.
+  // find and search over a table with no full-text column are not offered
+  // at all (see searchDoors): the routing and the other tools' text name
+  // neither there.
+  if (searchDoors) {
+  // search is registered only with an account: local vectors don't exist any
+  // more (the owner's decision, 2026-09-09 - see wantsLocalEmbed above), so a
+  // local "search" would just be a thinner bm25_search under a misleading
+  // name. Without an account, reach for sql's bm25_search/token_match instead.
   if (platformTools) {
   server.registerTool(
     "search",
@@ -2113,6 +2486,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       }
     }),
   );
+  }
 
   server.registerTool(
     "sql",
@@ -2155,7 +2529,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           ),
       },
     },
-    async (args) => batched("sql", args, async ({ query, embed, question, path }) => {
+    async (args) => batched("sql", args, async ({ query: written, embed, question, path }) => {
       let ctx: RepoCtx;
       try {
         ctx = repoFor(path);
@@ -2163,12 +2537,34 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         return fail((err as Error).message);
       }
       const embeds = embed as Record<string, string> | undefined;
+      // A query placeholder spelled close to the platform's `{{q:"..."}}` is
+      // read as it, before anything else reads the statement: the checks
+      // below, the routing, the platform and the verdict all see the one
+      // statement that runs (core/searcher.ts). Only where a platform is
+      // behind the context: the platform's form is the platform's alone, so
+      // a statement for the local index stays as written, and the engine's
+      // error, if it fails, names what the caller wrote.
+      const query = ctx.hosted ? normalizeQueryPlaceholders(written) : written;
+      // What the checks on the statement's text read: the statement without
+      // its comments, since a table, a search call or an ORDER BY named in
+      // one would read to the join gate, the top-k check and the row
+      // ranking as if the statement wrote it. The statement itself runs
+      // with them - the engine reads its own comments.
+      const code = withoutComments(query);
+      // The read-only guard first, before any check reads the statement or
+      // the platform is asked anything about it; runSql and runSqlRows hold
+      // it again where the statement runs.
+      try {
+        guardSql(query);
+      } catch (err) {
+        return fail(`sql failed: ${(err as Error).message}`);
+      }
       // A GROUP BY over a ranked search's small top k ranks a share of those
       // rows, not the corpus; refused with the shapes that do, on every path
       // (core/topk-aggregate.ts). The one shape behind every ranking the
       // Infino arm lost on the 2026-09-24 panel, warned against in the text
       // above and written anyway by every caller family.
-      const topK = topKAggregateRefusal("sql", query);
+      const topK = topKAggregateRefusal("sql", code);
       if (topK) return fail(topK);
       // A statement across two or more of the hosted tables is held to the
       // keys the platform found on their values: one written without any of
@@ -2177,7 +2573,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // by name instead (2026-09-24); the owner: "either the model calls it
       // or we force a rewrite internally".
       if (ctx.hosted && siblingNames.length > 0) {
-        const verdict = await joinGate(query, [TABLE, ...siblingNames], keysAmong);
+        const verdict = await joinGate(code, [TABLE, ...siblingNames], keysAmong);
         if (verdict.kind === "refuse") return fail(joinRefusal("sql", verdict));
       }
       // Over the rows of a hosted table of another shape the statement runs
@@ -2238,7 +2634,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         // result carries each row's place in its order (core/facts.ts).
         const raw = await runSql(handle, getEmbedder(), query, embed as Record<string, string> | undefined);
         recordOf(ctx).addRows(TABLE, raw);
-        const rows = rankRows(raw.map(numberRowLines), query);
+        const rows = rankRows(raw.map(numberRowLines), code);
         const partial = partialIndex(handle.manifest);
         // The platform's own retrieval contract, applied to these rows before
         // they go back. The answering loop gates every query it runs on this
@@ -2364,8 +2760,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           "each other's values, and through which expression where they meet only through one - never by " +
           "matching column names. Each join comes back with its two sides, the share of the referencing side's " +
           "values found on the other, whether a statement counted it, and 'predicate', the ON clause ready to " +
-          `paste: alias a search's rows as the table (FROM hybrid_search('${TABLE}', ...) AS ${TABLE} JOIN other ON ` +
-          "<predicate>) and it reads as written. Call it before writing a statement across tables.",
+          // A table with no full-text column has no search to alias.
+          (searchDoors
+            ? `paste: alias a search's rows as the table (FROM hybrid_search('${TABLE}', ...) AS ${TABLE} JOIN other ON ` +
+              "<predicate>) and it reads as written. "
+            : `paste: FROM ${TABLE} JOIN other ON <predicate> reads as written. `) +
+          "Call it before writing a statement across tables.",
         inputSchema: {
           tables: z.array(z.string().min(1)).min(2).max(8).describe(`The tables the statement will span, ${TABLE} among them when it is one of them.`),
         },
@@ -2443,8 +2843,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       },
     );
 
-    // Citations are path:line over a code table; a rows table is cited by
-    // its key, and the pass has nothing to check there.
+    // Citations are path:line over a code table; a rows table's row is cited
+    // by its link or not at all (`rowCitation`), and the pass has nothing to
+    // check there.
     if (!rows) {
       server.registerTool(
         "cite",
@@ -2517,9 +2918,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
      * anything useful. Over a hosted table of another shape there is no
      * local index to build or sync - and a build would drop that table (see
      * ownsTable) - and no readiness to probe: the startup decision saw the
-     * table. The facts are then keyed by the table's own key column, not the
-     * chunks table's place columns (rowsProjection), and come back as rows of
-     * that shape, text cut to snippets as a search hit's is. */
+     * table. The facts are then placed by the columns `rowsProjection` names -
+     * the table's own key, and its link and name where it has a link - not
+     * the chunks table's place columns, and come back as rows of that shape,
+     * text cut to snippets as a search hit's is. */
     const loopContext = async (tool: string, path: string | undefined): Promise<{ ctx: RepoCtx; over: { shape: TableShape } | null } | { failed: ReturnType<typeof fail> }> => {
       let ctx: RepoCtx;
       try {
@@ -2564,7 +2966,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         // `under` names a subtree of a code index, and a row of a hosted
         // table of another shape sits in no directory - so it is left out
         // there, exactly as find leaves its own out.
-        const { result, spend } = await runRetrievalAgent(
+        const { result: returned, spend } = await runRetrievalAgent(
           ctx.hosted!,
           {
             question,
@@ -2581,6 +2983,11 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           },
           { maxTurns: subagentMaxTurns(), maxWallSecs: subagentMaxWallSecs(), k: subagentK() },
         );
+        // The first k of a statement that matched more are a sample, and an
+        // answer written from a sample is not an answer: the rest are read
+        // with the statement (`completeTruncated`), or the statement is
+        // handed over when there are too many to read.
+        const result = await completeTruncated(ctx.hosted!, returned, over?.shape);
         // On the record for `answer`: the places the hits name, and the
         // rows of a table of another shape by their key.
         const record = recordOf(ctx);
@@ -2638,7 +3045,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           "Use it for most questions, before your own sql or search: any question about the code or the data " +
           "that is not one statement you already know or one exact literal - where is Y handled, how does X " +
           "work, which files or projects do Z, what the rows about W say, what fails and why. " +
-          `${PREFER_SEVERAL_ASKS} ` +
+          `${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS} ` +
           "A single question over a large codebase splits the same way: one call per section with " +
           "`under` naming its subtree, all issued together. " +
           // The whole-mechanism question is ask's too, as several asks in one
@@ -2760,7 +3167,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // what a row is named.
   const platform = hosted
     ? `, ${TABLE} table also at ${hostedLabel(hosted)} (embedder there: ${platformEmbedderInfo()})` +
-      (rows ? `; find, search and sql run over its rows, keyed by ${rows.keyColumn}` : "") +
+      (rows ? `; ${searchDoors ? "find, search and sql run" : "sql runs (no full-text column: no find, no search)"} over its rows, keyed by ${rows.keyColumn}` : "") +
       (mode.kind === "unresolved" ? "; the table could not be described, so every tool call says so" : "")
     : "";
   console.error(

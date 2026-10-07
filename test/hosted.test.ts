@@ -85,6 +85,21 @@ describe("joinKeys", () => {
   });
 });
 
+describe("querySql", () => {
+  it("keeps an engine id exact: a 128-bit integer the platform writes in full comes back as a bigint", async () => {
+    // Written by hand, not through JSON.stringify: the point is the digits
+    // the platform sends, which no JS number holds.
+    const body = '[{"_id":33023604937666786634178324594870,"n":12,"start_line":7,"score":0.5,"big_float":3.3e31}]';
+    const { db } = client([{ status: 200, body, headers: { "content-type": "application/json" } }]);
+    const [row] = await db.querySql("SELECT _id, n FROM t");
+    expect(row._id).toBe(33023604937666786634178324594870n);
+    expect(row.n).toBe(12);
+    expect(row.start_line).toBe(7);
+    expect(row.score).toBe(0.5);
+    expect(row.big_float).toBe(3.3e31);
+  });
+});
+
 describe("tableCard", () => {
   it("asks for the card by table and tier, and nothing else", async () => {
     const { db, calls } = client([json({ card: { table: "logs" } }), json({ card: { table: "logs" } })]);

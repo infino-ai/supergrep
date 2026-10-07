@@ -36,7 +36,7 @@ process.env.CX_AUTO_INDEX = "0";
 delete process.env.CX_NO_RECEIPT;
 delete process.env.CX_INDEX_DIR;
 
-const { SQL_DESCRIPTION, PREFER_SEVERAL_ASKS, FIND_BY_BARE_NAME, indexFirst, findHint, isLogIndex, logIndexInstructions } = await import("../src/mcp/server.js");
+const { SQL_DESCRIPTION, PREFER_SEVERAL_ASKS, TARGETED_ASKS, FIND_BY_BARE_NAME, indexFirst, findHint, isLogIndex, logIndexInstructions } = await import("../src/mcp/server.js");
 const { API_KEY_ENV, MANIFEST_NAME, TABLE, DEFAULT_TABLE, configureHosted, hostedSettingsFromFlags } = await import("../src/core/config.js");
 
 /** One chunk as the hosted search returns it. */
@@ -114,11 +114,16 @@ async function expectChunksText(s: Started): Promise<void> {
   // the tool's own text; "spawn several in parallel" only said it was allowed.
   expect(instructions).toContain(PREFER_SEVERAL_ASKS);
   expect(byName.get("ask")).toContain(PREFER_SEVERAL_ASKS);
+  // Beside it, wherever it is said: an ask is a targeted question, never the
+  // caller's own passed on.
+  expect(instructions).toContain(`${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS}`);
+  expect(byName.get("ask")).toContain(`${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS}`);
   expect(instructions).not.toContain("Spawn several in parallel");
   // The index ranks ahead of the model's own file tools, and the sentence
   // names the four tools this server registers.
   expect(instructions).toContain(indexFirst(true));
   expect(instructions).toContain("find, search, sql and ask cover every file in one call");
+  expectListedNames(instructions);
 }
 
 /** The two sentences the hosted loop's answer writer is told, word for word,
@@ -131,6 +136,21 @@ function expectSharedSentences(instructions: string): void {
   expect(instructions).toContain(
     "Be efficient: prefer few, well-chosen tool calls, and hand a sweep across many files to a tool built for it rather than searching by hand.",
   );
+}
+
+/** The last line of the instructions the server sends: the tools' names as
+ * the client lists them. A model that copied the bare "sql" from these
+ * instructions was refused by Claude Code ("No such tool available: sql")
+ * and spent the turn (the demo, 2026-10-03). Checked on what the server
+ * sends, not on a variant's text alone, since the server adds the line. */
+function expectListedNames(instructions: string): void {
+  expect(
+    instructions
+      .trimEnd()
+      .endsWith(
+        "Call each tool by the name your client lists for it - in Claude Code that is mcp__code-context__ask, mcp__code-context__sql, mcp__code-context__find and so on - never by the bare name written here, which the client refuses as no such tool.",
+      ),
+  ).toBe(true);
 }
 
 describe("an index of logs is told apart and gets its instructions in log words", () => {
@@ -217,7 +237,10 @@ describe("the chunks table with the platform up, and answer switched on", () => 
 
   it("read the one card at startup and nothing else: the default table is not probed for its shape", () => {
     expect(TABLE).toBe(DEFAULT_TABLE);
-    expect(s.startup).toEqual(["table_card"]);
+    // The enriched card first (the default tier), then, since the platform
+    // has none, the lean one it falls back to - one card, two asks.
+    expect(s.startup).toEqual(["table_card", "table_card"]);
+    expect(s.sent.filter((x) => x.op === "table_card").slice(0, 2).map((x) => x.body?.tier)).toEqual(["enriched", "lean"]);
   });
 
   it("registered the chunks tool text, word for word", async () => {
@@ -319,7 +342,7 @@ describe("the chunks table with CX_AGENT_TOOLS=0: the lane that hides ask", () =
     // The database is still configured: the sql text's platform-side note
     // and the startup card read are about sql, not about the loop.
     expect(tools.find((t) => t.name === "sql")?.description).toContain("'validation'");
-    expect(s.startup).toEqual(["table_card"]);
+    expect(s.startup).toEqual(["table_card", "table_card"]);
   });
 });
 
@@ -500,7 +523,9 @@ describe("the chunks table with CX_SIBLING_TABLES: the tables a statement may jo
     expect(sql).not.toContain("Keys found on the tables' values");
     expect(sql).not.toContain("instance_id = swe_issues.instance_id");
     expect(sql).toContain("JOIN chunks ON <the predicate join_keys returned> WHERE ...");
-    expect(sql).toContain("call join_keys with the tables first and paste its predicate into ON");
+    // The siblings' cards here are lean, so the lean wording stands under
+    // the enriched default.
+    expect(sql).toContain("The keys are not written here: call join_keys with the tables first and paste its predicate into ON");
     // The rule, in the owner's words, heads the sibling text and the
     // routing line (2026-09-24: "it's not forceful enough").
     const rule = "YOU MUST CALL join_keys BEFORE ANY sql CALL IF THE QUERY INVOLVES MORE THAN ONE TABLE.";
@@ -566,6 +591,31 @@ describe("the chunks table with CX_SIBLING_TABLES: the tables a statement may jo
     const one = await call(s, "sql", { query: "SELECT count(*) FROM chunks_swelogs WHERE resolved = 'false'" });
     expect(one.ok, String(one.value)).toBe(true);
     expect(one.ops).not.toContain("join_keys");
+  });
+
+  it("runs a statement that opens with a comment as written, the gate reading it without its comments", async () => {
+    // Opening with a comment is no longer refused as not read-only (13 such
+    // refusals on the demo from 2026-09-30), and a table named in a comment
+    // is not one the statement spans. `chunks` with `chunks_swelogs` is a
+    // set of tables no earlier statement here asked the keys of, so a gate
+    // that read the comment would ask for them now.
+    const before = s.sent.length;
+    const statement = "-- then join chunks on the path\nSELECT count(*) FROM chunks_swelogs WHERE resolved = '--false' /* the failing runs */";
+    const r = await call(s, "sql", { query: statement });
+    expect(r.ok, String(r.value)).toBe(true);
+    expect(r.ops).not.toContain("join_keys");
+    expect(s.sent.slice(before).find((x) => x.op === "query_sql")?.body?.query).toBe(statement);
+  });
+
+  it("refuses a block comment that never closes before anything runs, saying how to close it", async () => {
+    // The nested opener in `src/*` leaves the comment open, so the WHERE
+    // after it would be read as the comment and the count would run over
+    // every row; the engine reads it the same way and refuses it.
+    const before = s.sent.length;
+    const r = await call(s, "sql", { query: "SELECT count(*) FROM chunks_swelogs /* the runs under src/* */ WHERE resolved = 'false'" });
+    expect(r.ok).toBe(false);
+    expect(String(r.value)).toContain("a /* comment in the statement never closes");
+    expect(s.sent.slice(before)).toEqual([]);
   });
 });
 
@@ -658,6 +708,18 @@ describe("the chunks table without CX_REMOTE_SEARCH: only a statement that embed
     expect(ops).toEqual(["list_tables", "query_sql", "validate"]);
     expect(s.sent.find((x) => x.op === "query_sql")?.body?.query).toBe(statement.replace("{{q}}", HOSTED_PLACEHOLDER));
     expect((value as { index: string }).index).toBe("platform");
+  });
+
+  it("so does one with the platform's own placeholder, or one spelled close to it, read as the platform's", async () => {
+    for (const written of [HOSTED_PLACEHOLDER, "{q: 'body'}"]) {
+      const statement = `SELECT path FROM hybrid_search('${TABLE}','content','body','embedding', ${written}, 30)`;
+      const before = s.sent.length;
+      const { ok, value, ops } = await call(s, "sql", { query: statement });
+      expect(ok, String(value)).toBe(true);
+      expect(ops, written).toContain("query_sql");
+      expect(s.sent.slice(before).find((x) => x.op === "query_sql")?.body?.query, written).toBe(statement.replace(written, HOSTED_PLACEHOLDER));
+      expect((value as { index: string }).index).toBe("platform");
+    }
   });
 
   it("a plain statement stays local, with no platform request", async () => {

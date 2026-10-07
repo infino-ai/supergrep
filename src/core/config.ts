@@ -403,6 +403,52 @@ export function siblingNotes(): string {
   return (process.env.CX_SIBLING_NOTES ?? "").trim();
 }
 
+/** The text column the doors search on a hosted table of rows
+ * (CX_TEXT_COLUMN, default unset): the column `search` ranks by keyword -
+ * beside the vector column, when the table has one - `find` matches in, and
+ * the sql text's examples name. Read only for a table of another shape
+ * (CX_TABLE naming a table this client did not build, with
+ * CX_REMOTE_SEARCH); the chunks table searches its `content`. It is the
+ * deployment's decision for a table with several full-text columns, kept
+ * beside the table's name: the demo names `sections` for the Wikipedia
+ * table, the passages the platform embeds, where the pick by column name
+ * took `abstract`, which is filled on an article's first passage alone, so
+ * a hybrid search paired keywords on abstracts with meaning on passages.
+ * Unset, or naming no full-text column of the table, and the column is
+ * picked as before (`tableShapeFrom`), the server saying on stderr why a
+ * name it was given was not taken. */
+export function configuredTextColumn(): string | undefined {
+  const name = (process.env.CX_TEXT_COLUMN ?? "").trim();
+  return name === "" ? undefined : name;
+}
+
+/** The card tiers the platform serves, the lean one first: the card every
+ * swept table has, and the one a missing richer card falls back to. */
+export const CARD_TIERS = ["lean", "enriched"] as const;
+export type CardTierName = (typeof CARD_TIERS)[number];
+export const LEAN_CARD_TIER: CardTierName = CARD_TIERS[0];
+/** The tier the outer model's `sql` text folds in when nothing says
+ * otherwise: the enriched card, or the lean one where a table has no
+ * enriched card yet (fetchCard). The owner, 2026-10-01, on the measurement
+ * at CARD_TIER in the MCP server: "lean card for inner loop and enriched
+ * card for outer loop". */
+export const DEFAULT_CARD_TIER: CardTierName = CARD_TIERS[1];
+
+/** The card tier the `sql` text folds in (CX_CARD_TIER, default enriched):
+ * the enriched card - the lean one plus the model-written semantic layer,
+ * the dataset's description and each column's meaning, synonyms and format
+ * - or the lean card alone: schema, statistics, samples and the decoded
+ * codes. A name that is not a tier folds in the default, and `onNote` hears
+ * why. */
+export function configuredCardTier(onNote?: (line: string) => void): CardTierName {
+  const name = (process.env.CX_CARD_TIER ?? "").trim();
+  if (name === "") return DEFAULT_CARD_TIER;
+  const tier = CARD_TIERS.find((t) => t === name);
+  if (tier) return tier;
+  onNote?.(`CX_CARD_TIER=${name} is not a card tier (${CARD_TIERS.join("|")}); folding in the ${DEFAULT_CARD_TIER} card`);
+  return DEFAULT_CARD_TIER;
+}
+
 /** The table this client builds when nothing overrides the name: the one
  * table a process owns. A process whose `CX_TABLE` names anything else is a
  * search-only process over a table something else loaded (see TABLE), and
@@ -427,13 +473,6 @@ export const DEFAULT_TABLE = "chunks";
  * MCP server never auto-builds or auto-syncs a table the override names, only
  * an explicit `cx index` does. */
 export const TABLE = process.env.CX_TABLE?.trim() || DEFAULT_TABLE;
-
-/** The column the doors search on the hosted table, when whoever configured
- * the table says so (CX_TEXT_COLUMN); unset, the column is chosen from the
- * table's shape (`tableShapeFrom`). Set beside CX_TABLE for a table with
- * several indexed text columns, so the choice is a decision on record and
- * not a guess from the columns' names. */
-export const TEXT_COLUMN = process.env.CX_TEXT_COLUMN?.trim() || undefined;
 
 /** Manifest file inside the index dir - the product's own record of what the
  * local index holds (the engine ignores foreign files in its catalog root). */
