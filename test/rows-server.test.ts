@@ -29,8 +29,8 @@
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { call, scriptPlatform, start, stop, type Started } from "./mcp-harness.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { call, scriptPlatform, start, stop, type Routes, type Started } from "./mcp-harness.js";
 
 /** The table the server is started for, in place of `chunks`. */
 const JOBS_TABLE = "chunks_jobs";
@@ -48,8 +48,9 @@ delete process.env.CX_INDEX_DIR;
 const { API_KEY_ENV, MANIFEST_NAME, configureHosted, hostedSettingsFromFlags } = await import("../src/core/config.js");
 const { SNIPPET_CHARS } = await import("../src/core/table-shape.js");
 
-/** The live table's schema, as `POST /v1/schema` returned it. */
-const JOBS_SCHEMA = [
+/** The live table's columns, as `POST /v1/schema` returned them, but the
+ * vector column. */
+const JOBS_COLUMNS = [
   { name: "id", nullable: true, type: "utf8" },
   { name: "source_slug", nullable: true, type: "utf8" },
   { name: "title", nullable: true, type: "large_utf8" },
@@ -65,7 +66,32 @@ const JOBS_SCHEMA = [
   { name: "salary_max", nullable: true, type: "f64" },
   { name: "salary_currency", nullable: true, type: "utf8" },
   { name: "salary_period", nullable: true, type: "utf8" },
-  { name: "emb", nullable: false, source: ["title"], type: "embedding" },
+];
+
+/** The width the jobs table's `emb` is embedded at. */
+const JOBS_DIM = 768;
+
+/** The jobs table's vector column the two ways the platform has described
+ * it, each with the record of the hydrate job that loaded the table (one row
+ * per posting, cut into nothing): as the build before the seam spelled it,
+ * `embedding` with its source, the spelling the record need not back; and as
+ * the platform spells it since, `vector` with its width (2026-10-01: every
+ * hydrated table's), whose record says the job embedded it. */
+const SPELLINGS = [
+  {
+    spelling: "embedding",
+    schema: [...JOBS_COLUMNS, { name: "emb", nullable: false, source: ["title"], type: "embedding" }],
+    load: { state: "succeeded", request: { table: JOBS_TABLE, source: { kind: "prefix", prefix: "_source/jobs/" } } },
+  },
+  {
+    spelling: "vector",
+    schema: [...JOBS_COLUMNS, { dim: JOBS_DIM, name: "emb", nullable: false, type: "vector" }],
+    load: {
+      state: "succeeded",
+      request: { table: JOBS_TABLE, source: { kind: "prefix", prefix: "_source/jobs/" } },
+      schema: { fts: [{ column: "description_html", analyzer: "standard" }], embed: { column: "emb", source: ["title"] } },
+    },
+  },
 ];
 
 /** One row as the platform returns it: nulls omitted, the text entity-escaped HTML. */
@@ -88,11 +114,17 @@ const LONG_HTML_ITEM = "&lt;li&gt;Own the platform&lt;/li&gt;";
 const LONG_HTML_ITEMS = 220;
 const LONG_HTML = `&lt;ul&gt;${LONG_HTML_ITEM.repeat(LONG_HTML_ITEMS)}&lt;/ul&gt;`;
 
-/** The platform's loop answering one question over the table: a fact keyed
- * by the row's id, as the projection asks, carrying the searched text whole
- * and a list cell beside it, as the platform's facts do. */
+/** The platform's loop answering one question over the table: a fact placed
+ * by the columns the projection names - the row's id, its link and its
+ * title - carrying the searched text whole and a list cell beside it, as the
+ * platform's facts do. */
 const ASKED = {
-  facts: [{ table: JOBS_TABLE, row: { id: ROW.id, title: ROW.title, description_html: LONG_HTML, locations: ROW.locations, score: 0.0164 } }],
+  facts: [
+    {
+      table: JOBS_TABLE,
+      row: { id: ROW.id, apply_url: ROW.apply_url, title: ROW.title, description_html: LONG_HTML, locations: ROW.locations, score: 0.0164 },
+    },
+  ],
   statement: `SELECT id, title FROM bm25_search('${JOBS_TABLE}','description_html','distributed', 10)`,
   coverage: { rows_total: 1, rows_returned: 1, truncated: false },
   terminate: "answered",
@@ -104,14 +136,25 @@ const ASKED = {
 /** The writes this file exists to catch: none of them may ever be sent. */
 const FORBIDDEN_OPS = ["drop_table", "create_table", "append", "delete", "update"];
 
-/** The platform with the table there and describable: it has no card yet,
- * and every read answers. */
-const describable = () =>
+/** The card asks at startup for a table the platform holds no card for: the
+ * enriched card, the default tier, then the lean one it falls back to. */
+const CARD_ASKS = ["table_card", "table_card"];
+
+/** The platform with the table there and describable, its schema and its
+ * load's record `spelling`'s: it has no card yet, and every read answers -
+ * the search by meaning that checks the vector column's model among them,
+ * as a deployment that embeds with the model that filled it answers it -
+ * but where `overrides` answer instead. */
+const describable = ({ schema, load }: (typeof SPELLINGS)[number], overrides: Routes = {}) =>
   scriptPlatform({
     list_tables: () => [200, ["chunks", JOBS_TABLE]],
-    schema: () => [200, JOBS_SCHEMA],
+    schema: () => [200, schema],
     table_card: () => [404, { error: `no lean card for table ${JOBS_TABLE}` }],
+    // The jobs table was loaded one row per posting: its load cut nothing.
+    hydrate: () => [200, load],
+    vector_search: () => [200, [{ _id: 1, score: 0.26 }]],
     hybrid_search: () => [200, [{ ...ROW, score: 0.0164 }]],
+    bm25_search: () => [200, [{ ...ROW, score: 2.5 }]],
     query_sql: (body) => {
       const query = String(body?.query);
       if (query.includes("token_match")) return [200, [{ __cx_total: 2, ...ROW }]];
@@ -124,6 +167,7 @@ const describable = () =>
     // A request that asks for the written answer gets one; the loop's facts
     // either way.
     sub_agent: (body) => [200, body?.answer ? { ...ASKED, answer: WRITTEN_ANSWER } : ASKED],
+    ...overrides,
   });
 
 /** The platform's written answer, as `answer` asks for it. */
@@ -156,17 +200,30 @@ afterAll(() => {
   configureHosted(null);
 });
 
-describe("a table of another shape, described at startup", () => {
+describe.each(SPELLINGS)("a table of another shape, described at startup, its vector spelled $spelling", (spelling) => {
   let s: Started;
   beforeAll(async () => {
-    s = await start(describable(), "cx-rows-");
+    s = await start(describable(spelling), "cx-rows-");
   });
   afterAll(async () => {
     await stop(s);
   });
 
-  it("read the shape once at startup - schema and one card - and never listed the tables", () => {
-    expect(s.startup).toEqual(["schema", "table_card"]);
+  it("read the shape once at startup - schema, one card, the load's record and one check of the vector column - and never listed the tables", () => {
+    expect(s.startup).toEqual(["schema", ...CARD_ASKS, "hydrate", "vector_search"]);
+    // The check is a search by meaning for one row against the column, which
+    // the platform runs only for an embedding column of the model it embeds
+    // queries with: text, no vector and no projection.
+    const check = s.sent.find((x) => x.op === "vector_search")?.body;
+    expect(check).toMatchObject({ table_name: JOBS_TABLE, field_name: "emb", k: 1 });
+    expect(typeof check?.query_text).toBe("string");
+    expect(Object.keys(check ?? {}).sort()).toEqual(["field_name", "k", "query_text", "table_name"]);
+  });
+
+  it("says nothing about passages for a table loaded one row per record", async () => {
+    const { tools } = await s.client.listTools();
+    expect(tools.find((t) => t.name === "sql")?.description).not.toContain("one passage of a record");
+    expect(s.client.getInstructions()).toContain(`an index of the ${JOBS_TABLE} table, one row per record.`);
   });
 
   it("names the table's columns and search functions in the tool text, and speaks of rows and the key", async () => {
@@ -178,7 +235,18 @@ describe("a table of another shape, described at startup", () => {
     expect(byName.get("sql")).toContain("Full-text indexed: title, description_html (inferred from the schema");
     // The verdict note still rides on it: the platform is there to give one.
     expect(byName.get("sql")).toContain("'validation'");
-    expect(byName.get("search")).toContain("cite a row by its id");
+    // A row is cited as a link to its own link column with its title as the
+    // text, never by an id (the owner, 2026-10-01: "either have those ids be
+    // links or not show them"); the key stays the lookup.
+    const cite =
+      "Cite a row as a markdown link to its apply_url, with its title as the text - [<title>](<apply_url>) - never by an id such as its id or _id. " +
+      "A row that came without its apply_url is named by its title, never given a link it did not carry.";
+    for (const text of [byName.get("search"), byName.get("ask"), s.client.getInstructions()]) {
+      expect(text).toContain(cite);
+      expect(text).not.toMatch(/cite (a row|them) by/);
+    }
+    expect(byName.get("search")).toContain(`one sql away (SELECT * FROM ${JOBS_TABLE} WHERE id = '...')`);
+    expect(byName.get("sql")).toContain("select apply_url and title beside it so a row can be cited as its link");
     expect(byName.get("find")).toContain(`Every row of ${JOBS_TABLE}`);
     expect(byName.get("ask")).toContain(`the ${JOBS_TABLE} table's index`);
     // The facts of ask are rows, cut to snippets, never hits.
@@ -250,6 +318,23 @@ describe("a table of another shape, described at startup", () => {
     expect(verdict).toMatchObject({ table_name: JOBS_TABLE, field_name: "description_html", question: "how many rust roles?" });
   });
 
+  it("sql reads a placeholder spelled close to the platform's as the platform's, in the statement it runs and the one the verdict reads", async () => {
+    // As Sonnet wrote it on the demo (2026-10-01): one brace, single quotes,
+    // and an embed map beside it naming nothing the statement references.
+    const before = s.sent.length;
+    const { ok, value, ops } = await call(s, "sql", {
+      query: `SELECT COUNT(*) AS n FROM hybrid_search('${JOBS_TABLE}','description_html','rust','emb', {q: 'rust engineering roles'}, 50)`,
+      embed: { q: "rust engineering roles" },
+      question: "how many rust roles?",
+    });
+    expect(ok, String(value)).toBe(true);
+    expect(ops).toEqual(["query_sql", "validate"]);
+    const runs = `SELECT COUNT(*) AS n FROM hybrid_search('${JOBS_TABLE}','description_html','rust','emb', {{q:"rust engineering roles"}}, 50)`;
+    const sent = s.sent.slice(before);
+    expect(sent.find((x) => x.op === "query_sql")?.body?.query).toBe(runs);
+    expect(sent.find((x) => x.op === "validate")?.body?.statement).toBe(runs);
+  });
+
   it("sql returns a row's multi-line text as the platform gave it: a table has no lines to number", async () => {
     // The chunks path numbers every multi-line cell from the smallest
     // start-named column; here that would read "2019: Build\n2020: fast things".
@@ -265,12 +350,14 @@ describe("a table of another shape, described at startup", () => {
     expect(ops).toEqual([]);
   });
 
-  it("ask hands the platform's loop the row key as the projection, probes nothing first, and returns its facts as rows with the text cut to snippets", async () => {
+  it("ask hands the platform's loop the row key, link and title as the projection, probes nothing first, and returns its facts as rows with the text cut to snippets", async () => {
     const { ok, value, ops } = await call(s, "ask", { question: "which distributed systems roles are there?" });
     expect(ok, String(value)).toBe(true);
     expect(ops).toEqual(["sub_agent"]);
     const request = s.sent.find((x) => x.op === "sub_agent")?.body;
-    expect(request?.projection).toEqual(["id"]);
+    // The link and the title ride beside the key, so every search and find
+    // fact the loop returns carries what the answer cites a row by.
+    expect(request?.projection).toEqual(["id", "apply_url", "title"]);
     expect(request?.question).toBe("which distributed systems roles are there?");
     const result = value as { sql?: string; hits: unknown[]; rows: Array<Record<string, unknown>>; turns: number };
     expect(result.sql).toBe(ASKED.statement);
@@ -282,8 +369,8 @@ describe("a table of another shape, described at startup", () => {
     expect(result.hits).toEqual([]);
     expect(result.rows).toHaveLength(1);
     const [row] = result.rows;
-    expect(Object.keys(row)).toEqual(["score", "id", "locations", "title", "description_html"]);
-    expect(row).toMatchObject({ score: 0.0164, id: ROW.id, title: ROW.title, locations: ["Paris, France"] });
+    expect(Object.keys(row)).toEqual(["score", "id", "apply_url", "locations", "title", "description_html"]);
+    expect(row).toMatchObject({ score: 0.0164, id: ROW.id, apply_url: ROW.apply_url, title: ROW.title, locations: ["Paris, France"] });
     const text = String(row.description_html);
     expect(text.length).toBe(SNIPPET_CHARS + "...".length);
     expect(text.startsWith("Own the platform Own the platform")).toBe(true);
@@ -332,6 +419,134 @@ describe("a table of another shape, described at startup", () => {
   });
 
   it("never reached the platform with a drop, create or append, and wrote no manifest", () => {
+    expectNothingBuilt(s);
+  });
+});
+
+// A `vector` column is spelled the same whoever filled it, and the client
+// cannot read the model it was filled with: without the load's word that the
+// platform embedded it, it is no candidate, the platform is not asked, and it
+// is not searched by meaning - the inner loop's rule for a column whose model
+// it cannot match.
+describe("a table whose vector column no load record says the platform embedded", () => {
+  let s: Started;
+  beforeAll(async () => {
+    // The `vector` spelling, its load's record without what the job settled
+    // on: a request and a state, and no word of an embedding.
+    const [, vector] = SPELLINGS;
+    const load = { state: vector.load.state, request: vector.load.request };
+    s = await start(describable({ ...vector, load }), "cx-rows-");
+  });
+  afterAll(async () => {
+    await stop(s);
+  });
+
+  it("runs search by keyword alone, and the sql text says there is no vector column", async () => {
+    // No candidate, so nothing to ask the platform to check.
+    expect(s.startup).toEqual(["schema", ...CARD_ASKS, "hydrate"]);
+    const { tools } = await s.client.listTools();
+    const sql = tools.find((t) => t.name === "sql")?.description ?? "";
+    expect(sql).toContain("No vector column: rank by terms alone.");
+    expect(sql).not.toContain("hybrid_search");
+    const { ok, value, ops } = await call(s, "search", { query: "distributed systems", k: 3 });
+    expect(ok, String(value)).toBe(true);
+    expect(ops).toEqual(["bm25_search"]);
+    expect((value as { ranking: string }).ranking).toBe("keyword");
+    expectNothingBuilt(s);
+  });
+});
+
+/** The platform's words for a column filled under another model than the
+ * one it embeds queries with (ask/src/worker/query_text.rs). */
+const MODEL_MISMATCH =
+  'column "emb" was embedded with model "nomic-embed-text-v1.5"; this deployment embeds with "another-embedder", so text cannot be queried against it';
+/** The platform's words for an embedding server it could not reach. */
+const EMBEDDER_DOWN = "embedding server unreachable; retry after the Retry-After seconds, once it is back";
+
+/** The checks that leave a candidate vector column unoffered: the platform
+ * refusing a column filled under another model - whichever way the schema
+ * spells it, and though the load's record says the platform embedded it -
+ * and an embedding server that is starting, which the check does not wait
+ * for. */
+const UNEMBEDDED = [
+  { case: "filled under another model, spelled vector", spelling: SPELLINGS[1], status: 400, error: MODEL_MISMATCH },
+  { case: "filled under another model, spelled embedding", spelling: SPELLINGS[0], status: 400, error: MODEL_MISMATCH },
+  { case: "its embedding server starting", spelling: SPELLINGS[1], status: 503, error: EMBEDDER_DOWN },
+];
+
+// The load's record says the platform embedded the column; it does not say
+// the platform still embeds queries with the model that filled it - the
+// embedder can change after a load, and a table can be loaded under a model
+// of its own. The platform is asked, the one place the column's model can be
+// read, and a column it did not embed a query for is not searched by
+// meaning: no {{q:"..."}} in the sql text, and search runs BM25.
+describe.each(UNEMBEDDED)("a vector column the platform did not embed a query for at startup, $case", ({ spelling, status, error }) => {
+  let s: Started;
+  const heard: string[] = [];
+  beforeAll(async () => {
+    const stderr = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      heard.push(args.map(String).join(" "));
+    });
+    try {
+      s = await start(describable(spelling, { vector_search: () => [status, { error }] }), "cx-rows-");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+  afterAll(async () => {
+    await stop(s);
+  });
+
+  it("asks once, retries nothing, and says why on stderr in the platform's words", () => {
+    expect(s.startup).toEqual(["schema", ...CARD_ASKS, "hydrate", "vector_search"]);
+    const said = `${JOBS_TABLE}: vector column emb is not searched by meaning: the platform did not embed a query for it (vector_search: server returned ${status}: ${error}`;
+    expect(heard.filter((line) => line.startsWith(said)), heard.join("\n")).toHaveLength(1);
+  });
+
+  it("runs search by keyword alone, and the sql text offers no search by meaning", async () => {
+    const { tools } = await s.client.listTools();
+    const sql = tools.find((t) => t.name === "sql")?.description ?? "";
+    expect(sql).toContain("No vector column: rank by terms alone.");
+    expect(sql).not.toContain("hybrid_search");
+    expect(sql).not.toContain('{{q:"..."}}');
+    expect(tools.find((t) => t.name === "search")?.description).toContain("ranked by exact keyword matching (BM25)");
+    const { ok, value, ops } = await call(s, "search", { query: "distributed systems", k: 3 });
+    expect(ok, String(value)).toBe(true);
+    expect(ops).toEqual(["bm25_search"]);
+    expect((value as { ranking: string }).ranking).toBe("keyword");
+    expectNothingBuilt(s);
+  });
+});
+
+// CX_TEXT_COLUMN names the column the doors search, read once at startup:
+// the jobs table's pick by name is description_html, and a deployment that
+// names title gets title in every door and in the sql text's examples.
+describe("a table whose deployment names the text column to search", () => {
+  let s: Started;
+  beforeAll(async () => {
+    process.env.CX_TEXT_COLUMN = "title";
+    try {
+      s = await start(describable(SPELLINGS[1]), "cx-rows-");
+    } finally {
+      delete process.env.CX_TEXT_COLUMN;
+    }
+  });
+  afterAll(async () => {
+    await stop(s);
+  });
+
+  it("searches, finds and writes its examples over the named column, the vector beside it", async () => {
+    const { tools } = await s.client.listTools();
+    const sql = tools.find((t) => t.name === "sql")?.description ?? "";
+    expect(sql).toContain(`hybrid_search('${JOBS_TABLE}','title','terms','emb', {{q:"..."}}, k)`);
+    expect(sql).not.toContain(`'${JOBS_TABLE}','description_html'`);
+    const searched = await call(s, "search", { query: "distributed systems", k: 3 });
+    expect(searched.ok, String(searched.value)).toBe(true);
+    expect(searched.ops).toEqual(["hybrid_search"]);
+    expect(s.sent.find((x) => x.op === "hybrid_search")?.body).toMatchObject({ text_field: "title", vector_field: "emb" });
+    const found = await call(s, "find", { query: "engineer" });
+    expect(found.ok, String(found.value)).toBe(true);
+    expect((found.value as { column: string }).column).toBe("title");
     expectNothingBuilt(s);
   });
 });
@@ -392,7 +607,7 @@ describe("the same table without CX_REMOTE_SEARCH: local doors, no index, auto-i
   it("refuses to build by ownership - CX_TABLE names a table this process does not own - whatever CX_AUTO_INDEX says", async () => {
     // Only the card was asked for at startup, as it always was without
     // CX_REMOTE_SEARCH; the chunks text stands because the doors ARE local.
-    expect(s.startup).toEqual(["table_card"]);
+    expect(s.startup).toEqual(CARD_ASKS);
     for (const [name, args] of [
       ["find", { query: "rust" }],
       ["search", { query: "rust" }],

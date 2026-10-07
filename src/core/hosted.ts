@@ -87,9 +87,11 @@ const JSON_CONTENT_TYPE = "application/json";
 const ARROW_STREAM_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
 
 /** The metering headers the platform returns on every response: decimal
- * tokens (`"0.050"`), one for reads and one for writes. */
+ * tokens (`"0.050"`), one for reads and one for writes, and the response's
+ * bytes as its egress meter recorded them (an integer). */
 const READ_TOKENS_HEADER = "x-infino-read-tokens";
 const WRITE_TOKENS_HEADER = "x-infino-write-tokens";
+const RESULT_BYTES_HEADER = "x-infino-result-bytes";
 
 /** The hosts a plaintext `http://` target may name: the request never leaves
  * the machine, so the bearer credential is never on the wire in the clear. */
@@ -138,8 +140,9 @@ export interface HostedTarget {
 }
 
 /** What one logical call cost: the final status, the round trip of the
- * attempt that answered, how many retries the cold-start loop took, and the
- * tokens the platform billed (from its response headers, when present). */
+ * attempt that answered, how many retries the cold-start loop took, the
+ * tokens the platform billed and the bytes its egress meter recorded for the
+ * response (all from its response headers, when present). */
 export interface HostedCallInfo {
   op: string;
   status: number;
@@ -147,6 +150,7 @@ export interface HostedCallInfo {
   retries: number;
   readTokens?: number;
   writeTokens?: number;
+  resultBytes?: number;
 }
 
 export interface HostedOptions {
@@ -318,6 +322,26 @@ interface CallSpec {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** An integer the platform wrote in full. */
+const WHOLE_DIGITS = /^-?\d+$/;
+
+/** The JSON reviver that keeps a large integer exact. The engine's `_id` is
+ * a 128-bit integer, and the platform writes it as a JSON number with every
+ * digit (`33023604937666786634178324594870`); JSON.parse alone rounds any
+ * integer past 2^53 to the nearest double, and a row's id came back as
+ * 3.3023604937666788e+31 - a number no statement can name the row by
+ * (measured 2026-10-03: the graph expansion's seed lookups found ids and
+ * lost every one). With the source text of the number (Node 21+), an
+ * integer past the safe range becomes a bigint; everything else, and a
+ * number written with a point or an exponent, parses as before. */
+function keepBigIntegers(_key: string, value: unknown, context?: { source?: string }): unknown {
+  if (typeof value === "number" && Number.isInteger(value) && !Number.isSafeInteger(value)) {
+    const source = context?.source;
+    if (typeof source === "string" && WHOLE_DIGITS.test(source)) return BigInt(source);
+  }
+  return value;
+}
+
 export class HostedDb {
   readonly target: HostedTarget;
   private readonly fetchImpl: typeof fetch;
@@ -432,7 +456,7 @@ export class HostedDb {
     const exchange = await this.call({
       op: "cite",
       method: "POST",
-      body: JSON.stringify(body),
+      body: jsonify(body),
       contentType: JSON_CONTENT_TYPE,
       acceptJson: true,
       timeoutMs: this.timeoutMs,
@@ -452,7 +476,7 @@ export class HostedDb {
     const exchange = await this.call({
       op: "join_keys",
       method: "POST",
-      body: JSON.stringify({ tables }),
+      body: jsonify({ tables }),
       contentType: JSON_CONTENT_TYPE,
       acceptJson: true,
       timeoutMs: this.timeoutMs,
@@ -480,6 +504,21 @@ export class HostedDb {
     return this.parseJson(exchange, "table_card") as RowRecord;
   }
 
+  /** `GET /v1/hydrate/{db}?table=`: the record of the hydrate job that loaded
+   * the table - its request (the columns it indexed and embedded, and how it
+   * cut a long text column into passages), state and progress. A 404 for a
+   * table no hydrate job loaded. */
+  async hydrateJob(table: string): Promise<RowRecord> {
+    const exchange = await this.call({
+      op: "hydrate",
+      method: "GET",
+      query: { table },
+      acceptJson: true,
+      timeoutMs: this.timeoutMs,
+    });
+    return this.parseJson(exchange, "hydrate") as RowRecord;
+  }
+
   // --- writes ---
 
   /** `POST /v1/append/{db}?table=T` with an Arrow IPC stream body - the only
@@ -504,7 +543,7 @@ export class HostedDb {
       op: "append",
       method: "POST",
       query: { table },
-      body: JSON.stringify({ data: rows }),
+      body: jsonify({ data: rows }),
       contentType: JSON_CONTENT_TYPE,
       acceptJson: true,
       timeoutMs: this.timeoutMs,
@@ -574,6 +613,19 @@ export class HostedDb {
         true,
       ),
       "hybrid_search",
+    );
+  }
+
+  /** `POST /v1/vector_search/{db}` with `query_text`: the `k` rows nearest
+   * `text` by `field`, the text embedded on the platform. The platform
+   * embeds it only for an embedding column of the model it embeds queries
+   * with, and refuses any other column with a 400 saying why - for a column
+   * filled under another model, both models named. No projection is sent,
+   * so each row comes back as the engine's `_id` and `score`. */
+  async vectorSearchText(table: string, field: string, text: string, k: number): Promise<RowRecord[]> {
+    return this.rows(
+      await this.postJson("vector_search", { table_name: table, field_name: field, query_text: text, k }, true),
+      "vector_search",
     );
   }
 
@@ -660,7 +712,7 @@ export class HostedDb {
     const exchange = await this.call({
       op: "sub_agent",
       method: "POST",
-      body: JSON.stringify(body),
+      body: jsonify(body),
       contentType: JSON_CONTENT_TYPE,
       acceptJson: true,
       timeoutMs,
@@ -670,11 +722,14 @@ export class HostedDb {
 
   // --- plumbing ---
 
+  /** A JSON request body. Through jsonify, as every body here: a value the
+   * caller took from a platform answer may carry a bigint
+   * (`keepBigIntegers`), which JSON.stringify refuses and Number() rounds. */
   private postJson(op: string, body: RowRecord, acceptJson: boolean): Promise<Exchange> {
     return this.call({
       op,
       method: "POST",
-      body: JSON.stringify(body),
+      body: jsonify(body),
       contentType: JSON_CONTENT_TYPE,
       acceptJson,
       timeoutMs: this.timeoutMs,
@@ -696,7 +751,7 @@ export class HostedDb {
   private parseJson(exchange: Exchange, op: string): unknown {
     if (exchange.text.trim().length === 0) return null;
     try {
-      return JSON.parse(exchange.text);
+      return JSON.parse(exchange.text, keepBigIntegers as (this: unknown, key: string, value: unknown) => unknown);
     } catch (err) {
       throw new HostedError(op, exchange.status, `response is not JSON: ${(err as Error).message}`);
     }
@@ -756,8 +811,10 @@ export class HostedDb {
       const info: HostedCallInfo = { op: spec.op, status: response.status, rttMs, retries };
       const readTokens = tokensHeader(response.headers, READ_TOKENS_HEADER);
       const writeTokens = tokensHeader(response.headers, WRITE_TOKENS_HEADER);
+      const resultBytes = tokensHeader(response.headers, RESULT_BYTES_HEADER);
       if (readTokens !== undefined) info.readTokens = readTokens;
       if (writeTokens !== undefined) info.writeTokens = writeTokens;
+      if (resultBytes !== undefined) info.resultBytes = resultBytes;
 
       if (response.ok) {
         this.record(info);

@@ -10,11 +10,14 @@ import { describe, expect, it } from "vitest";
 import {
   runRetrievalAgent,
   retrievalAgentRunFrom,
+  completeTruncated,
   factRowsOf,
   factsFrom,
+  COMPLETE_ROWS_CAP,
   MAX_HITS,
   MAX_ROWS,
   HIT_CONTENT_CHARS,
+  REST_CONTENT_CHARS,
   TERMINATE_ANSWERED,
   TERMINATE_ESCALATED,
   type RetrievalAgentResult,
@@ -406,6 +409,31 @@ describe("the caller's context and the facts-only contract", () => {
     expect("context" in sent[1]).toBe(false);
   });
 
+  it("tells the loop what a row is when the table was cut into passages, after the caller's own context", async () => {
+    // The loop reads tables, not how they were loaded: the note the caller's
+    // sql text carries reaches the inner loop only in the ask's context.
+    const sent: Array<Record<string, unknown>> = [];
+    const hosted = {
+      subAgent: async (req: unknown) => {
+        sent.push(req as Record<string, unknown>);
+        return answered({ facts: [] });
+      },
+    };
+    const fields = [
+      { name: "name", type: "large_utf8" },
+      { name: "sections", type: "large_utf8" },
+      { name: "chunk", type: "i32" },
+    ];
+    const cut = tableShapeFrom("chunks_wikipedia_v5", fields, null, { request: { chunk: { column: "sections", max_tokens: 512 } } });
+    await runRetrievalAgent(hosted, { question: "how many village articles?", shape: cut }, { maxWallSecs: 90 });
+    await runRetrievalAgent(hosted, { question: "q", context: "Joins: ...", shape: cut }, { maxWallSecs: 90 });
+    await runRetrievalAgent(hosted, { question: "q", shape: tableShapeFrom("t", fields) }, { maxWallSecs: 90 });
+    expect(sent[0].context).toMatch(/^Each row is one passage of a record, not the record: .*a record is counted once with chunk = 0/);
+    expect(sent[1].context).toMatch(/^Joins: \.\.\.\n\nEach row is one passage of a record/);
+    // A table loaded one row per record: no note, and no context at all.
+    expect(sent[2]).not.toHaveProperty("context");
+  });
+
   it("keeps a stray chain out of the result; the platform's answer is the one text that passes, as `answer`", () => {
     const { result } = retrievalAgentRunFrom(QUESTION, answered({ answer: "the platform's written answer", chain: ["x"] }));
     expect(result).not.toHaveProperty("chain");
@@ -626,5 +654,106 @@ describe("a question scoped to a subtree", () => {
       expect(hosted.sent[0]).not.toHaveProperty("context");
       expect(result).not.toHaveProperty("under");
     }
+  });
+});
+
+// --- completeTruncated ------------------------------------------------------------------------
+// The platform returns the first k of a statement's rows; a result written
+// from a sample is not an answer (the owner, 2026-10-04: "unacceptable to
+// simply take the top 10 results and say 'hey i found a couple of things'").
+
+describe("completeTruncated", () => {
+  /** A platform whose query_sql answers `rows` and records what it was asked. */
+  const platform = (rows: Record<string, unknown>[] | Error) => {
+    const asked: string[] = [];
+    return {
+      asked,
+      querySql: async (sql: string) => {
+        asked.push(sql);
+        if (rows instanceof Error) throw rows;
+        return rows;
+      },
+    };
+  };
+  /** A result of the first `k` of `total` hits, as the platform returns it. */
+  const cutResult = (k: number, total: number): RetrievalAgentResult => {
+    const { result } = retrievalAgentRunFrom(
+      "which files?",
+      answered({
+        facts: Array.from({ length: k }, (_, i) => ({ table: "chunks", row: chunkRow(i) })),
+        statement: "SELECT path, start_line, end_line, content FROM bm25_search('chunks','content','slow', 1000)",
+        coverage: { rows_total: total, rows_returned: k, truncated: true },
+      }),
+      k,
+    );
+    return result;
+  };
+
+  it("runs the statement again and appends the rows the platform cut, the platform's first k in front", async () => {
+    const all = Array.from({ length: 27 }, (_, i) => chunkRow(26 - i, `fn f${26 - i}() {\n  ${"x".repeat(600)}\n}`));
+    const hosted = platform(all);
+    const result = await completeTruncated(hosted, cutResult(10, 27));
+    expect(hosted.asked).toEqual(["SELECT path, start_line, end_line, content FROM bm25_search('chunks','content','slow', 1000)"]);
+    expect(result.hits).toHaveLength(27);
+    // The platform's ranked ten stay first and whole; the rest follow in
+    // the statement's order, their content cut short.
+    expect(result.hits.slice(0, 10).map((h) => h.path)).toEqual(Array.from({ length: 10 }, (_, i) => `src/f${i}.ts`));
+    expect(result.hits[10].path).toBe("src/f26.ts");
+    expect(result.hits[10].content.length).toBeLessThanOrEqual(REST_CONTENT_CHARS);
+    expect(result.hitsTotal).toBe(27);
+    expect(result.coverage).toMatchObject({ rowsTotal: 27, rowsReturned: 27, truncated: false });
+    expect(result.completed).toContain("the platform returned the first 10 of 27 rows");
+    expect(result).not.toHaveProperty("more");
+  });
+
+  it("leaves a result that was not cut, or has no statement, as it is and asks the platform nothing", async () => {
+    const hosted = platform([]);
+    const whole = retrievalAgentRunFrom("q", answered()).result;
+    expect(await completeTruncated(hosted, whole)).toBe(whole);
+    const cut = { ...cutResult(10, 27), sql: undefined };
+    expect(await completeTruncated(hosted, cut)).toBe(cut);
+    expect(hosted.asked).toEqual([]);
+  });
+
+  it("hands over the statement instead when the rows are more than a result is completed to", async () => {
+    const hosted = platform([]);
+    const result = await completeTruncated(hosted, cutResult(10, COMPLETE_ROWS_CAP + 1));
+    expect(hosted.asked).toEqual([]);
+    expect(result.hits).toHaveLength(10);
+    expect(result.coverage?.truncated).toBe(true);
+    expect(result.more).toContain(`${COMPLETE_ROWS_CAP + 1} rows matched and 10 are here`);
+    expect(result.more).toContain("bm25_search('chunks','content','slow', 1000)");
+    expect(result).not.toHaveProperty("completed");
+  });
+
+  it("keeps the first k and says why when the second run fails", async () => {
+    const hosted = platform(new Error("the worker is restarting"));
+    const result = await completeTruncated(hosted, cutResult(10, 27));
+    expect(result.hits).toHaveLength(10);
+    expect(result.coverage?.truncated).toBe(true);
+    expect(result.more).toContain("reading the rest failed: the worker is restarting");
+  });
+
+  it("over a table of another shape, the rows are that table's rows and the key is the whole row", async () => {
+    const shape = tableShapeFrom("issues", [
+      { name: "issue_id", type: "i64" },
+      { name: "title", type: "large_utf8" },
+    ]);
+    const first = { issue_id: 1, title: "slow query" };
+    const platformRows = [first, { issue_id: 2, title: "memory grows" }, { issue_id: 3, title: "latency spike" }];
+    const hosted = platform(platformRows);
+    const { result: cut } = retrievalAgentRunFrom(
+      "which issues?",
+      answered({
+        facts: [{ table: "issues", row: first }],
+        statement: "SELECT issue_id, title FROM issues WHERE title LIKE '%slow%'",
+        coverage: { rows_total: 3, rows_returned: 1, truncated: true },
+      }),
+      10,
+      shape,
+    );
+    const result = await completeTruncated(hosted, cut, shape);
+    expect(result.rows.map((r) => r.issue_id)).toEqual([1, 2, 3]);
+    expect(result.coverage).toMatchObject({ rowsReturned: 3, truncated: false });
   });
 });

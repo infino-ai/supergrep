@@ -88,18 +88,21 @@ export function partialIndex(manifest: Manifest): PartialIndex | undefined {
 export { jsonify } from "./json.js";
 
 /** The ledger's record of what the platform call behind an `ask` result
- * cost: the round trip of the answering request and the
- * tokens the platform metered. Read right after the call, while the client's
- * last call is that one. Undefined when there is no platform client, so
- * callers spread it into the usage entry unconditionally. Ledger-only: never
- * part of a tool result. */
-export function hostedTelemetry(handle: { hosted?: HostedDb }): { rttMs: number; readTokens?: number; writeTokens?: number } | undefined {
+ * cost: the round trip of the answering request, the tokens the platform
+ * metered and the bytes its egress meter recorded. Read right after the
+ * call, while the client's last call is that one. Undefined when there is no
+ * platform client, so callers spread it into the usage entry
+ * unconditionally. Ledger-only: never part of a tool result. */
+export function hostedTelemetry(
+  handle: { hosted?: HostedDb },
+): { rttMs: number; readTokens?: number; writeTokens?: number; resultBytes?: number } | undefined {
   const info = handle.hosted?.lastCall();
   if (!info) return undefined;
   return {
     rttMs: info.rttMs,
     ...(info.readTokens !== undefined ? { readTokens: info.readTokens } : {}),
     ...(info.writeTokens !== undefined ? { writeTokens: info.writeTokens } : {}),
+    ...(info.resultBytes !== undefined ? { resultBytes: info.resultBytes } : {}),
   };
 }
 
@@ -754,6 +757,12 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
 
 const PLACEHOLDER = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
 
+/** The platform's own placeholder - `{{q:"text"}}`, the text embedded with
+ * the table's model before the statement runs - is the only name it reads;
+ * a `{{name}}` from the embed map is folded into it by text alone. */
+const HOSTED_PLACEHOLDER_OPEN = '{{q:"';
+const HOSTED_PLACEHOLDER_CLOSE = '"}}';
+
 /** The distinct `{{name}}` placeholders a statement references, in order. */
 function placeholderNames(sql: string): string[] {
   const referenced = new Set<string>();
@@ -761,12 +770,279 @@ function placeholderNames(sql: string): string[] {
   return [...referenced];
 }
 
-/** Whether a statement embeds a query - carries a `{{name}}` placeholder,
- * which only the vector functions (vector_search, hybrid_search) take. The
- * MCP server reads this to send such a statement to the platform when a
+/** A query placeholder written close to the platform's `{{q:"text"}}`: one
+ * brace or two on either side, the key `q` bare or in either quote, spaces
+ * around the colon, and the text a string in single quotes (SQL's, with a
+ * quote inside doubled) or in double quotes. Sticky, because it is tried at
+ * one brace at a time (see vectorArguments). */
+const NEAR_PLACEHOLDER = /\{\{?\s*(["']?)q\1\s*:\s*(?:'((?:[^']|'')*)'|"([^"]*)")\s*\}\}?/y;
+
+/** The functions a query placeholder is an argument of. */
+const VECTOR_SEARCH_FUNCTIONS = new Set(["vector_search", "hybrid_search"]);
+
+/** What starts a word of SQL - a keyword, a name - and what continues one;
+ * a `$` inside a name is part of it, as the engine's parser reads names. */
+const WORD_START = /[A-Za-z_]/;
+const WORD_CHAR = /[A-Za-z0-9_$]/;
+
+/** The tag that opens a dollar-quoted string, `$$` or `$tag$`: the engine's
+ * parser reads `$$it's$$` as a string, so the `'` inside it opens nothing.
+ * Sticky, tried where a `$` stands outside a word. */
+const DOLLAR_QUOTE_TAG = /\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/y;
+
+/** The prefix of an escape string, E'...', in which a backslash escapes the
+ * character after it: the engine's parser (sqlparser's generic dialect)
+ * reads them, so a `\'` inside one does not end it. */
+const ESCAPE_STRING_PREFIX = new Set(["E", "e"]);
+
+/** The index of the quote closing the quoted run that opens at `at` - a
+ * string, a "quoted" or `backticked` identifier - reading a doubled quote
+ * inside as the quote itself and, with `backslashes`, a backslash as
+ * escaping the character after it; the statement's last index when the run
+ * never closes. */
+function quotedEnd(sql: string, at: number, backslashes: boolean): number {
+  const quote = sql[at];
+  for (let i = at + 1; i < sql.length; i++) {
+    if (backslashes && sql[i] === "\\") {
+      i += 1;
+      continue;
+    }
+    if (sql[i] !== quote) continue;
+    if (sql[i + 1] !== quote) return i;
+    i += 1;
+  }
+  return sql.length - 1;
+}
+
+/** The index where the comment opening at `at` ends - a line comment's
+ * newline (or the statement's last index, which ends one too), a block
+ * comment's closing slash, block comments nested as the engine's parser
+ * reads them; the statement's length, one past its end, when a block comment
+ * never closes, which the engine refuses; -1 when no comment opens there. */
+function commentEnd(sql: string, at: number): number {
+  if (sql.startsWith("--", at)) {
+    const end = sql.indexOf("\n", at);
+    return end < 0 ? sql.length - 1 : end;
+  }
+  if (!sql.startsWith("/*", at)) return -1;
+  let depth = 0;
+  for (let i = at; i < sql.length - 1; i++) {
+    if (sql.startsWith("/*", i)) {
+      depth += 1;
+      i += 1;
+    } else if (sql.startsWith("*/", i)) {
+      depth -= 1;
+      i += 1;
+      if (depth === 0) return i;
+    }
+  }
+  return sql.length;
+}
+
+/** A query placeholder spelled close to the platform's, where it stands:
+ * the offset of its first brace, its length as written, and its text. */
+interface NearSpelling {
+  at: number;
+  length: number;
+  text: string;
+}
+
+/** What one reading of a statement finds: everything a check on its text
+ * needs, so that every check reads the statement alike. */
+interface StatementReading {
+  /** The near spellings (NEAR_PLACEHOLDER) standing as a direct argument of
+   * vector_search or hybrid_search, outside any struct. */
+  nearSpellings: NearSpelling[];
+  /** How many of the platform's own `{{q:"..."}}` stand as such an argument. */
+  placeholders: number;
+  /** The comments, each as the offsets of its first and last character; a
+   * block comment that never closes is not among them. */
+  comments: Array<[number, number]>;
+  /** Whether a block comment opens and never closes - the rest of the
+   * statement is inside it, and the engine refuses the statement. */
+  unclosed: boolean;
+  /** The statement's first word, lowercased, read past any opening
+   * parentheses; empty when anything else - a string, a number, nothing at
+   * all - comes first. */
+  firstWord: string;
+  /** Whether code follows a semicolon - a second statement. More
+   * semicolons with nothing between them are not one: the engine's parser
+   * skips the empty statements between them. */
+  more: boolean;
+}
+
+/** `sql` read in one pass outside strings (escape and dollar-quoted ones
+ * included), quoted identifiers and comments: where its query placeholders
+ * stand as direct arguments of vector_search and hybrid_search calls, where
+ * its comments are, its first word, and whether a second statement follows
+ * the first. A call is a vector search function's name followed by its
+ * parenthesis, with only whitespace or comments between. The platform's own
+ * placeholder is read as the platform reads it, its text running to the
+ * first `"}}`, and a near spelling is read whole, so neither leaves a brace
+ * counted as a struct's, and a `;` or a `--` in either is text. */
+function readStatement(sql: string): StatementReading {
+  const nearSpellings: NearSpelling[] = [];
+  const comments: Array<[number, number]> = [];
+  let unclosed = false;
+  let placeholders = 0;
+  // The parenthesis depth of the arguments of each vector search call still
+  // open, and how deep inside struct braces the pass is.
+  const calls: number[] = [];
+  let depth = 0;
+  let structs = 0;
+  // The last word read, kept across whitespace and comments: the function a
+  // parenthesis after it calls.
+  let word = "";
+  // The first word, and whether nothing but opening parentheses has been
+  // read yet.
+  let firstWord = "";
+  let leading = true;
+  // Whether any code has been read, whether a semicolon has ended the
+  // statement, and whether code came after one.
+  let started = false;
+  let ended = false;
+  let more = false;
+  const code = () => {
+    started = true;
+    if (ended) more = true;
+  };
+  for (let i = 0; i < sql.length; i++) {
+    const comment = commentEnd(sql, i);
+    if (comment === sql.length) {
+      unclosed = true;
+      break;
+    }
+    if (comment >= 0) {
+      comments.push([i, comment]);
+      i = comment;
+      continue;
+    }
+    const c = sql[i];
+    if (/\s/.test(c)) continue;
+    if (WORD_START.test(c)) {
+      let wordEnd = i + 1;
+      while (wordEnd < sql.length && WORD_CHAR.test(sql[wordEnd])) wordEnd += 1;
+      word = sql.slice(i, wordEnd);
+      if (sql[wordEnd] === "'" && ESCAPE_STRING_PREFIX.has(word)) {
+        i = quotedEnd(sql, wordEnd, true);
+        word = "";
+      } else {
+        if (leading) firstWord = word.toLowerCase();
+        i = wordEnd - 1;
+      }
+      leading = false;
+      code();
+      continue;
+    }
+    // A semicolon before any code ends an empty statement, which the
+    // engine's parser skips, as it does the ones between semicolons.
+    if (c === ";") {
+      if (started) {
+        ended = true;
+        leading = false;
+      }
+      word = "";
+      continue;
+    }
+    if (c !== "(") leading = false;
+    const inArgument = calls.at(-1) === depth && structs === 0;
+    if (sql.startsWith(HOSTED_PLACEHOLDER_OPEN, i)) {
+      if (inArgument) placeholders += 1;
+      const close = sql.indexOf(HOSTED_PLACEHOLDER_CLOSE, i + HOSTED_PLACEHOLDER_OPEN.length);
+      i = close < 0 ? sql.length - 1 : close + HOSTED_PLACEHOLDER_CLOSE.length - 1;
+    } else if (c === "'" || c === '"' || c === "`") {
+      i = quotedEnd(sql, i, false);
+    } else if (c === "$") {
+      DOLLAR_QUOTE_TAG.lastIndex = i;
+      const tag = DOLLAR_QUOTE_TAG.exec(sql)?.[0];
+      if (tag) {
+        const close = sql.indexOf(tag, i + tag.length);
+        i = close < 0 ? sql.length - 1 : close + tag.length - 1;
+      }
+    } else if (c === "(") {
+      depth += 1;
+      if (VECTOR_SEARCH_FUNCTIONS.has(word.toLowerCase())) calls.push(depth);
+    } else if (c === ")") {
+      if (calls.at(-1) === depth) calls.pop();
+      depth -= 1;
+    } else if (c === "{") {
+      NEAR_PLACEHOLDER.lastIndex = i;
+      const near = inArgument ? NEAR_PLACEHOLDER.exec(sql) : null;
+      if (near) {
+        const [written, , single, double] = near;
+        nearSpellings.push({ at: i, length: written.length, text: single !== undefined ? single.replace(/''/g, "'") : (double ?? "") });
+        i += written.length - 1;
+      } else {
+        structs += 1;
+      }
+    } else if (c === "}") {
+      structs = Math.max(0, structs - 1);
+    }
+    code();
+    word = "";
+  }
+  return { nearSpellings, placeholders, comments, unclosed, firstWord, more };
+}
+
+/** `sql` with each of its comments read out, as readStatement reads them,
+ * for the checks that read a statement's text - the join gate, the top-k
+ * check, whether the rows are ordered: a table, a search call or an ORDER
+ * BY named in a comment would read to them as if the statement wrote it.
+ * Each comment leaves its newlines (a space where it has none), so the text
+ * keeps its lines; a `--` or a `/*` inside a string, a quoted name or the
+ * platform's placeholder is text and stays, and so does a block comment
+ * that never closes - the engine refuses that statement, and nothing here
+ * should read it as shorter than it is. The statement itself runs as
+ * written, comments and all: the engine reads its own comments, and a
+ * statement this reader read wrong can then only be checked wrong, never
+ * run as something else. */
+export function withoutComments(sql: string): string {
+  let out = "";
+  let copied = 0;
+  for (const [first, last] of readStatement(sql).comments) {
+    const lines = sql.slice(first, last + 1).replace(/[^\n]/g, "");
+    out += sql.slice(copied, first) + (lines || " ");
+    copied = last + 1;
+  }
+  return out + sql.slice(copied);
+}
+
+/** Whether a statement embeds a query - carries a `{{name}}` placeholder, or
+ * the platform's own `{{q:"..."}}` as a vector search's argument; only the
+ * vector functions (vector_search, hybrid_search) take either. The MCP
+ * server reads this to send such a statement to the platform when a
  * database is configured: the query is embedded there with the table's own
  * model, and the local side stays lexical. */
-export const embedsAQuery = (sql: string): boolean => placeholderNames(sql).length > 0;
+export const embedsAQuery = (sql: string): boolean =>
+  placeholderNames(sql).length > 0 || readStatement(sql).placeholders > 0;
+
+/** `sql` with each query placeholder written close to the platform's own
+ * (NEAR_PLACEHOLDER) rewritten to `{{q:"text"}}` where it stands as a direct
+ * argument of vector_search or hybrid_search, and every other character as
+ * written. The platform's own form is read as the platform reads it and kept
+ * byte for byte, and a struct literal anywhere else is SQL and is left
+ * alone. A near spelling whose text holds a double quote is left as written
+ * too: the platform's form has no way to carry one - its text runs to the
+ * first `"}}` - and the statement's other readers, the top-k check and the
+ * join gate, would read its quotes out of step.
+ *
+ * The documented form is `{{q:"..."}}`, and a model copying it can read the
+ * doubled brace as an escaped one. Measured on the demo, 2026-10-01: Sonnet
+ * wrote `{q: "..."}`, `{{"q": "..."}}` and `{q: '...'}` in all three of its
+ * hybrid_search calls over the Wikipedia table, and each failed on the
+ * platform - DataFusion read the first as a struct whose field names a
+ * column, the second as a syntax error, the third as a struct where the
+ * query vector belongs. In that place none of them can mean anything else. */
+export function normalizeQueryPlaceholders(sql: string): string {
+  let out = "";
+  let copied = 0;
+  for (const { at, length, text } of readStatement(sql).nearSpellings) {
+    if (text.includes('"')) continue;
+    out += `${sql.slice(copied, at)}${HOSTED_PLACEHOLDER_OPEN}${text}${HOSTED_PLACEHOLDER_CLOSE}`;
+    copied = at + length;
+  }
+  return out + sql.slice(copied);
+}
 
 /** The embed text for one placeholder; a referenced placeholder with no
  * supplied text is a hard error. */
@@ -805,15 +1081,39 @@ export async function applyEmbeds(
   return sql.replace(PLACEHOLDER, (full, name) => literals.get(name) ?? full);
 }
 
-/** Read-only guard: one statement, must be SELECT/WITH. The index is a
- * derived artifact - mutating it through SQL is never useful; re-index instead. */
+/** Read-only guard: one statement, and its first word SELECT or WITH. The
+ * index is a derived artifact - mutating it through SQL is never useful;
+ * re-index instead. The statement is read as every other check here reads
+ * it (readStatement): a comment, a string or a quoted name is not code, so a
+ * statement may open with a comment, a semicolon or a keyword inside any of
+ * them counts for nothing, and a closing semicolon with only whitespace or
+ * comments after it still ends the one statement. A block comment that
+ * never closes is refused here in words the model can act on: the rest of
+ * the statement is inside it, and the engine would refuse it too. Returns
+ * the statement as written but trimmed and with a closing semicolon off its
+ * end - comments and all, which the engine reads itself (the platform runs
+ * a leading, trailing or nested comment, measured 2026-10-01) - so the
+ * reading here decides only whether the statement runs, never what runs.
+ *
+ * Until 2026-10-01 this tested the raw text's first word and refused every
+ * semicolon, so a statement opening with a `-- what this counts` line was
+ * refused as not read-only: 13 of the 1,002 sql calls the demo's Infino arm
+ * made from 2026-09-30, each one costing the model a turn, and on the
+ * Wikipedia news-outlets question it turned one UNION ALL into four
+ * statements. */
 export function guardSql(sql: string): string {
-  const stripped = sql.trim().replace(/;\s*$/, "");
-  if (stripped.includes(";")) throw new Error("only a single statement is allowed");
-  if (!/^(select|with)\b/i.test(stripped)) {
+  const { firstWord, more, unclosed } = readStatement(sql);
+  if (unclosed) {
+    throw new Error(
+      "a /* comment in the statement never closes, so the rest of it would be read as the comment: close it with */ " +
+        "(a /* inside a comment - a path like src/* - opens another that needs its own */), or write the note as a -- line",
+    );
+  }
+  if (more) throw new Error("only a single statement is allowed");
+  if (firstWord !== "select" && firstWord !== "with") {
     throw new Error("only read-only SELECT / WITH queries are allowed (the index is rebuilt by `cx index`, not mutated through SQL)");
   }
-  return stripped;
+  return sql.trim().replace(/;\s*$/, "");
 }
 
 export async function runSql(
@@ -953,12 +1253,6 @@ export async function findRows(
     ...(total > matches.length ? { truncated: true } : {}),
   };
 }
-
-/** The platform's own placeholder - `{{q:"text"}}`, the text embedded with
- * the table's model before the statement runs - is the only name it reads;
- * a `{{name}}` from the embed map is folded into it by text alone. */
-const HOSTED_PLACEHOLDER_OPEN = '{{q:"';
-const HOSTED_PLACEHOLDER_CLOSE = '"}}';
 
 /** `sql` with every `{{name}}` placeholder the caller supplied embed text
  * for rewritten to the platform's inline `{{q:"text"}}`, which the platform
