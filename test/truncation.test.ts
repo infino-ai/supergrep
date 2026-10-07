@@ -85,9 +85,9 @@ describe("the gitignore warning", () => {
     // The shape measured on a real workspace: two entries that matter, buried
     // among hundreds of leftover test temp directories under one parent.
     const noise = Array.from({ length: 40 }, (_, i) => `wt-a/optimizer/tmp/.tmp${i}/acme/logs`);
-    const collapsed = collapseIgnored(["infino", "claude-plans", ...noise]);
+    const collapsed = collapseIgnored(["infino", "docs", ...noise]);
     // Shallowest first, so the sibling repositories are what a reader sees.
-    expect(collapsed[0]).toBe("claude-plans");
+    expect(collapsed[0]).toBe("docs");
     expect(collapsed[1]).toBe("infino");
     // Forty entries, each with its OWN immediate parent, became one line -
     // named at the deepest ancestor that actually covers them, so it says
@@ -116,9 +116,9 @@ describe("the gitignore warning", () => {
   });
 
   it("names what was skipped, what it costs, and how to include it", () => {
-    const w = ignoreWarning(["infino", "claude-plans"]);
+    const w = ignoreWarning(["infino", "docs"]);
     expect(w).toContain("2 directories were NOT indexed");
-    expect(w).toContain("claude-plans, infino");
+    expect(w).toContain("docs, infino");
     expect(w).toContain("not proof it is absent");
     expect(w).toContain("--no-ignore");
     expect(w).toContain("CX_NO_IGNORE=1");
