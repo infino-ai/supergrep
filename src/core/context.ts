@@ -15,12 +15,6 @@ import { connect, type Connection } from "@infino-ai/infino";
 import { indexDir, resolveRoot, TABLE, hostedTarget, hostedLabel, hostedClientOptions } from "./config.js";
 import { readManifest, type Manifest } from "./manifest.js";
 import { HostedDb, type HostedOptions, type HostedTarget } from "./hosted.js";
-import { PLATFORM_DEFAULT_ANALYZER } from "./analyzer.js";
-
-// The platform's default analyzer is defined with the analyzers themselves;
-// it is re-exported here because callers that describe the platform table
-// (the loader, the tests) reach for it alongside the other platform constants.
-export { PLATFORM_DEFAULT_ANALYZER };
 
 /** Provider recorded for a table whose vector column the platform fills. */
 export const PLATFORM_EMBEDDER_PROVIDER = "platform";

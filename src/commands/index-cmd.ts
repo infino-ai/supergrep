@@ -16,9 +16,7 @@ import { watch } from "node:fs";
 import { openForIndexing, platformLabel } from "../core/context.js";
 import { indexRepoStaged, syncRepo, type IndexOptions, type IndexStats, type SyncResult } from "../core/indexer.js";
 import { createEmbedder, createIndexingEmbedder, embedderInfo, platformEmbedderInfo } from "../core/embedder.js";
-import { DEFAULT_CAPS, INDEX_DIR_NAME, embedProvider, hostedAnalyzer, type EmbedProvider } from "../core/config.js";
-import { HOSTED_DEFAULT_ANALYZER, analyzerOf } from "../core/analyzer.js";
-import { readPlatformManifest } from "../core/manifest.js";
+import { DEFAULT_CAPS, INDEX_DIR_NAME, embedProvider, type EmbedProvider } from "../core/config.js";
 import { bold, dim, green, yellow, fmtMs, fmtCount, progressLine, progressDone } from "../core/output.js";
 
 export interface IndexCmdOptions {
@@ -232,10 +230,6 @@ export async function indexCmd(path: string | undefined, opts: IndexCmdOptions):
   // own model doing the embedding, no local embedder is ever built.
   const wantsLocalEmbed = Boolean(hosted) && provider === "local" && opts.embed !== false;
   const embedder = wantsLocalEmbed ? createEmbedder() : undefined;
-  // The analyzer only when --analyzer named one: otherwise a build keeps the
-  // table's own (the recorded one, or the default for a first load), and a
-  // sync asks for nothing.
-  const analyzer = hostedAnalyzer();
   const caps = {
     ...DEFAULT_CAPS,
     ...(opts.maxFiles ? { maxFiles: Number(opts.maxFiles) } : {}),
@@ -249,7 +243,6 @@ export async function indexCmd(path: string | undefined, opts: IndexCmdOptions):
     indexDirPath: dir,
     embedder,
     embedProvider: provider,
-    analyzer,
     caps,
     respectGitignore: respectGitignore(opts),
     include: includePatterns(opts),
@@ -270,9 +263,7 @@ export async function indexCmd(path: string | undefined, opts: IndexCmdOptions):
     console.log(dim(`index: ${dir} · embedder: ${embedding}`));
     if (hosted) {
       const platformEmbedding = opts.embed === false ? "off (--no-embed)" : platformEmbedderInfo();
-      const recorded = readPlatformManifest(dir);
-      const shown = analyzer ?? (recorded ? analyzerOf(recorded) : HOSTED_DEFAULT_ANALYZER);
-      console.log(dim(`platform table: ${platformLabel(hosted)} · analyzer: ${shown} · embedder: ${platformEmbedding}`));
+      console.log(dim(`platform table: ${platformLabel(hosted)} · embedder: ${platformEmbedding}`));
     }
   }
 

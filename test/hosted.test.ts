@@ -183,7 +183,7 @@ describe("request shapes", () => {
       { name: "auto", type: { type: "embedding", source: ["content"] } },
     ];
     await db.createTable("chunks", columns, {
-      fts: [{ column: "content", analyzer: "ascii_lower" }, { column: "path" }],
+      fts: [{ column: "content" }, { column: "path" }],
       vector: [{ column: "embedding", metric: "cosine" }],
     });
     expect(calls[0].url).toBe("https://api.example.test/v1/create_table/cx");
@@ -196,7 +196,7 @@ describe("request shapes", () => {
         { name: "auto", type: "embedding", source: ["content"] },
       ],
       indexes: {
-        fts: [{ column: "content", analyzer: "ascii_lower" }, { column: "path" }],
+        fts: [{ column: "content" }, { column: "path" }],
         vector: [{ column: "embedding", metric: "cosine" }],
       },
     });

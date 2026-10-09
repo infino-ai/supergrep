@@ -3,7 +3,7 @@
 //
 // The indexer with a platform database configured: one build writes the local
 // index and then the platform table from the same spill (the table lifecycle
-// - drop only when present, create with the analyzer and the right vector
+// - drop only when present, create with the FTS index and the right vector
 // column and indexes - and the append encodings: Arrow IPC waves for client
 // vectors, the JSON envelope for a platform-embedded table); the two manifests
 // it leaves behind; the platform-side cost in the stats; a platform failure
@@ -273,7 +273,7 @@ describe("a build with a platform database (client vectors)", () => {
     expect(created.table_name).toBe(TABLE);
     expect(created.schema).toEqual([...TEXT_COLUMNS, { name: "embedding", type: "vector", dim: DIM }]);
     expect(created.indexes).toEqual({
-      fts: [{ column: "content", analyzer: "ascii_lower" }],
+      fts: [{ column: "content" }],
       vector: [{ column: "embedding", metric: "cosine" }],
     });
 
@@ -306,18 +306,16 @@ describe("a build with a platform database (client vectors)", () => {
     expect(stats.hosted!.writeTokens).toBeCloseTo(WRITE_TOKENS_PER_CALL * (2 + waves));
     expect(stats.hosted!.loadWallMs).toBeGreaterThanOrEqual(0);
 
-    // Two manifests: the local one describes the local index (engine default
-    // analyzer), the platform one the table (the analyzer sent), both the same
-    // rows; the file state is shared; no spills are left.
+    // Two manifests: the local one describes the local index, the platform
+    // one the table, both the same rows; the file state is shared; no spills
+    // are left.
     const local = readManifest(dir)!;
     expect(local.origin).toBeUndefined();
-    expect(local.analyzer).toBe("ascii_lower");
     expect(local.vectors).toBe("none");
     expect(local.embedder).toBeUndefined();
     expect(local.chunks).toBe(stats.chunks);
     const remote = readPlatformManifest(dir)!;
     expect(remote.origin).toBe("hosted");
-    expect(remote.analyzer).toBe("ascii_lower");
     expect(remote.vectors).toBe("ready");
     expect(remote.embedder).toEqual({ provider: "fake", model: "fake-16d", dim: DIM });
     expect(remote.chunks).toBe(stats.chunks);
@@ -334,19 +332,6 @@ describe("a build with a platform database (client vectors)", () => {
     const platform = fakePlatform([]);
     await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
     expect(platform.ops()).toEqual(["list_tables", "create_table", "append"]);
-  });
-
-  it("names the analyzer it was given to the platform and records it in the platform manifest only", async () => {
-    writeSmallFixture(root);
-    const platform = fakePlatform();
-    await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local", analyzer: "standard" });
-    const created = createBody(platform.calls.find((c) => c.op === "create_table")!);
-    expect(created.indexes).toEqual({
-      fts: [{ column: "content", analyzer: "standard" }],
-      vector: [{ column: "embedding", metric: "cosine" }],
-    });
-    expect(readPlatformManifest(dir)!.analyzer).toBe("standard");
-    expect(readManifest(dir)!.analyzer).toBe("ascii_lower"); // the local index took the engine default
   });
 
   it("indexes an empty tree to an empty, complete table on both sides", async () => {
@@ -374,7 +359,6 @@ describe("a build with a platform database (client vectors)", () => {
     // this window waits on it, reading "in progress", never "rebuild".
     const provisional = readPlatformManifest(dir)!;
     expect(provisional.vectors).toBe("building");
-    expect(provisional.analyzer).toBe("ascii_lower");
     const waiting = await syncRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
     expect(waiting.action).toBe("rebuild-required");
     expect(syncInProgress(waiting)).toBe(true);
@@ -383,26 +367,6 @@ describe("a build with a platform database (client vectors)", () => {
     expect(final.vectors).toBe("none"); // local; the platform manifest below is the one that goes "ready"
     expect(final.hosted!.appendCalls).toBe(1);
     expect(readPlatformManifest(dir)!.vectors).toBe("ready");
-  });
-
-  it("keeps the analyzer the table has when a rebuild or sync names none", async () => {
-    writeSmallFixture(root);
-    const first = fakePlatform();
-    await indexRepo({ root, db, hosted: first.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local", analyzer: "standard" });
-    expect(readPlatformManifest(dir)!.analyzer).toBe("standard");
-    // A sync with no analyzer asks for nothing: no rebuild, the record stands.
-    const synced = await syncRepo({ root, db, hosted: first.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
-    expect(synced.action).toBe("noop");
-    expect(readPlatformManifest(dir)!.analyzer).toBe("standard");
-    // A rebuild with no analyzer recreates the table with the one it had.
-    const second = fakePlatform([TABLE]);
-    await indexRepo({ root, db, hosted: second.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
-    const created = createBody(second.calls.find((c) => c.op === "create_table")!);
-    expect(created.indexes).toMatchObject({ fts: [{ column: "content", analyzer: "standard" }] });
-    expect(readPlatformManifest(dir)!.analyzer).toBe("standard");
-    // Only an explicit, differing request changes it.
-    const changed = await syncRepo({ root, db, hosted: second.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local", analyzer: "ascii_lower" });
-    expect((changed as { reason: string }).reason).toMatch(/analyzer changed \(platform table: standard, current: ascii_lower\)/);
   });
 });
 
@@ -429,7 +393,7 @@ describe("a build with a platform database (the platform embeds)", () => {
     expect(created.schema).toEqual([...TEXT_COLUMNS, { name: "embedding", type: "embedding", source: ["content"] }]);
     // The platform indexes an embedding column by itself; a vector entry for
     // it would be a 400.
-    expect(created.indexes).toEqual({ fts: [{ column: "content", analyzer: "ascii_lower" }] });
+    expect(created.indexes).toEqual({ fts: [{ column: "content" }] });
 
     const appends = platform.calls.filter((c) => c.op === "append");
     expect(appends).toHaveLength(1);
@@ -468,7 +432,7 @@ describe("a build with a platform database (keyword only)", () => {
     expect(stats.vectors).toBe("none");
     const created = createBody(platform.calls.find((c) => c.op === "create_table")!);
     expect(created.schema).toEqual(TEXT_COLUMNS);
-    expect(created.indexes).toEqual({ fts: [{ column: "content", analyzer: "ascii_lower" }] });
+    expect(created.indexes).toEqual({ fts: [{ column: "content" }] });
     const append = platform.calls.find((c) => c.op === "append")!;
     expect(append.headers["content-type"]).toBe("application/vnd.apache.arrow.stream");
     expect(append.ipc!.schema.fields.map((f) => f.name)).toEqual(TEXT_FIELDS);
@@ -672,14 +636,6 @@ describe("a sync with a platform database", () => {
     const forth = await syncRepo({ root, db, hosted: local.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" });
     expect(forth.action).toBe("rebuild-required");
     expect((forth as { reason: string }).reason).toMatch(/embedder changed \(platform table: fake-16d, current: platform\)/);
-  });
-
-  it("asks for a build when the analyzer requested differs from the platform table's", async () => {
-    const platform = fakePlatform();
-    await build(platform);
-    const outcome = await syncRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local", analyzer: "standard" });
-    expect(outcome.action).toBe("rebuild-required");
-    expect((outcome as { reason: string }).reason).toMatch(/analyzer changed \(platform table: ascii_lower, current: standard\)/);
   });
 
   it("a platform failure mid-apply throws, marks the touched paths unapplied, and the next sync re-applies the diff to both", async () => {

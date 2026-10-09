@@ -78,13 +78,6 @@ import {
   type Manifest,
   type VectorState,
 } from "./manifest.js";
-import {
-  analyzerOf,
-  ENGINE_DEFAULT_ANALYZER,
-  HOSTED_DEFAULT_ANALYZER,
-  isAnalyzer,
-  type Analyzer,
-} from "./analyzer.js";
 import { EMBEDDING_COLUMN, PLATFORM_EMBEDDER_MODEL, PLATFORM_EMBEDDER_PROVIDER } from "./context.js";
 import { rowsToIpc, type HostedDb, type HostedIndexes, type JsonColumn } from "./hosted.js";
 import {
@@ -177,15 +170,6 @@ export interface IndexOptions {
    * The narrow form of `respectGitignore: false`: one gitignored sibling
    * repository or generated tree, rather than all of them. */
   include?: string[];
-  /** Platform table only: the FTS analyzer its `content` index is created
-   * with, when the caller asks for one (--analyzer). Absent, a build keeps
-   * the analyzer the table already has, per the platform manifest, and a
-   * first load takes HOSTED_DEFAULT_ANALYZER; the value settled on is sent to
-   * the platform explicitly and recorded in the platform manifest. The local
-   * index is built with the engine default through the binding's bare
-   * `IndexSpec.fts(column)`. A sync whose value differs from the recorded one
-   * reports rebuild-required: a table's analyzer is fixed at create time. */
-  analyzer?: Analyzer;
   /** `load` is the platform pass (drop, create, append waves) after the local
    * stages; the other phases are the local build's. */
   onPhase?: (phase: "scan" | "chunk" | "commit-text" | "embed" | "commit-vectors" | "load") => void;
@@ -285,12 +269,6 @@ export async function indexRepoStaged(opts: IndexOptions): Promise<StagedIndexRu
   // Keep the index out of the user's commits before we write a byte of it.
   ensureIndexIgnored(root, indexDirPath);
 
-  // The platform table's analyzer is fixed when the table is created: a
-  // rebuild keeps what the table has unless the caller asks for another, and
-  // a first load takes the default. Read before the provisional manifest
-  // below replaces the record.
-  const platformAnalyzer = opts.hosted ? platformAnalyzerFor(opts, indexDirPath) : undefined;
-
   const scanned = await scanToSpill(opts, caps);
   const db = opts.db;
   const {
@@ -315,7 +293,7 @@ export async function indexRepoStaged(opts: IndexOptions): Promise<StagedIndexRu
   try {
     onPhase?.("commit-text");
     if (db.listTables().includes(TABLE)) db.dropTable(TABLE, true);
-    const textTable = db.createTable(TABLE, { ...TEXT_SCHEMA }, new IndexSpec().fts(CONTENT_COLUMN, { analyzer: ENGINE_DEFAULT_ANALYZER }));
+    const textTable = db.createTable(TABLE, { ...TEXT_SCHEMA }, new IndexSpec().fts(CONTENT_COLUMN));
     appendSpillSync(textTable, spill, chunkCount, undefined, onProgress);
     // Always - this table is never recreated after this point, embedder or
     // not, since the local index never gains a vector column any more.
@@ -338,14 +316,14 @@ export async function indexRepoStaged(opts: IndexOptions): Promise<StagedIndexRu
       vectors: "none",
       indexMs,
     };
-    writeManifest(indexDirPath, toManifest(stats, ENGINE_DEFAULT_ANALYZER));
+    writeManifest(indexDirPath, toManifest(stats));
     // From here the file state describes this tree. With a platform database
     // the table does not yet: the provisional manifest says a load is under
     // way, so a sync in the meantime waits instead of diffing against a table
     // that is about to be replaced, and a record of an earlier load cannot
     // outlive a load that fails (the failure removes this file).
-    if (opts.hosted && platformAnalyzer) {
-      writePlatformManifest(indexDirPath, toManifest({ ...stats, vectors: "building" }, platformAnalyzer, undefined, "hosted"));
+    if (opts.hosted) {
+      writePlatformManifest(indexDirPath, toManifest({ ...stats, vectors: "building" }, undefined, "hosted"));
     }
     writeFileState(indexDirPath, fileState);
     if (!opts.hosted) {
@@ -385,9 +363,9 @@ export async function indexRepoStaged(opts: IndexOptions): Promise<StagedIndexRu
             stats.embedError = (err as Error).message;
           }
         }
-        if (opts.hosted && platformAnalyzer) {
+        if (opts.hosted) {
           try {
-            stats.hosted = await loadPlatform(opts, opts.hosted, platformAnalyzer, scanned, embedder && dim !== undefined ? { embedder, dim } : undefined, stats);
+            stats.hosted = await loadPlatform(opts, opts.hosted, scanned, embedder && dim !== undefined ? { embedder, dim } : undefined, stats);
           } catch (err) {
             stats.hostedError = (err as Error).message;
             // No record of the table survives a failed load: the next sync
@@ -609,21 +587,12 @@ async function scanToSpill(opts: IndexOptions, caps: IndexCaps): Promise<Scanned
 
 // --- the platform load -------------------------------------------------------------------
 
-/** The analyzer a build creates the platform table with: the one asked for,
- * else the one the table already has (its manifest, provisional or final),
- * else the default for a first load. */
-function platformAnalyzerFor(opts: IndexOptions, indexDirPath: string): Analyzer {
-  if (opts.analyzer !== undefined) return opts.analyzer;
-  const recorded = readPlatformManifest(indexDirPath);
-  return recorded ? analyzerOf(recorded) : HOSTED_DEFAULT_ANALYZER;
-}
-
 /** Load the spilled chunks into the platform's chunks table in one pass after
  * the local stages: drop → create → append waves, from the spill the local
  * build replayed, so both tables hold the same rows. The table gets the FTS
- * index with `analyzer` and, when there are vectors, either a client-vector
- * column carrying the local embedder's vectors (`embedProvider: "local"`, the
- * vector spill already written by the local stage) with a cosine index, or a
+ * index and, when there are vectors, either a client-vector column carrying
+ * the local embedder's vectors (`embedProvider: "local"`, the vector spill
+ * already written by the local stage) with a cosine index, or a
  * platform-filled embedding column (which the platform indexes by itself - a
  * vector entry naming it is a 400). Replaces the provisional platform
  * manifest with the final one so a later sync can apply its diff to this
@@ -632,7 +601,6 @@ function platformAnalyzerFor(opts: IndexOptions, indexDirPath: string): Analyzer
 async function loadPlatform(
   opts: IndexOptions,
   hosted: HostedDb,
-  analyzer: Analyzer,
   scanned: Scanned,
   vectors: { embedder: Embedder; dim: number } | undefined,
   stats: IndexStats,
@@ -646,7 +614,7 @@ async function loadPlatform(
   // Zero chunks ⇒ no vector spill was ever written and nothing is appended.
   if (dim !== undefined && chunkCount > 0) verifyVectorSpill(spill, chunkCount, dim);
   const columns = hostedColumns(platform ? { platform: true } : { dim });
-  const indexes = hostedIndexes(analyzer, dim !== undefined);
+  const indexes = hostedIndexes(dim !== undefined);
 
   onPhase?.("load");
   const tLoad = performance.now();
@@ -669,7 +637,7 @@ async function loadPlatform(
       : undefined;
   writePlatformManifest(
     indexDirPath,
-    toManifest({ ...stats, vectors: platform || dim !== undefined ? "ready" : "none", hosted: loadStats }, analyzer, embedderInfo, "hosted"),
+    toManifest({ ...stats, vectors: platform || dim !== undefined ? "ready" : "none", hosted: loadStats }, embedderInfo, "hosted"),
   );
   return loadStats;
 }
@@ -704,14 +672,12 @@ function hostedColumns(vectors: { platform: true } | { dim?: number }): JsonColu
   return columns;
 }
 
-/** The index declarations of a hosted chunks table. The analyzer is always
- * named, never left to the platform default, so the manifest records exactly
- * what the table has. A vector index is declared only for a client-vector
- * column: the platform indexes an embedding column by itself and rejects a
- * caller's declaration for it. */
-function hostedIndexes(analyzer: Analyzer, clientVectors: boolean): HostedIndexes {
+/** The index declarations of a hosted chunks table. A vector index is
+ * declared only for a client-vector column: the platform indexes an embedding
+ * column by itself and rejects a caller's declaration for it. */
+function hostedIndexes(clientVectors: boolean): HostedIndexes {
   return {
-    fts: [{ column: CONTENT_COLUMN, analyzer }],
+    fts: [{ column: CONTENT_COLUMN }],
     ...(clientVectors ? { vector: [{ column: EMBEDDING_COLUMN, metric: VECTOR_METRIC }] } : {}),
   };
 }
@@ -1103,8 +1069,7 @@ export async function syncRepo(opts: IndexOptions): Promise<SyncOutcome> {
   // take the vectors the current settings produce. Who fills its vectors is
   // fixed by the table - a platform-embedded column takes no client vectors
   // and a client-vector column takes no platform text - so a provider switch
-  // is a rebuild, and so is its analyzer: rows appended by a sync are
-  // tokenized with the table's, whatever the caller now wants.
+  // is a rebuild.
   let platformManifest: Manifest | undefined;
   let platformClientVectors = false;
   if (hosted) {
@@ -1139,10 +1104,6 @@ export async function syncRepo(opts: IndexOptions): Promise<SyncOutcome> {
         return rebuildRequired(`embedder changed (platform table: ${platformManifest.embedder.model}, current: ${embedder.model})`);
       }
       platformClientVectors = !indexedPlatform;
-    }
-    const recordedAnalyzer = analyzerOf(platformManifest);
-    if (opts.analyzer !== undefined && opts.analyzer !== recordedAnalyzer) {
-      return rebuildRequired(`analyzer changed (platform table: ${recordedAnalyzer}, current: ${opts.analyzer})`);
     }
   }
 
@@ -1483,7 +1444,6 @@ function localEmbedderInfo(embedder: Embedder, dim: number): Manifest["embedder"
 
 function toManifest(
   stats: IndexStats,
-  analyzer: Analyzer,
   embedder?: Manifest["embedder"],
   origin?: Manifest["origin"],
 ): Manifest {
@@ -1492,7 +1452,6 @@ function toManifest(
     table: TABLE,
     ...(origin ? { origin } : {}),
     vectors: stats.vectors,
-    analyzer,
     ...(embedder ? { embedder } : {}),
     files: stats.files,
     chunks: stats.chunks,

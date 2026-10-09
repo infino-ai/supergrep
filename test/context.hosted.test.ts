@@ -3,7 +3,7 @@
 //
 // The platform database through config, context, manifest and embedder: the
 // command-line surface (--db, the key from --api-key-file or INFINO_API_KEY,
-// --embed-provider, the client and agent budgets, --analyzer), what opening an
+// --embed-provider, the client and agent budgets), what opening an
 // index yields with and without a database (the local index always; the
 // platform client beside it for a build), the two manifests in one index dir,
 // the platform table's readiness memo, and the embedder that is local either
@@ -27,7 +27,6 @@ import {
   TABLE,
   configureHosted,
   hostedSettingsFromFlags,
-  hostedAnalyzer,
   subagentK,
   subagentMaxTurns,
   subagentMaxWallSecs,
@@ -139,7 +138,6 @@ describe("platform settings", () => {
     expect(isHosted()).toBe(false);
     expect(hostedTarget()).toBeNull();
     expect(() => hostedSettingsFromFlags({ embedProvider: "platform" }, {})).toThrow(/--embed-provider needs --db <url>/);
-    expect(() => hostedSettingsFromFlags({ analyzer: "standard" }, {})).toThrow(/--analyzer needs --db <url>/);
     expect(() => hostedSettingsFromFlags({ subagentK: "5" }, {})).toThrow(/--subagent-k needs --db/);
     expect(() => hostedSettingsFromFlags({ subagentMaxWallSecs: "5" }, {})).toThrow(/--subagent-max-wall-secs needs --db/);
   });
@@ -210,17 +208,6 @@ describe("platform settings", () => {
     expect(hostedClientOptions()).toEqual({ timeoutMs: 1500, coldStartSecs: 7 });
     expect(() => settingsFor({ dbTimeoutMs: "soon" })).toThrow(/--db-timeout-ms must be a positive integer/);
     expect(() => settingsFor({ coldStartSecs: "0" })).toThrow(/--cold-start-secs must be a positive integer/);
-  });
-
-  it("asks for an analyzer only when --analyzer names one, and refuses a name the engine lacks", () => {
-    // Absent, a build keeps the table's own analyzer (the default for a first
-    // load lives in the indexer) and a sync asks for nothing.
-    expect(hostedAnalyzer()).toBeUndefined();
-    withPlatform();
-    expect(hostedAnalyzer()).toBeUndefined();
-    withPlatform({ analyzer: "standard" });
-    expect(hostedAnalyzer()).toBe("standard");
-    expect(() => settingsFor({ analyzer: "icu" })).toThrow(/--analyzer must be "ascii_lower" or "standard"/);
   });
 
   it("reads the platform tools' caps from the flags, with the documented defaults", () => {
@@ -364,8 +351,8 @@ describe("platformTableReady", () => {
 describe("the two manifests", () => {
   it("live in separate files and each reader rejects the other's origin", () => {
     const dir = join(root, ".infino");
-    const local: Manifest = { ...emptyManifest(), files: 2, chunks: 5, analyzer: "ascii_lower" };
-    const platform: Manifest = { ...emptyManifest(), files: 2, chunks: 5, analyzer: "standard", embedder: { provider: "platform", model: "server-side" } };
+    const local: Manifest = { ...emptyManifest(), files: 2, chunks: 5 };
+    const platform: Manifest = { ...emptyManifest(), files: 2, chunks: 5, embedder: { provider: "platform", model: "server-side" } };
     writeManifest(dir, local);
     writePlatformManifest(dir, platform);
     expect(existsSync(join(dir, MANIFEST_NAME))).toBe(true);
@@ -375,7 +362,6 @@ describe("the two manifests", () => {
     expect(readManifest(dir)!.origin).toBeUndefined();
     const read = readPlatformManifest(dir)!;
     expect(read.origin).toBe("hosted"); // forced by the writer
-    expect(read.analyzer).toBe("standard");
     expect(read.embedder).toEqual({ provider: "platform", model: "server-side" });
     expect(read.version).toBe(INDEX_FORMAT_VERSION);
   });

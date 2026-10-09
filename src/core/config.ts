@@ -6,7 +6,6 @@
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseHostedUrl, DEFAULT_TIMEOUT_MS, DEFAULT_COLD_START_SECS, type HostedTarget } from "./hosted.js";
-import { isAnalyzer, type Analyzer } from "./analyzer.js";
 import { keyFilePath, readStoredAccount, readStoredKey, type StoredAccount } from "./keystore.js";
 import { databaseNameFor } from "./account-api.js";
 
@@ -97,17 +96,12 @@ export interface HostedSettings {
   /** How long retryable "not ready yet" answers are re-issued before giving
    * up, in seconds. */
   coldStartSecs: number;
-  /** The FTS analyzer the platform table's content index is created with,
-   * when --analyzer named one. Absent, a build keeps the analyzer the table
-   * already has (or HOSTED_DEFAULT_ANALYZER for a first load) and a sync
-   * asks for nothing - only an explicit, differing request forces a rebuild. */
-  analyzer?: Analyzer;
   subagent: SubagentSettings;
 }
 
 /** The platform flags as commander parses them: camelCase of `--db`,
  * `--api-key-file`, `--embed-provider`, `--db-timeout-ms`, `--cold-start-secs`,
- * `--analyzer`, `--subagent-max-turns`, `--subagent-max-wall-secs`,
+ * `--subagent-max-turns`, `--subagent-max-wall-secs`,
  * `--subagent-k`. Every value is the raw string; validation is here, in one
  * place, so a bad value is an error at startup and not on the first call. */
 export interface HostedFlags {
@@ -116,7 +110,6 @@ export interface HostedFlags {
   embedProvider?: string;
   dbTimeoutMs?: string;
   coldStartSecs?: string;
-  analyzer?: string;
   subagentMaxTurns?: string;
   subagentMaxWallSecs?: string;
   subagentK?: string;
@@ -128,7 +121,6 @@ const HOSTED_ONLY_FLAGS: Array<[keyof HostedFlags, string]> = [
   ["embedProvider", "--embed-provider"],
   ["dbTimeoutMs", "--db-timeout-ms"],
   ["coldStartSecs", "--cold-start-secs"],
-  ["analyzer", "--analyzer"],
   ["subagentMaxTurns", "--subagent-max-turns"],
   ["subagentMaxWallSecs", "--subagent-max-wall-secs"],
   ["subagentK", "--subagent-k"],
@@ -224,16 +216,12 @@ export function hostedSettingsFromFlags(
   if (providerRaw !== "local" && providerRaw !== "platform") {
     throw new Error(`--embed-provider must be "platform" or "local", got "${flags.embedProvider}"`);
   }
-  if (flags.analyzer !== undefined && !isAnalyzer(flags.analyzer)) {
-    throw new Error(`--analyzer must be "ascii_lower" or "standard", got "${flags.analyzer}"`);
-  }
   return {
     target: { baseUrl, database, apiKey },
     ...(account ? { account } : {}),
     embedProvider: providerRaw,
     timeoutMs: positiveIntFlag("--db-timeout-ms", flags.dbTimeoutMs, DEFAULT_DB_TIMEOUT_MS),
     coldStartSecs: positiveIntFlag("--cold-start-secs", flags.coldStartSecs, DEFAULT_DB_COLD_START_SECS),
-    ...(flags.analyzer !== undefined ? { analyzer: flags.analyzer } : {}),
     subagent: {
       maxTurns: positiveIntFlag("--subagent-max-turns", flags.subagentMaxTurns, DEFAULT_SUBAGENT_MAX_TURNS),
       maxWallSecs: positiveIntFlag("--subagent-max-wall-secs", flags.subagentMaxWallSecs, DEFAULT_SUBAGENT_MAX_WALL_SECS),
@@ -302,15 +290,6 @@ export function hostedClientOptions(): { timeoutMs: number; coldStartSecs: numbe
     timeoutMs: hosted?.timeoutMs ?? DEFAULT_DB_TIMEOUT_MS,
     coldStartSecs: hosted?.coldStartSecs ?? DEFAULT_DB_COLD_START_SECS,
   };
-}
-
-/** The analyzer --analyzer asked for the platform table's `content` index, or
- * undefined when the flag was not given: then a build keeps the analyzer the
- * table already has (HOSTED_DEFAULT_ANALYZER for a first load) and a sync
- * asks for nothing. The indexer sends the value it settles on to the platform
- * explicitly and records it in the platform manifest. */
-export function hostedAnalyzer(): Analyzer | undefined {
-  return hosted?.analyzer;
 }
 
 export function subagentMaxTurns(): number {

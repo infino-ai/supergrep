@@ -1,7 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  analyzerOf,
-  analyzerTokens,
   applyEmbeds,
   citeOf,
   excerpt,
@@ -11,43 +9,15 @@ import {
   numberRowLines,
   plainTerms,
 } from "../src/core/searcher.js";
-import { hasIndexableToken, isAnalyzer } from "../src/core/analyzer.js";
-import { emptyManifest } from "../src/core/manifest.js";
+import { analyzerTokens, hasIndexableToken } from "../src/core/analyzer.js";
 import type { Embedder } from "../src/core/embedder.js";
 
-describe("analyzerTokens (ascii_lower)", () => {
-  // The analyzer is always named: which one a table has depends on where it
-  // lives, so there is no default to fall back on.
-  const ascii = (text: string) => analyzerTokens(text, "ascii_lower");
-
-  it("splits on anything outside [A-Za-z0-9] and lowercases, like the index analyzer", () => {
-    // `parse_config` indexes as two tokens: the underscore is a separator.
-    expect(ascii("parse_config(Path)")).toEqual(["parse", "config", "path"]);
-  });
-
-  it("dedupes repeated tokens", () => {
-    expect(ascii("a.a A")).toEqual(["a"]);
-  });
-
-  it("drops a run that touches non-ASCII text, as the analyzer does", () => {
-    expect(ascii("Süd ok")).toEqual(["ok"]);
-    // The non-ASCII character extends the run rather than splitting it, so
-    // the ASCII neighbours go with it.
-    expect(ascii("abcédef ghi")).toEqual(["ghi"]);
-  });
-
-  it("yields nothing for punctuation-only text", () => {
-    expect(ascii("->")).toEqual([]);
-    expect(ascii("")).toEqual([]);
-  });
-});
-
-describe("analyzerTokens (standard)", () => {
-  const std = (text: string) => analyzerTokens(text, "standard");
+describe("analyzerTokens", () => {
+  const std = analyzerTokens;
 
   it("keeps an underscored identifier as one word and lowercases", () => {
     // UAX #29: the underscore (ExtendNumLet) joins letters, so `parse_config`
-    // is one token where ascii_lower makes two.
+    // is one token.
     expect(std("parse_config(Path)")).toEqual(["parse_config", "path"]);
     expect(std("foo_bar")).toEqual(["foo_bar"]);
   });
@@ -95,34 +65,10 @@ describe("analyzerTokens (standard)", () => {
 });
 
 describe("hasIndexableToken", () => {
-  it("depends on the analyzer", () => {
-    expect(hasIndexableToken("Süd", "ascii_lower")).toBe(false);
-    expect(hasIndexableToken("Süd", "standard")).toBe(true);
-    expect(hasIndexableToken("->", "ascii_lower")).toBe(false);
-    expect(hasIndexableToken("->", "standard")).toBe(false);
-    expect(hasIndexableToken("x", "ascii_lower")).toBe(true);
-  });
-});
-
-describe("analyzerOf", () => {
-  it("reads the recorded analyzer and defaults an absent one to the engine default", () => {
-    expect(analyzerOf(emptyManifest())).toBe("ascii_lower");
-    expect(analyzerOf({ ...emptyManifest(), analyzer: "standard" })).toBe("standard");
-    expect(analyzerOf({ ...emptyManifest(), analyzer: "ascii_lower" })).toBe("ascii_lower");
-  });
-
-  it("defaults an absent analyzer on a hosted manifest to the platform default, never the engine's", () => {
-    // A hosted table's bare column took the platform default (`standard`);
-    // reading it as `ascii_lower` would reject queries the index can serve.
-    expect(analyzerOf({ ...emptyManifest(), origin: "hosted" })).toBe("standard");
-    expect(analyzerOf({ ...emptyManifest(), origin: "hosted", analyzer: "ascii_lower" })).toBe("ascii_lower");
-  });
-
-  it("isAnalyzer accepts only the two engine names", () => {
-    expect(isAnalyzer("ascii_lower")).toBe(true);
-    expect(isAnalyzer("standard")).toBe(true);
-    expect(isAnalyzer("icu")).toBe(false);
-    expect(isAnalyzer(undefined)).toBe(false);
+  it("is true only when the analyzer keeps a token", () => {
+    expect(hasIndexableToken("Süd")).toBe(true);
+    expect(hasIndexableToken("x")).toBe(true);
+    expect(hasIndexableToken("->")).toBe(false);
   });
 });
 
@@ -136,10 +82,9 @@ describe("plainTerms", () => {
     expect(plainTerms("parse_config(Path).x")).toBe("parse_config(Path).x");
   });
 
-  it("does not change the token set under either analyzer", () => {
+  it("does not change the token set", () => {
     for (const text of ["git -C repo", "--max-files", 'say "hi there"', "x+y-z", "e-mail 3.14 don't"]) {
-      expect(analyzerTokens(plainTerms(text), "ascii_lower"), text).toEqual(analyzerTokens(text, "ascii_lower"));
-      expect(analyzerTokens(plainTerms(text), "standard"), text).toEqual(analyzerTokens(text, "standard"));
+      expect(analyzerTokens(plainTerms(text)), text).toEqual(analyzerTokens(text));
     }
   });
 });

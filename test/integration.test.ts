@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { connect } from "@infino-ai/infino";
 import { indexRepo, indexRepoStaged, syncRepo } from "../src/core/indexer.js";
-import { readManifest } from "../src/core/manifest.js";
-import { analyzerOf, analyzerTokens, cutFindMatches, find, plainTerms, readFiles, READ_LINES_CAP, runSql, search } from "../src/core/searcher.js";
+import { readManifest, writeManifest } from "../src/core/manifest.js";
+import { cutFindMatches, find, readFiles, READ_LINES_CAP, runSql, search } from "../src/core/searcher.js";
 import { TABLE } from "../src/core/config.js";
 import type { IndexHandle } from "../src/core/context.js";
 import type { Embedder } from "../src/core/embedder.js";
@@ -56,12 +56,14 @@ export function replayLog(): number { return 42; }
   // overlapping), so a line in the overlap lives in two chunks. Line 55 is in
   // windows 1-60 and 51-110; line 20 carries analyzer edge cases; lines 30
   // and 40 carry the engine's query-grammar characters as literal text; line
-  // 130 is longer than the excerpt cap with its marker past the cap.
+  // 70 holds an identifier inside a longer dotted token; line 130 is longer
+  // than the excerpt cap with its marker past the cap.
   const notes = Array.from({ length: 130 }, (_, i) => `filler ${i + 1}`);
   notes[19] = "parse_config(Path) ABC-123 x.y Süd ok";
   notes[29] = "run git -C repo status --max-files 5";
   notes[39] = 'log("hello wörld there")';
   notes[54] = "OVERLAP_MARK sits in two windows";
+  notes[69] = "self.reconcile_tombstone_seqs(ids)";
   notes[129] = "z".repeat(600) + " FAR_MARK " + "z".repeat(300);
   writeFileSync(join(root, "notes.txt"), notes.join("\n") + "\n");
   writeFileSync(join(root, ".gitignore"), "ignored.ts\n");
@@ -85,10 +87,6 @@ describe("indexing", () => {
     const m = handle.manifest;
     expect(m.files).toBe(4); // auth.ts, storage.ts, README.md, notes.txt (.gitignore is not indexable)
     expect(m.vectors).toBe("none");
-    // A local build goes through the binding's bare IndexSpec.fts, which the
-    // pinned engine indexes with its default analyzer; the manifest says so.
-    expect(m.analyzer).toBe("ascii_lower");
-    expect(analyzerOf(m)).toBe("ascii_lower");
     const rows = handle.db.querySql("SELECT DISTINCT path FROM chunks ORDER BY path") as Array<{ path: string }>;
     expect(rows.map((r) => r.path)).not.toContain("ignored.ts");
   });
@@ -100,15 +98,17 @@ describe("indexing", () => {
     expect(final.vectors).toBe("none");
   });
 
-  it("sync leaves the local index on the engine's analyzer whatever --analyzer says (that names the platform table's)", async () => {
-    // The local table is built through the binding's bare IndexSpec.fts and
-    // takes the engine default; the analyzer option describes the platform
-    // table, which this index has none of, so a sync is unaffected by it.
-    const out = await syncRepo({ root, db: handle.db, indexDirPath: dir, embedder: fakeEmbedder, analyzer: "standard" });
-    expect(out.action).toBe("noop");
-    expect(readManifest(dir)!.analyzer).toBe("ascii_lower");
-    const same = await syncRepo({ root, db: handle.db, indexDirPath: dir, embedder: fakeEmbedder });
-    expect(same.action).toBe("noop");
+  it("asks for a rebuild over an index from an older format", async () => {
+    // An older format's table may not open under this engine at all, so its
+    // manifest reads as absent and only a build replaces it.
+    const current = readManifest(dir)!;
+    writeManifest(dir, { ...current, version: current.version - 1 });
+    try {
+      const out = await syncRepo({ root, db: handle.db, indexDirPath: dir, embedder: fakeEmbedder });
+      expect(out).toEqual({ action: "rebuild-required", reason: "no prior index state" });
+    } finally {
+      writeManifest(dir, current);
+    }
   });
 });
 
@@ -243,36 +243,17 @@ describe("find", () => {
     expect(r.matches[0].text.startsWith("...")).toBe(true);
   });
 
-  it("agrees with the engine's analyzer on which chunks are candidates", () => {
-    // find hands the engine the query text (grammar characters blanked) and
-    // lets the index's own analyzer tokenize it. That must select the same
-    // chunks as the client's ascii_lower mirror, pre-tokenized and joined, or
-    // the mirror's "is there anything to look up" check would disagree with
-    // what the engine matches. Checked on the analyzer's edge cases:
-    // underscores and punctuation as separators, digits, a dropped non-ASCII
-    // run, and the engine's own query-grammar characters as literal text.
-    const table = handle.db.openTable(TABLE);
-    const analyzer = analyzerOf(handle.manifest);
-    const chunks = (rows: Array<Record<string, unknown>>) =>
-      rows.map((r) => `${r.path}:${r.start_line}`).sort();
-    for (const text of [
-      "parse_config(Path)",
-      "ABC-123 x.y",
-      "Süd ok",
-      "Session(",
-      "session record",
-      "git -C repo",
-      "--max-files 5",
-      '"hello wörld there"',
-    ]) {
-      const viaEngine = table.tokenMatch("content", plainTerms(text), { mode: "and", projection: ["path", "start_line"] });
-      const viaMirror = table.tokenMatch("content", analyzerTokens(text, analyzer).join(" "), {
-        mode: "and",
-        projection: ["path", "start_line"],
-      });
-      expect(viaEngine.length, text).toBeGreaterThan(0);
-      expect(chunks(viaMirror), text).toEqual(chunks(viaEngine));
-    }
+  it("finds an identifier inside a longer token", async () => {
+    // `standard` indexes `self.reconcile_tombstone_seqs` as one token; the
+    // candidate step matches substrings, so the shorter identifier reaches it.
+    const at = (r: Awaited<ReturnType<typeof find>>) => r.matches.map((m) => `${m.path}:${m.line}`);
+    expect(at(await find(handle, "reconcile_tombstone_seqs"))).toEqual(["notes.txt:70"]);
+    expect(at(await find(handle, "tombstone_seqs(ids"))).toEqual(["notes.txt:70"]);
+    // Case-sensitive unless asked: the candidates are case-insensitive, the literal check is not.
+    expect(at(await find(handle, "RECONCILE_tombstone_seqs"))).toEqual([]);
+    expect(at(await find(handle, "RECONCILE_tombstone_seqs", { ignoreCase: true }))).toEqual(["notes.txt:70"]);
+    // A non-ASCII word is a candidate too, through the engine's verified path.
+    expect(at(await find(handle, "Süd ok"))).toEqual(["notes.txt:20"]);
   });
 
   it("treats the engine's query-grammar characters as literal text", async () => {
@@ -363,22 +344,10 @@ describe("find", () => {
     expect(cutFindMatches(rows, 500).matches.length).toBe(50);
   });
 
-  it("refuses a query the index cannot look up, naming the index's analyzer", async () => {
-    await expect(find(handle, "->")).rejects.toThrow(/ascii_lower analyzer keeps none/);
-    // Under ascii_lower a non-ASCII word is not indexed either.
-    await expect(find(handle, "Süd")).rejects.toThrow(/ascii_lower analyzer keeps none/);
+  it("refuses a query the index cannot look up", async () => {
+    await expect(find(handle, "->")).rejects.toThrow(/analyzer keeps none/);
     await expect(find(handle, "a\nb")).rejects.toThrow(/newline/);
     await expect(find(handle, "")).rejects.toThrow(/non-empty/);
-  });
-
-  it("takes the analyzer from the manifest", async () => {
-    // A handle whose manifest records `standard` would accept `Süd`: the
-    // rejection is decided by the recorded analyzer, not a built-in rule. (The
-    // fixture table is ascii_lower, so the engine finds no candidates - the
-    // point is that the client no longer refuses the query.)
-    const std = { ...handle, manifest: { ...handle.manifest, analyzer: "standard" as const } };
-    expect((await find(std, "Süd")).total).toBe(0);
-    await expect(find(std, "->")).rejects.toThrow(/standard analyzer keeps none/);
   });
 });
 

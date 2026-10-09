@@ -134,10 +134,6 @@ hostedOptions(
     )
     .option("--json", "machine-readable stats"),
 )
-  .option(
-    "--analyzer <ascii_lower|standard>",
-    "FTS analyzer the platform table is created with (default ascii_lower: splits code identifiers on . _ and ::)",
-  )
   .action(async (path: string | undefined, opts: IndexCmdOptions & HostedFlags) => {
     applyHosted(opts, resolveRoot(path));
     await indexCmd(path, opts);

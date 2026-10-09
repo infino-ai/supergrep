@@ -32,14 +32,9 @@ import { TABLE, DEFAULT_SEARCH_K, DEFAULT_FIND_LIMIT, MAX_FIND_LIMIT } from "./c
 import type { Embedder } from "./embedder.js";
 import type { Manifest } from "./manifest.js";
 import type { HostedDb, RowRecord } from "./hosted.js";
-import { analyzerOf, analyzerTokens, hasIndexableToken, PLATFORM_DEFAULT_ANALYZER, type Analyzer } from "./analyzer.js";
+import { analyzerTokens, hasIndexableToken } from "./analyzer.js";
 import { rowHit, sqlIdentifier, sqlLiteral, type TableShape } from "./table-shape.js";
 
-// The analyzer mirror is re-exported from the door that uses it: `find`
-// decides what the index can look up with `analyzerOf(handle.manifest)`, and
-// the analyzer is always named - there is no default, because which one a
-// table has depends on where the table lives (see analyzer.ts).
-export { analyzerOf, analyzerTokens };
 
 // The chunks table's text column lives with its vector column (context.ts);
 // it is re-exported here because every door reaches for it as the searcher's.
@@ -169,11 +164,10 @@ const PROJECTION = ["path", "start_line", "end_line", "lang", "symbol", "content
 // server). `sql` sends the statement the caller actually wrote, so nothing
 // renders one here any more.
 
-/** The query's terms and the analyzer that made them, for a search that
- * returns its hits as matching lines (`SearchOptions.lines`). */
+/** The query's terms, for a search that returns its hits as matching lines
+ * (`SearchOptions.lines`). */
 interface LineFocus {
   terms: readonly string[];
-  analyzer: Analyzer;
 }
 
 /** A chunk cut to the lines that carry a term of the query, each with
@@ -193,11 +187,10 @@ interface LineFocus {
  * `find` returns a matched line rather than its chunk for the same reason;
  * this is that idea inside a ranked result.
  *
- * Which lines match is decided by the index's own analyzer: a line carries a
- * term when the analyzer's tokens of the line include one of the analyzer's
- * tokens of the query, so `parse_config(` matches a query naming `config`
- * under `ascii_lower` and does not under `standard`, exactly as the keyword
- * half of the search itself would have matched it. No stopword list: the
+ * Which lines match is decided by the index's analyzer: a line carries a
+ * term when its tokens include one of the query's, so `parse_config(` does
+ * not match a query naming `config`, exactly as the keyword half of the
+ * search itself would not have matched it. No stopword list: the
  * terms are the caller's, and a term on every line selects every line.
  *
  * A chunk none of whose lines carries a term ranked on meaning alone. It comes
@@ -218,7 +211,7 @@ export function focusLines(
   const keep = new Set<number>();
   let matchedLines = 0;
   for (let i = 0; i < lines.length; i++) {
-    if (!analyzerTokens(lines[i], focus.analyzer).some((t) => wanted.has(t))) continue;
+    if (!analyzerTokens(lines[i]).some((t) => wanted.has(t))) continue;
     matchedLines += 1;
     for (let j = Math.max(0, i - LINE_CONTEXT); j <= Math.min(lines.length - 1, i + LINE_CONTEXT); j++) keep.add(j);
   }
@@ -281,10 +274,10 @@ function toHit(r: Record<string, unknown>, focus?: LineFocus): SearchHit {
   };
 }
 
-/** The line focus for a query against a table of the given analyzer, or
- * undefined when the search returns whole chunks. */
-function lineFocus(opts: SearchOptions, query: string, analyzer: Analyzer): LineFocus | undefined {
-  return opts.lines ? { terms: analyzerTokens(query, analyzer), analyzer } : undefined;
+/** The line focus for a query, or undefined when the search returns whole
+ * chunks. */
+function lineFocus(opts: SearchOptions, query: string): LineFocus | undefined {
+  return opts.lines ? { terms: analyzerTokens(query) } : undefined;
 }
 
 /** `search` against the HOSTED index: the platform fuses both legs and embeds
@@ -298,20 +291,15 @@ function lineFocus(opts: SearchOptions, query: string, analyzer: Analyzer): Line
  * No `partial` either. That marker means the LOCAL index skipped files over
  * its size cap; what the hosted table holds was decided when it was loaded,
  * and this caller has no way to know it. Reporting the local index's
- * completeness beside hosted hits would be a claim about the wrong index.
- *
- * `analyzer` is the hosted table's, for cutting hits to their matching lines
- * (`lines`): this side has no manifest of that table in hand, so the caller
- * names it, and a caller that cannot gets the platform's default for a bare
- * column. */
+ * completeness beside hosted hits would be a claim about the wrong index. */
 export async function searchHosted(
   hosted: { hybridSearch: (t: string, tf: string, vf: string, q: string, k: number, p: string[]) => Promise<Array<Record<string, unknown>>> },
   query: string,
   k = DEFAULT_SEARCH_K,
-  opts: SearchOptions & { analyzer?: Analyzer } = {},
+  opts: SearchOptions = {},
 ): Promise<SearchResult> {
   const rows = await hosted.hybridSearch(TABLE, CONTENT_COLUMN, EMBEDDING_COLUMN, query, k, PROJECTION);
-  const focus = lineFocus(opts, query, opts.analyzer ?? PLATFORM_DEFAULT_ANALYZER);
+  const focus = lineFocus(opts, query);
   return { query, ranking: "hybrid", hits: rows.map((r) => toHit(r, focus)) };
 }
 
@@ -339,7 +327,7 @@ export async function search(
   const rows: Array<Record<string, unknown>> = leg
     ? table.hybridSearch(CONTENT_COLUMN, query, EMBEDDING_COLUMN, leg, k, { projection: PROJECTION })
     : table.bm25Search(CONTENT_COLUMN, query, k, { projection: PROJECTION });
-  const focus = lineFocus(opts, query, analyzerOf(handle.manifest));
+  const focus = lineFocus(opts, query);
   return {
     query,
     ranking,
@@ -356,19 +344,14 @@ export async function search(
 
 // --- find -------------------------------------------------------------------
 //
-// Two steps. The index's token match narrows to the chunks that contain every
-// token of the query - an inverted-list intersection, no scoring, no top-k -
-// then the literal is verified line by line inside those chunks. The analyzer
-// splits identifiers (`ascii_lower` indexes `parse_config` as `parse` and
-// `config`), so the first step alone would over-match; the second makes every
-// hit a real occurrence of the exact text, and grep's line-based,
-// case-sensitive semantics fall out of it.
-//
-// The query goes to the engine as text, not pre-tokenized: the engine
-// tokenizes it with the index's own analyzer, so the candidate set is exact
-// for whichever analyzer the table has (a client mirror of the Unicode
-// `standard` rules could drift, e.g. on CJK segmentation). What the client
-// does strip is the engine's *query grammar* - see plainTerms below.
+// Two steps. The index narrows to the chunks that hold every token of the
+// query as a case-insensitive substring - `content ILIKE '%token%'` per token,
+// which the engine answers from its term dictionary for an ASCII token, no
+// scoring - then the literal is verified line by line inside those chunks. A substring,
+// not a token match: `standard` keeps `self.reconcile_tombstone_seqs` as one
+// token, and a find for `reconcile_tombstone_seqs` must still reach it. The
+// second step makes every hit a real occurrence of the exact text, and grep's
+// line-based, case-sensitive semantics fall out of it.
 
 export interface FindMatch {
   path: string;
@@ -560,8 +543,8 @@ const FIND_PROJECTION = ["path", "start_line", "symbol", "content"];
  * negation-only and errors), and `"` opens a phrase (whose adjacency check
  * fails across a token the analyzer drops). A find query is a literal, never
  * a boolean expression, so every one of them becomes a space before the
- * engine sees the query. All three are separators under both analyzers
- * (hyphen splits words in UAX #29 too), so the tokens are unchanged. */
+ * engine sees the query. All three are separators under UAX #29, so the
+ * tokens are unchanged. */
 const QUERY_GRAMMAR_CHARS = /["+-]/g;
 
 /** `query` with the engine's query-grammar characters blanked, so the engine
@@ -698,20 +681,20 @@ export function normalizeUnder(under: string | undefined): string | undefined {
 }
 
 /** What every find - over chunks or over rows - refuses before it asks the
- * index: an empty query, a query spanning lines, one the index's analyzer
- * keeps no token from (it would match nothing and read as "no occurrences"
- * rather than "cannot look this up"), and a malformed limit (rejected rather
+ * index: an empty query, a query spanning lines, one the analyzer keeps no
+ * token from (it would match nothing and read as "no occurrences" rather
+ * than "cannot look this up"), and a malformed limit (rejected rather
  * than clamped: NaN would slice to nothing and report nothing, which reads as
  * "no matches"). Returns the limit to apply. `column` names the searched
  * column in the message's sql suggestion. */
-function checkFindQuery(query: string, analyzer: Analyzer, column: string, limit: number | undefined): number {
+function checkFindQuery(query: string, column: string, limit: number | undefined): number {
   if (query.length === 0) throw new Error("find needs a non-empty string to look for");
   if (/[\r\n]/.test(query)) {
     throw new Error("find matches within a single line - the query must not contain a newline");
   }
-  if (!hasIndexableToken(query, analyzer)) {
+  if (!hasIndexableToken(query)) {
     throw new Error(
-      `find needs at least one word or number the index can look up, and its ${analyzer} analyzer keeps ` +
+      "find needs at least one word or number the index can look up, and its analyzer keeps " +
         "none from this query (only punctuation, or text it does not index) - try search, or sql with " +
         `regexp_like(${column}, ...)`,
     );
@@ -722,16 +705,25 @@ function checkFindQuery(query: string, analyzer: Analyzer, column: string, limit
   return Math.min(limit ?? DEFAULT_FIND_LIMIT, MAX_FIND_LIMIT);
 }
 
+/** The chunks holding every token of `query` as a case-insensitive substring.
+ * Each needle is one whole `standard` token with its LIKE wildcards escaped,
+ * the shape the engine answers exactly from its term dictionary. */
+function findCandidatesSql(query: string): string {
+  const needles = analyzerTokens(query).map(
+    (token) => `${sqlIdentifier(CONTENT_COLUMN)} ILIKE ${sqlLiteral(`%${token.replace(/[\\%_]/g, "\\$&")}%`)}`,
+  );
+  return `SELECT ${FIND_PROJECTION.map(sqlIdentifier).join(", ")} FROM ${sqlIdentifier(TABLE)} WHERE ${needles.join(" AND ")}`;
+}
+
 /** Async so a rejected validation surfaces as a rejection like every other
  * door's; the engine call underneath is synchronous. */
 export async function find(handle: IndexHandle, query: string, opts: FindOptions = {}): Promise<FindResult> {
-  const limit = checkFindQuery(query, analyzerOf(handle.manifest), CONTENT_COLUMN, opts.limit);
+  const limit = checkFindQuery(query, CONTENT_COLUMN, opts.limit);
   const ignoreCase = opts.ignoreCase ?? false;
   const context = Math.min(Math.max(0, Math.trunc(opts.context ?? 0)), MAX_FIND_CONTEXT);
   const partial = partialIndex(handle.manifest);
 
-  const terms = plainTerms(query);
-  const candidates = localDb(handle).openTable(TABLE).tokenMatch(CONTENT_COLUMN, terms, { mode: "and", projection: FIND_PROJECTION });
+  const candidates = localDb(handle).querySql(findCandidatesSql(query));
 
   // Fixed-window chunks overlap, so one line can arrive in two chunks; key by path:line.
   const seen = new Set<string>();
@@ -1059,9 +1051,7 @@ export function findRowsSql(shape: TableShape, terms: string, limit: number): st
  * every token of `query`, matched by the index's own analyzer. Token
  * semantics, not grep's: a code chunk can be checked line by line for the
  * literal afterwards, but a row is one long text with no line to cite, so
- * the index's answer is the answer. The analyzer named in a refusal is the
- * platform's default for a bare column; both analyzers agree on whether a
- * query holds a token at all. */
+ * the index's answer is the answer. */
 export async function findRows(
   hosted: Pick<HostedDb, "querySql">,
   shape: TableShape,
@@ -1069,7 +1059,7 @@ export async function findRows(
   opts: { limit?: number } = {},
 ): Promise<RowFindResult> {
   if (shape.primaryText === "") throw new Error(`${shape.table} has no text column to match in`);
-  const limit = checkFindQuery(query, PLATFORM_DEFAULT_ANALYZER, shape.primaryText, opts.limit);
+  const limit = checkFindQuery(query, shape.primaryText, opts.limit);
   const rows = await hosted.querySql(findRowsSql(shape, plainTerms(query), limit));
   const total = rows.length > 0 ? Number(rows[0][FIND_TOTAL_COLUMN]) : 0;
   const matches = rows.map(({ [FIND_TOTAL_COLUMN]: _total, ...row }) => rowHit(row, shape));
