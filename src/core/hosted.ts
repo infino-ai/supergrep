@@ -177,7 +177,7 @@ export interface JsonColumn {
 }
 
 export interface HostedIndexes {
-  fts: Array<{ column: string; analyzer?: string }>;
+  fts: Array<{ column: string }>;
   vector?: Array<{ column: string; metric: "cosine" | "l2sq" | "negdot" }>;
 }
 
@@ -363,14 +363,13 @@ export class HostedDb {
     return this.parseJson(exchange, "schema") as RowRecord;
   }
 
-  /** `POST /v1/create_table/{db}`: `{table_name, schema, indexes}`. A bare
-   * `{column}` fts entry takes the platform's default analyzer (`standard`). */
+  /** `POST /v1/create_table/{db}`: `{table_name, schema, indexes}`. */
   async createTable(table: string, columns: JsonColumn[], indexes: HostedIndexes): Promise<void> {
     const body: RowRecord = {
       table_name: table,
       schema: columns.map(toSchemaField),
       indexes: {
-        fts: indexes.fts.map((f) => (f.analyzer === undefined ? { column: f.column } : { column: f.column, analyzer: f.analyzer })),
+        fts: indexes.fts.map((f) => ({ column: f.column })),
         ...(indexes.vector ? { vector: indexes.vector.map((v) => ({ column: v.column, metric: v.metric })) } : {}),
       },
     };

@@ -67,7 +67,6 @@ import {
   hostedTarget,
   hostedAccount,
   hostedLabel,
-  hostedAnalyzer,
   embedProvider,
   autoIndexEnabled as autoIndexSetting,
   autoSyncEnabled as autoSyncSetting,
@@ -84,7 +83,7 @@ import { keyFilePath, readStoredAccount } from "../core/keystore.js";
 import { createDatabase } from "../core/account-api.js";
 import { runRetrievalAgent } from "../core/retrieval-agent.js";
 import { answerDisplayMode, hookDeliveryText, relayDeliveryText, type AnswerDisplay } from "../core/answer-display.js";
-import { readManifest, readPlatformManifest, type Manifest } from "../core/manifest.js";
+import { readManifest, type Manifest } from "../core/manifest.js";
 
 /** The one refusal whose fix is a person rather than a retry: the account has
  * nothing left to spend. It names the account to add the card to - this same
@@ -162,7 +161,6 @@ import { budgetSqlRows, foldValidationFacts, rankRows, sqlBudgetHint } from "../
 import { HostedError, type HostedOptions, type RowRecord } from "../core/hosted.js";
 import { RetrievalRecord } from "../core/retrieval-record.js";
 import {
-  analyzerOf,
   find,
   findRows,
   search,
@@ -1048,16 +1046,14 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * two are written together, so no path here ever writes one without the
    * other. CX_NO_EMBED means keyword-only in both places, as --no-embed does
    * on the CLI: with no local embedder, the `local` provider gives the
-   * platform table no embedding column either. The analyzer is passed only
-   * when a flag named one; otherwise a build keeps the table's own. */
-  const analyzer = hostedAnalyzer();
-  const indexTargets = (ctx: RepoCtx): Pick<IndexOptions, "root" | "db" | "hosted" | "indexDirPath" | "embedProvider" | "analyzer" | "caps"> => ({
+   * platform table no embedding column either. */
+  const indexTargets = (ctx: RepoCtx): Pick<IndexOptions, "root" | "db" | "hosted" | "indexDirPath" | "embedProvider" | "caps"> => ({
     root: ctx.root,
     db: localDb(ctx),
     indexDirPath: ctx.dir,
     caps: DEFAULT_CAPS,
     ...(ctx.hosted
-      ? { hosted: ctx.hosted, embedProvider: noEmbed ? "local" : embedProvider(), ...(analyzer !== undefined ? { analyzer } : {}) }
+      ? { hosted: ctx.hosted, embedProvider: noEmbed ? "local" : embedProvider() }
       : {}),
   });
 
@@ -1899,12 +1895,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       if (notReady) return notReady;
       try {
         const t0 = performance.now();
-        // The hosted table's analyzer decides which lines carry a term
-        // (`lines`): the platform manifest this machine wrote when it loaded
-        // the table records it; a table loaded some other way is read with
-        // the platform's default for a bare column, as analyzerOf says.
-        const hostedAnalyzer = analyzerOf(readPlatformManifest(ctx.dir) ?? { origin: "hosted" });
-        const result = await searchHosted(ctx.hosted, query, k, { lines, analyzer: hostedAnalyzer });
+        const result = await searchHosted(ctx.hosted, query, k, { lines });
         recordOf(ctx).addPlaces(TABLE, result.hits);
         let usage: string | undefined;
         if (receiptOn) {

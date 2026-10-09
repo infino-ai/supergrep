@@ -77,7 +77,6 @@ that touch it, `cx index` and `cx mcp`:
 | `--db <url>` | the directory's own database on the stored account; the local index alone without one | the platform database, `https://host/<database>` (plain `http://` only for localhost) |
 | `--api-key-file <path>` | `INFINO_API_KEY` | file holding the bearer key. The key is never an argument, since a process's arguments are visible to every other process on the machine; the environment variable is the one alternative |
 | `--embed-provider <platform\|local>` | `platform` | who fills the platform table's vectors: the platform's own model, or this machine's (vectors shipped with the rows) |
-| `--analyzer <ascii_lower\|standard>` | the table's own; `ascii_lower` for a first load | `cx index` only: the full-text analyzer the platform table is created with. `ascii_lower` splits code identifiers on `.`, `_`, and `::`. Without the flag a rebuild keeps the analyzer the table has; naming a different one rebuilds it |
 | `--db-timeout-ms <n>` | 60000 | per-request timeout |
 | `--cold-start-secs <n>` | 120 | how long to keep retrying while the database is not yet ready, before giving up |
 | `--subagent-max-turns`, `--subagent-max-wall-secs`, `--subagent-k` | 4, 120, 10 | `cx mcp` only: turn and wall-clock caps for one `ask` call, and how many facts a call returns |
@@ -125,7 +124,7 @@ cx sql <statement>        read-only SQL; --embed q="text" fills {{q}}
 cx status                 what the index holds, how fresh, vector readiness
 cx usage                  ledger of queries run and what each returned  (-n, --all, --clear, --json)
 cx mcp                    serve the MCP tools over stdio
-cx index --db <url>       also keep the index on an Infino platform database  (--api-key-file, --embed-provider, --analyzer)
+cx index --db <url>       also keep the index on an Infino platform database  (--api-key-file, --embed-provider)
 cx mcp --db <url>         also serve ask over that copy                    (--api-key-file, the ask caps)
 ```
 

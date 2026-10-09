@@ -50,8 +50,8 @@ exact `path:line` places with the code, plus counts and rankings - for the
 coding agent to compose from, never a written summary. By default the
 platform embeds its copy with its own model. Every platform setting is a
 command-line flag on `cx index` and `cx mcp` (`--db`, `--api-key-file`,
-`--embed-provider`, `--analyzer`, the timeouts, the tool caps); the key
-comes from a file or from `INFINO_API_KEY`, never from the command line.
+`--embed-provider`, the timeouts, the tool caps); the key comes from a file
+or from `INFINO_API_KEY`, never from the command line.
 [The reference's flag table](reference.md#platform-flags) has every one.
 
 ### How fast is it usable after indexing starts?
