@@ -120,9 +120,8 @@ export interface HostedFlags {
   subagentMaxTurns?: string;
   subagentMaxWallSecs?: string;
   subagentK?: string;
-  /** `cx mcp --sign-in <url>`: the server over HTTP with sign-in. The
-   * process then holds no key of its own - every session brings the key of
-   * the account it signed in with - so `--db` names the platform alone. */
+  /** `cx mcp --sign-in <url>`: each session brings its own key, so `--db`
+   * names the platform alone. */
   signIn?: string;
 }
 
@@ -200,6 +199,7 @@ export function hostedSettingsFromFlags(
   let database: string;
   let apiKey: string;
   let account: AccountSettings | undefined;
+  if (flags.signIn !== undefined && (flags.db === undefined || flags.db === "")) throw new Error("--sign-in needs --db <url>: the platform the accounts are on");
   if (flags.db === undefined || flags.db === "") {
     const stored = fallback.accountRoot !== undefined ? (fallback.storedAccount ?? readStoredAccount)() : undefined;
     const key = stored?.uploadConsentAt !== undefined ? (env[API_KEY_ENV] ?? storedKey() ?? "") : "";
@@ -214,9 +214,7 @@ export function hostedSettingsFromFlags(
     account = { baseUrl, apiKey };
   } else {
     ({ baseUrl, database } = parseHostedUrl(flags.db));
-    // With sign-in, no key is this process's: each session's calls carry
-    // the key of the account that signed in, and one found in a file or the
-    // environment is not used either, so no session can run on it.
+    // With sign-in the process holds no key, not even one it could find.
     apiKey =
       flags.signIn !== undefined
         ? ""

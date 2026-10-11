@@ -172,7 +172,7 @@ The same server runs over Streamable HTTP, as one URL that claude.ai, Claude Des
 cx mcp --http 9121 --db https://<platform> --sign-in https://<host>/.well-known/oauth-protected-resource/mcp
 ```
 
-`--sign-in` is the resource server's half of sign-in as the MCP clients do it (OAuth 2.1): every call must carry an Infino account's key as its bearer token, and a call with none - or with a key the platform refuses - is answered 401 naming that metadata URL, which is what makes the client sign the person in. The authorization server the metadata names is the deployment's, not this process: it is what shows the person a page and hands the client a key (Infino's demo hands each connection a free trial account, the same kind `cx login --platform` gets you). Every call then runs on that account: `tables`, `hydrate`, `sql` and the rest over its own databases, and revoking the key in Infino ends the connection. The process holds no key of its own. Without `--sign-in`, every session runs on the one account the process was started with, the shape for a URL shared with no sign-in (add `--read-only`).
+With `--sign-in`, every call carries an Infino account's key, and a call with none is told where to sign in (the OAuth resource metadata at that URL), which is how Claude knows to sign the person in. Every call then runs on that account's own databases. Without it, every session runs on the one account the process was started with (add `--read-only` for a URL shared with no sign-in).
 
 ## Indexing from object storage
 

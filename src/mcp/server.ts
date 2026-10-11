@@ -1334,16 +1334,19 @@ export interface ServeOptions {
   hostedOptions?: HostedOptions;
   /** Offer no tool that writes (`readOnlyEnabled` when absent). */
   readOnly?: boolean;
-  /** The key this server's platform calls carry, in place of the one the
-   * process was configured with: the server over HTTP with sign-in, where
-   * each session is one person's account and the process has no key of
-   * its own. The platform stays the configured one. */
+  /** The key this session's platform calls carry instead of the configured
+   * one (the server over HTTP with sign-in). */
   apiKey?: string;
+  /** Whether hydrate may read files on the machine this server runs on
+   * (kinds path and ssh). False over HTTP, where that machine is not the
+   * caller's: its files are the server's own. */
+  hostFiles?: boolean;
 }
 
 export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {}): Promise<void> {
   const { hostedOptions } = serveOptions;
   const readOnly = serveOptions.readOnly ?? readOnlyEnabled();
+  const hostFiles = serveOptions.hostFiles ?? true;
   const defaultRoot = resolveRoot(rootPath);
 
   // The platform database (--db <url>), when one is configured: the default
@@ -1351,14 +1354,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // beside the local index and read by the `ask` tool.
   // Resolved once here - a bad URL or a missing key fails the server at
   // startup, not on the first tool call. The key stays inside the target;
-  // only `hostedLabel` ever reaches a log line. A session's own key, when
-  // the server was given one, replaces the configured key and nothing else.
+  // only `hostedLabel` ever reaches a log line.
   const configured = hostedTarget();
   const hosted = configured !== null && serveOptions.apiKey !== undefined ? { ...configured, apiKey: serveOptions.apiKey } : configured;
   // The account the target came from, when no --db named a database: then
   // every repository a session opens gets its own database on it (see
-  // RepoRegistry), registered here before its first build. Never with a
-  // session's own key: that account registers nothing from here.
+  // RepoRegistry), registered here before its first build.
   const account = serveOptions.apiKey !== undefined ? null : hostedAccount();
 
   const noEmbed = Boolean(process.env.CX_NO_EMBED);
@@ -1841,8 +1842,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       "database before a JOIN), search and find with table, ask with tables or none for the whole database.\n" +
       (readOnly
         ? ""
-        : "- hydrate - load a dataset into a database of the account, from a bucket, from files on this machine (path) " +
-          "or on a machine reached by ssh; hydrate_status follows the load, hydrate_cancel stops it. Only when asked.\n")
+        : "- hydrate - load a dataset into a database of the account, from a bucket" +
+          (hostFiles ? ", from files on this machine (path) or on a machine reached by ssh" : "") +
+          "; hydrate_status follows the load, hydrate_cancel stops it. Only when asked.\n")
     : "";
   // How the `answer` tool delivers the written answer: through the hook `cx
   // install` wrote (the entry sets CX_ANSWER_DISPLAY), or as text the model
@@ -3051,7 +3053,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     /** The sources `hydrate` takes, flat so a model fills one shape: the
      * kind, and the fields the kind reads. */
     const SOURCE_KINDS = ["bucket", "prefix", "path", "ssh"] as const;
+    const OFFERED_KINDS = hostFiles ? SOURCE_KINDS : (["bucket", "prefix"] as const);
     const sourceOf = (given: { kind: (typeof SOURCE_KINDS)[number]; bucket?: string; prefix?: string; path?: string; host?: string }): HydrateToolSource => {
+      if (!(OFFERED_KINDS as readonly string[]).includes(given.kind)) throw new Error(`kind ${given.kind} reads this server's own machine, which is not yours; load from a bucket`);
       switch (given.kind) {
         case "bucket":
           if (!given.bucket) throw new Error("a bucket source names the bucket");
@@ -3076,9 +3080,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         description:
           "Load a dataset into a table of a database of the Infino account, from wherever it is: a bucket " +
           "prefix in object storage the platform reads itself (kind bucket, the platform's identity granted " +
-          "read on it), a prefix already under the database's own storage (kind prefix), a file or directory " +
-          "on this machine (kind path), or one on a machine this machine reaches with ssh (kind ssh, host as " +
-          "ssh resolves it) - the files are then put into the database's storage first and loaded from there. " +
+          "read on it)" +
+          (hostFiles
+            ? ", a prefix already under the database's own storage (kind prefix), a file or directory " +
+              "on this machine (kind path), or one on a machine this machine reaches with ssh (kind ssh, host as " +
+              "ssh resolves it) - the files are then put into the database's storage first and loaded from there. "
+            : " or a prefix already under the database's own storage (kind prefix). ") +
           "Parquet, CSV, NDJSON and Iceberg are read by their extension (format auto); documents (PDF, text) " +
           "with format documents. fts names the columns to index for search and find, embed the column to " +
           "embed and the text columns it embeds; left out, the platform picks from the data. The database is " +
@@ -3088,7 +3095,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         inputSchema: {
           database: z.string().min(1).describe("The database to load into; registered on the account if new."),
           table: z.string().min(1).optional().describe("The table to load. Absent, one table per folder of the source, each named after its folder."),
-          kind: z.enum(SOURCE_KINDS).describe("Where the data is: bucket, prefix (under the database's storage), path (this machine), ssh (a machine reached by ssh)."),
+          kind: z.enum(OFFERED_KINDS).describe(hostFiles ? "Where the data is: bucket, prefix (under the database's storage), path (this machine), ssh (a machine reached by ssh)." : "Where the data is: bucket, or prefix (under the database's storage)."),
           bucket: z.string().optional().describe("kind bucket: the bucket's name."),
           prefix: z.string().optional().describe("kind bucket: the key prefix inside it (empty for the whole bucket); kind prefix: the prefix under the database's root."),
           path: z.string().optional().describe("kind path or ssh: the file or directory."),

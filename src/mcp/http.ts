@@ -15,20 +15,19 @@
 // another's: the registry, the data plane and the receipts are the
 // session's.
 //
-// Two shapes. Without `signIn`, every session runs on the account this
-// process was started with - a URL shared with no sign-in, over one
-// database. With `signIn` (mcp/sign-in.ts), every call must carry a bearer
-// token, which is an Infino account's key, and the session the call opens
-// runs on that account; a call with no token, or one the platform refuses,
-// is answered 401 naming where to sign in, which is what makes the client
-// start that flow. The sign-in itself is the deployment's authorization
-// server, not this process.
+// With `signIn`, every call must carry an Infino account's key as its
+// bearer token, and the session it opens runs on that account. A call with
+// none, or with a key the platform refuses, is answered 401 naming the
+// OAuth resource metadata, which is what makes a client sign the person in.
+// The sign-in itself is the deployment's, not this process.
 
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { SignIn, type SignInSettings } from "./sign-in.js";
+import { listDatabases } from "../core/account-api.js";
+import { hostedTarget } from "../core/config.js";
+import { HostedError } from "../core/hosted.js";
 import { serveMcp, type ServeOptions } from "./server.js";
 
 /** Where the server listens when nothing says otherwise: loopback, since a
@@ -56,6 +55,7 @@ const JSONRPC_SESSION_NOT_FOUND = -32001;
 const JSONRPC_INVALID_REQUEST = -32600;
 const JSONRPC_UNAUTHORIZED = -32001;
 const JSONRPC_UNAVAILABLE = -32002;
+const BEARER = /^Bearer\s+(\S+)$/i;
 
 export interface HttpServeOptions extends Pick<ServeOptions, "hostedOptions" | "readOnly"> {
   /** The port to listen on; 0 takes a free one (tests). */
@@ -64,10 +64,9 @@ export interface HttpServeOptions extends Pick<ServeOptions, "hostedOptions" | "
   path?: string;
   /** Idle time before a session is closed (SESSION_IDLE_MS). */
   idleMs?: number;
-  /** Sign-in: every call carries an account's key, and a call without one
-   * is told where to sign in (mcp/sign-in.ts). Absent, every session runs
-   * on the configured account. */
-  signIn?: SignInSettings;
+  /** Sign-in: the URL of the OAuth resource metadata a call with no key is
+   * pointed at. Absent, every session runs on the configured account. */
+  signIn?: string;
 }
 
 /** What `serveHttp` hands back: where it listens, and how to stop it. */
@@ -83,9 +82,9 @@ export interface HttpServed {
 interface Session {
   transport: StreamableHTTPServerTransport;
   lastSeen: number;
-  /** The bearer the session was opened with, which every later call must
+  /** The key the session was opened with, which every later call must
    * carry again; absent without sign-in. */
-  token?: string;
+  key?: string;
 }
 
 /** A JSON-RPC error answer with no request id, for a request that reached
@@ -120,33 +119,34 @@ export async function serveHttp(rootPath: string | undefined, opts: HttpServeOpt
   const path = opts.path ?? DEFAULT_HTTP_PATH;
   const idleMs = opts.idleMs ?? SESSION_IDLE_MS;
   const sessions = new Map<string, Session>();
-  const signIn = opts.signIn ? new SignIn(opts.signIn) : null;
+  // Over HTTP this machine is the server's, not the caller's: hydrate never
+  // reads its files.
   const serveOptions: Omit<ServeOptions, "transport"> = {
+    hostFiles: false,
     ...(opts.hostedOptions ? { hostedOptions: opts.hostedOptions } : {}),
     ...(opts.readOnly !== undefined ? { readOnly: opts.readOnly } : {}),
   };
+  const platform = hostedTarget()?.baseUrl;
+  if (opts.signIn !== undefined && platform === undefined) throw new Error("sign-in needs --db <url>: the platform the accounts are on");
+  /** The answer that starts a sign-in: the client reads where from the header. */
+  const signIn = (res: ServerResponse, message: string): void =>
+    refuse(res, 401, JSONRPC_UNAUTHORIZED, message, { "www-authenticate": `Bearer resource_metadata="${opts.signIn}"` });
 
   /** A session's server and transport, registered once the transport has
    * answered the initialize request with the session's id. With sign-in,
-   * the session runs on the account `token` is the key of. */
-  const open = async (token: string | undefined): Promise<StreamableHTTPServerTransport> => {
+   * the session runs on the account `key` belongs to. */
+  const open = async (key: string | undefined): Promise<StreamableHTTPServerTransport> => {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (id) => {
-        sessions.set(id, { transport, lastSeen: Date.now(), ...(token !== undefined ? { token } : {}) });
+        sessions.set(id, { transport, lastSeen: Date.now(), ...(key !== undefined ? { key } : {}) });
       },
       onsessionclosed: (id) => {
         sessions.delete(id);
       },
     });
-    await serveMcp(rootPath, { ...serveOptions, ...(token !== undefined ? { apiKey: token } : {}), transport });
+    await serveMcp(rootPath, { ...serveOptions, ...(key !== undefined ? { apiKey: key } : {}), transport });
     return transport;
-  };
-
-  /** The 401 that starts a sign-in: the client reads where to go from the
-   * header. */
-  const askToSignIn = (res: ServerResponse, message: string): void => {
-    refuse(res, 401, JSONRPC_UNAUTHORIZED, message, { "www-authenticate": signIn!.challenge() });
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -161,16 +161,11 @@ export async function serveHttp(rootPath: string | undefined, opts: HttpServeOpt
       res.end();
       return;
     }
-    // With sign-in, the token first, on every call: a session is one
-    // account's, and a call that carries another's (or none) is not its.
-    let token: string | undefined;
-    if (signIn) {
-      const given = signIn.bearer(req);
-      if (given === null) {
-        askToSignIn(res, "sign in: this server needs an Infino account's key as a bearer token");
-        return;
-      }
-      token = given;
+    // With sign-in, the key first, on every call.
+    const key = opts.signIn !== undefined ? BEARER.exec(req.headers.authorization?.trim() ?? "")?.[1] : undefined;
+    if (opts.signIn !== undefined && key === undefined) {
+      signIn(res, "sign in: this server needs an Infino account's key as a bearer token");
+      return;
     }
     const given = req.headers[SESSION_HEADER];
     const id = typeof given === "string" ? given : undefined;
@@ -180,8 +175,8 @@ export async function serveHttp(rootPath: string | undefined, opts: HttpServeOpt
         refuse(res, 404, JSONRPC_SESSION_NOT_FOUND, "session not found; start a new one with an initialize request");
         return;
       }
-      if (signIn && session.token !== token) {
-        askToSignIn(res, "this session was opened with another token");
+      if (session.key !== key) {
+        signIn(res, "this session was opened with another key");
         return;
       }
       session.lastSeen = Date.now();
@@ -199,21 +194,21 @@ export async function serveHttp(rootPath: string | undefined, opts: HttpServeOpt
       refuse(res, 400, JSONRPC_INVALID_REQUEST, "no session: send an initialize request first");
       return;
     }
-    // The token is checked against the platform once, here, before a
-    // session is built on it: a refused key is a 401 the client acts on by
-    // signing the person in again, where a tool error later would not be.
-    if (signIn && token !== undefined) {
-      const verdict = await signIn.checkToken(token);
-      if (verdict === "refused") {
-        askToSignIn(res, "sign in again: the platform refused this token");
-        return;
-      }
-      if (verdict === "unavailable") {
-        refuse(res, 503, JSONRPC_UNAVAILABLE, "the platform did not answer; try again in a minute");
+    // The key is checked once, before a session is built on it: a refused
+    // key is a 401 the client acts on by signing in again.
+    // An account out of credit is not a bad key: a new sign-in would only
+    // hand the person another, empty account, so it is said instead.
+    if (key !== undefined) {
+      try {
+        await listDatabases({ baseUrl: platform!, apiKey: key }, { fetch: opts.hostedOptions?.fetch ?? fetch });
+      } catch (err) {
+        if (err instanceof HostedError && err.unauthenticated) signIn(res, "sign in again: the platform refused this key");
+        else if (err instanceof HostedError && err.paymentRequired) refuse(res, 403, JSONRPC_UNAVAILABLE, "this Infino account is out of credit");
+        else refuse(res, 503, JSONRPC_UNAVAILABLE, "the platform did not answer; try again in a minute");
         return;
       }
     }
-    const transport = await open(token);
+    const transport = await open(key);
     await transport.handleRequest(req, res, body);
   };
 
@@ -247,7 +242,7 @@ export async function serveHttp(rootPath: string | undefined, opts: HttpServeOpt
   const port = typeof address === "object" && address !== null ? address.port : opts.port;
   console.error(
     `code-context MCP server listening on http://${host}:${port}${path}` +
-      ` (sessions idle out after ${Math.round(idleMs / 60000)} min${signIn ? `; sign-in through ${signIn.resourceMetadataUrl}` : ""})`,
+      ` (sessions idle out after ${Math.round(idleMs / 60000)} min${opts.signIn ? "; sign-in required" : ""})`,
   );
 
   return {

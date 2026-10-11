@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 //
-// The server over Streamable HTTP with sign-in: every call carries a
-// bearer token, which is an account's key; a call with none, or with one
-// the platform refuses, is answered 401 naming the resource metadata (what
-// makes a client start the sign-in); a token that could never be a key
-// costs the platform nothing; a session is its token's; and the session a
-// good token opens runs on that account - its platform calls carry it.
+// The server over Streamable HTTP with sign-in: a call with no key, or one
+// the platform refuses, gets the 401 naming the resource metadata; a good
+// key opens a session that runs on that account, and is that key's alone.
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -26,6 +23,7 @@ type HttpServed = Awaited<ReturnType<typeof serveHttp>>;
 const METADATA_URL = "https://api.example.test/.well-known/oauth-protected-resource/connect/mcp";
 const GOOD_KEY = `inf_${"1".repeat(16)}_${"ab".repeat(24)}`;
 const UNKNOWN_KEY = `inf_${"2".repeat(16)}_${"cd".repeat(24)}`;
+const BROKE_KEY = `inf_${"3".repeat(16)}_${"ef".repeat(24)}`;
 const DATA_DB = "mydata";
 const TRANS = "data";
 
@@ -35,7 +33,12 @@ function platform(): Platform & { keysSeen: string[] } {
   const keysSeen: string[] = [];
   const bearerOf = (request: { headers: Record<string, string> }) => (request.headers.authorization ?? "").replace(/^Bearer /, "");
   const scripted = scriptPlatform({
-    databases: (_body, request) => (bearerOf(request) === GOOD_KEY ? [200, { databases: [{ name: DATA_DB, state: "registered" }] }] : [401, { error: "unauthenticated" }]),
+    databases: (_body, request) =>
+      bearerOf(request) === GOOD_KEY
+        ? [200, { databases: [{ name: DATA_DB, state: "registered" }] }]
+        : bearerOf(request) === BROKE_KEY
+          ? [402, { error: "payment required" }]
+          : [401, { error: "unauthenticated" }],
     list_tables: () => [200, [TRANS]],
     schema: () => [200, [{ name: "id", nullable: true, type: "i64" }]],
     table_card: (body) => [404, { error: `no lean card for table ${String(body?.table)}` }],
@@ -61,7 +64,7 @@ describe("the server over Streamable HTTP with sign-in", () => {
     configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/cxbench", signIn: METADATA_URL }, { [API_KEY_ENV]: "inf_should_not_be_used" }));
     expect(hostedTarget()?.apiKey).toBe("");
     scripted = platform();
-    served = await serveHttp(undefined, { port: 0, hostedOptions: { fetch: scripted.fetch }, signIn: { resourceMetadataUrl: METADATA_URL, platformBaseUrl: "http://127.0.0.1:9", fetch: scripted.fetch } });
+    served = await serveHttp(undefined, { port: 0, hostedOptions: { fetch: scripted.fetch }, signIn: METADATA_URL });
     url = `http://${served.host}:${served.port}${served.path}`;
   });
   afterAll(async () => {
@@ -78,17 +81,19 @@ describe("the server over Streamable HTTP with sign-in", () => {
     expect(get.status).toBe(401);
   });
 
-  it("refuses a token that could never be a key without asking the platform, and one the platform refuses with the same 401", async () => {
-    const asked = () => scripted.sent.filter((sent) => sent.op === "databases").length;
-    const before = asked();
-    const junk = await fetch(url, { method: "POST", headers: { ...accept, authorization: "Bearer not-a-key" }, body: initialize });
-    expect(junk.status).toBe(401);
-    expect(junk.headers.get("www-authenticate")).toContain("resource_metadata=");
-    expect(asked()).toBe(before);
+  it("answers a key the platform refuses with the same 401, and an account out of credit with no sign-in, before building a session", async () => {
     const unknown = await fetch(url, { method: "POST", headers: { ...accept, authorization: `Bearer ${UNKNOWN_KEY}` }, body: initialize });
     expect(unknown.status).toBe(401);
-    expect(asked()).toBe(before + 1);
+    expect(unknown.headers.get("www-authenticate")).toBe(`Bearer resource_metadata="${METADATA_URL}"`);
+    // A new sign-in would only hand the person another, empty account.
+    const broke = await fetch(url, { method: "POST", headers: { ...accept, authorization: `Bearer ${BROKE_KEY}` }, body: initialize });
+    expect(broke.status).toBe(403);
+    expect(broke.headers.get("www-authenticate")).toBeNull();
     expect(served.sessions()).toBe(0);
+  });
+
+  it("needs --db, whatever account the machine has stored", () => {
+    expect(() => hostedSettingsFromFlags({ signIn: METADATA_URL }, {}, () => GOOD_KEY, { accountRoot: "/tmp/r", storedAccount: () => ({ baseUrl: "https://p.example", uploadConsentAt: "2026-10-11" }) })).toThrow("--sign-in needs --db");
   });
 
   it("opens a session on a good token, runs it on that account, and keeps it that token's", async () => {
@@ -100,6 +105,12 @@ describe("the server over Streamable HTTP with sign-in", () => {
     expect(names).toContain("tables");
     expect(names).toContain("sql");
     expect(names).toContain("hydrate");
+    // This machine is the server's, not the caller's: hydrate reads none of its files.
+    const hydrate = (await client.listTools()).tools.find((t) => t.name === "hydrate")!;
+    expect((hydrate.inputSchema.properties as Record<string, { enum?: string[] }>).kind.enum).toEqual(["bucket", "prefix"]);
+    const local = (await client.callTool({ name: "hydrate", arguments: { database: DATA_DB, kind: "path", path: "/etc" } })) as { isError?: boolean };
+    expect(local.isError).toBe(true);
+    expect(scripted.sent.some((sent) => sent.op === "hydrate")).toBe(false);
     const result = (await client.callTool({ name: "sql", arguments: { database: DATA_DB, query: `SELECT COUNT(*) AS n FROM ${TRANS}` } })) as { content: Array<{ text: string }>; isError?: boolean };
     expect(result.isError).toBeFalsy();
     expect(JSON.parse(result.content[0].text)).toMatchObject({ rows: [{ n: 3 }], database: DATA_DB });
