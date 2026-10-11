@@ -3302,11 +3302,16 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       }
       try {
         const t0 = performance.now();
+        // Without one table's shape no projection is sent (an empty one):
+        // the chunks table's place columns would be sent otherwise, and the
+        // platform refuses a projection naming no column of any table
+        // (measured on the Berka tables, 2026-10-11); each fact then
+        // carries its table's own keys.
         const { result: returned, spend } = await runRetrievalAgent(
           client,
           {
             question,
-            ...(shape ? { projection: rowsProjection(shape), shape, table: shape.table } : {}),
+            ...(shape ? { projection: rowsProjection(shape), shape, table: shape.table } : { projection: [] }),
             ...(!shape && tables?.length ? { tables } : {}),
           },
           { maxTurns: subagentMaxTurns(), maxWallSecs: subagentMaxWallSecs(), k: subagentK() },

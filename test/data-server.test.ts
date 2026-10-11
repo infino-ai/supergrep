@@ -289,6 +289,9 @@ describe("the account's data through the server started for a repository", () =>
     expect(request.path).toBe(`sub_agent/${DATA_DB}`);
     expect(request.body).not.toHaveProperty("table");
     expect(request.body).not.toHaveProperty("tables");
+    // No projection: the chunks table's place columns name no column of a
+    // data table, and the platform refuses such a projection (live, 2026-10-11).
+    expect(request.body).not.toHaveProperty("projection");
     const result = whole.value as { rows: unknown[]; database: string; statement?: string };
     expect(result.database).toBe(DATA_DB);
     expect(result.rows).toEqual([{ account_id: 42, total: 1200.5 }]);
@@ -296,6 +299,7 @@ describe("the account's data through the server started for a repository", () =>
     const some = await call(s, "ask", { database: DATA_DB, question: "the same", tables: [TRANS, ACCOUNTS] });
     expect(some.ok, String(some.value)).toBe(true);
     expect(s.sent.at(-1)?.body).toMatchObject({ tables: [TRANS, ACCOUNTS] });
+    expect(s.sent.at(-1)?.body).not.toHaveProperty("projection");
 
     const one = await call(s, "ask", { database: DATA_DB, question: "notes about the close", tables: [NOTES] });
     expect(one.ok, String(one.value)).toBe(true);
