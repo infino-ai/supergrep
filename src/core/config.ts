@@ -381,6 +381,15 @@ export function apiToolsEnabled(): boolean {
   return ON_VALUES.includes((process.env.CX_API_TOOLS ?? "").toLowerCase());
 }
 
+/** Whether the MCP server offers no tool that writes (CX_READ_ONLY, default
+ * off): `hydrate` and `hydrate_cancel` are then neither registered nor named
+ * in the instructions. The shape of a server shared through one URL with no
+ * sign-in - a public connector over public data - where a write would be
+ * anyone's. The `--read-only` flag of `cx mcp` sets the same thing. */
+export function readOnlyEnabled(): boolean {
+  return ON_VALUES.includes((process.env.CX_READ_ONLY ?? "").toLowerCase());
+}
+
 /** Hosted tables beside the primary that `sql` may join (CX_SIBLING_TABLES,
  * comma-separated, default none). Named, the server reads each one's schema
  * at startup and puts it in the sql tool's text with the primary's, and

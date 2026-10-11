@@ -36,6 +36,7 @@ import {
   resolveRoot,
   type HostedFlags,
 } from "./core/config.js";
+import { DEFAULT_HTTP_HOST, DEFAULT_HTTP_PATH } from "./mcp/http.js";
 
 /** The flags that name the platform database and tune the client, on the
  * commands that write the platform table (`index`) or serve it (`mcp`): where
@@ -254,10 +255,27 @@ hostedOptions(
   .option("--subagent-max-turns <n>", `turn cap for one ask call (default ${DEFAULT_SUBAGENT_MAX_TURNS})`)
   .option("--subagent-max-wall-secs <n>", `wall-clock cap for one ask call, in seconds (default ${DEFAULT_SUBAGENT_MAX_WALL_SECS})`)
   .option("--subagent-k <n>", `facts one ask call asks for and returns (default ${DEFAULT_SUBAGENT_K}, search's k)`)
-  .action(async (opts: { path?: string } & HostedFlags) => {
+  .option("--http <port>", "serve over Streamable HTTP on this port instead of stdio - one URL any MCP client adds as a remote connector - behind a TLS proxy")
+  .option("--http-host <host>", `the address --http binds (default ${DEFAULT_HTTP_HOST}, loopback)`)
+  .option("--http-path <path>", `the URL path --http serves MCP at (default ${DEFAULT_HTTP_PATH})`)
+  .option("--read-only", "offer no tool that writes - no hydrate, no hydrate_cancel (or CX_READ_ONLY=1): for a URL shared with no sign-in")
+  .action(async (opts: { path?: string; http?: string; httpHost?: string; httpPath?: string; readOnly?: boolean } & HostedFlags) => {
     applyHosted(opts, resolveRoot(opts.path));
+    const readOnly = opts.readOnly ? { readOnly: true } : {};
+    if (opts.http !== undefined) {
+      const port = Number(opts.http);
+      if (!Number.isInteger(port) || port < 0) throw new Error(`--http takes a port number, got "${opts.http}"`);
+      const { serveHttp } = await import("./mcp/http.js");
+      await serveHttp(opts.path, {
+        port,
+        ...(opts.httpHost !== undefined ? { host: opts.httpHost } : {}),
+        ...(opts.httpPath !== undefined ? { path: opts.httpPath } : {}),
+        ...readOnly,
+      });
+      return;
+    }
     const { serveMcp } = await import("./mcp/server.js");
-    await serveMcp(opts.path);
+    await serveMcp(opts.path, readOnly);
   });
 
 program

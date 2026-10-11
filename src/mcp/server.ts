@@ -73,6 +73,7 @@ import {
   agentToolsEnabled,
   answerToolEnabled,
   apiToolsEnabled,
+  readOnlyEnabled,
   configuredCardTier,
   configuredTextColumn,
   LEAN_CARD_TIER,
@@ -1331,10 +1332,13 @@ export function unresolvedDescription(door: string, table: string): string {
 export interface ServeOptions {
   transport?: Transport;
   hostedOptions?: HostedOptions;
+  /** Offer no tool that writes (`readOnlyEnabled` when absent). */
+  readOnly?: boolean;
 }
 
 export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {}): Promise<void> {
   const { hostedOptions } = serveOptions;
+  const readOnly = serveOptions.readOnly ?? readOnlyEnabled();
   const defaultRoot = resolveRoot(rootPath);
 
   // The platform database (--db <url>), when one is configured: the default
@@ -1827,8 +1831,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       "indexes, key and card: call it before the first query over data. Every query tool takes database to run over " +
       "a database of the account instead of this repository: sql one statement over its tables (join_keys with " +
       "database before a JOIN), search and find with table, ask with tables or none for the whole database.\n" +
-      "- hydrate - load a dataset into a database of the account, from a bucket, from files on this machine (path) " +
-      "or on a machine reached by ssh; hydrate_status follows the load, hydrate_cancel stops it. Only when asked.\n"
+      (readOnly
+        ? ""
+        : "- hydrate - load a dataset into a database of the account, from a bucket, from files on this machine (path) " +
+          "or on a machine reached by ssh; hydrate_status follows the load, hydrate_cancel stops it. Only when asked.\n")
     : "";
   // How the `answer` tool delivers the written answer: through the hook `cx
   // install` wrote (the entry sets CX_ANSWER_DISPLAY), or as text the model
@@ -3029,6 +3035,11 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       },
     );
 
+    // The tools that write - a load, its cancel - and the status read that
+    // only makes sense beside them: not on a read-only server (a shared
+    // URL with no sign-in), where `tables` and the query tools are the
+    // whole surface.
+    if (!readOnly) {
     /** The sources `hydrate` takes, flat so a model fills one shape: the
      * kind, and the fields the kind reads. */
     const SOURCE_KINDS = ["bucket", "prefix", "path", "ssh"] as const;
@@ -3158,6 +3169,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         }
       },
     );
+    }
   }
 
   if (apiTools && hosted) {
@@ -3607,7 +3619,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       (mode.kind === "unresolved" ? "; the table could not be described, so every tool call says so" : "")
     : "";
   console.error(
-    `code-context MCP server ready on stdio (default root: ${defaultRoot}, index: ${
+    `code-context MCP server ready on ${serveOptions.transport ? "its transport" : "stdio"} (default root: ${defaultRoot}, index: ${
       manifest ? `${manifest.chunks} chunks, vectors ${manifest.vectors}` : "none yet"
     }, embedder: ${embedderInfo()}${platform}; tools accept an optional 'path' to target other repos)`,
   );
