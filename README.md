@@ -95,8 +95,10 @@ Two commands, once per machine. You need Claude Code and node 22 or newer, on ma
 
 ```bash
 claude plugin marketplace add infino-ai/supergrep
-claude plugin install code-context@infino-ai
+claude plugin install supergrep@infino-ai
 ```
+
+(The plugin was called `code-context` before; an earlier install is replaced with `claude plugin uninstall code-context@infino-ai` and the two commands above. The MCP server inside keeps its name, so nothing the agent learned changes.)
 
 That is the setup. Open Claude Code in any directory - a repository, a folder of logs, your notes, anything - and ask a question. The first question indexes the directory, and `find`, `sql` and `read` answer from then on. Nothing is configured per directory, no account exists yet, and nothing has left your machine.
 
@@ -148,9 +150,23 @@ cx index --db https://api.supergrep.infino.ai/<database>
 
 `--embed-provider platform` (the default) has the platform fill that table's vectors with its own model, server-side; `local` embeds on this machine and ships the vectors instead.
 
+## Your data, through the same tools
+
+The same plugin reaches every table in your Infino account, not only the directories it indexed. Signed in, the agent has three more tools and a `database` argument on the four it had:
+
+| tool | what it does |
+|---|---|
+| `tables` | What the account holds: every database with its tables; a table's columns, which are indexed for search and which the platform embeds, the column that names a row, and the table's card - statistics, sample rows and what each column means. |
+| `hydrate` | Load a dataset into a database of the account, from wherever it is: a bucket prefix the platform reads itself, files on your laptop, files on a machine you reach with `ssh`, or a prefix already in the database's storage. Parquet, CSV, NDJSON, Iceberg and parsed documents. The database is created if it is new; the load runs on the platform and `hydrate_status` follows it. |
+| `hydrate_status`, `hydrate_cancel` | Where a load stands; stop one. |
+
+`sql`, `search`, `find` and `ask` take `database` (and `table`) to run over a table of the account instead of a repository - the statement, the ranked search, the exact match and the retrieval loop, with the platform's verdict on a statement's rows and its keys for a join, exactly as over code. So one session asks "which files call this" of the checkout and "which accounts moved the most money last quarter" of the data, through one MCP, and a question can span both.
+
+Nothing is configured per table or per database. Point the agent at a folder of CSVs, a Parquet export, a bucket, or a directory on a dev box, and ask it to load it; then ask questions. Files on your laptop or on a remote machine go straight into the database's storage over the platform's upload sessions (`ssh` is yours: the plugin runs one `find` and one `cat` per file over it and installs nothing there); a bucket is read in place and nothing is copied.
+
 ## Indexing from object storage
 
-For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in a bucket as Parquet or JSON - leave it there, point the platform at the bucket, and it builds the index from there. Nothing is copied, nothing is downloaded to your machine, and no row passes through your laptop or through the API.
+For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in a bucket as Parquet or JSON - leave it there, point the platform at the bucket, and it builds the index from there. Nothing is copied, nothing is downloaded to your machine, and no row passes through your laptop or through the API. The `hydrate` tool above does this from inside a session; the API it calls is below.
 
 **1. Grant read on your bucket** to Infino's service account - we give you its address - on the prefix you want indexed: `roles/storage.objectViewer` on GCS, `s3:GetObject` + `s3:ListBucket` on S3. Read only: the platform writes nothing there.
 

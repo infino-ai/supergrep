@@ -161,7 +161,7 @@ export function refusalHint(err: unknown): string {
 import { hostedDbFor, localDb, newHostedMemo, platformLabel, platformTableReady, type IndexHandle } from "../core/context.js";
 import { devContext, devContextEnabled } from "../core/dev-context.js";
 import { budgetSqlRows, foldValidationFacts, rankRows, sqlBudgetHint } from "../core/facts.js";
-import { HostedError, type HostedOptions, type RowRecord } from "../core/hosted.js";
+import { HostedError, type HostedDb, type HostedOptions, type RowRecord } from "../core/hosted.js";
 import { RetrievalRecord } from "../core/retrieval-record.js";
 import {
   analyzerOf,
@@ -202,7 +202,8 @@ import {
   recordUsage,
 } from "../core/usage.js";
 import { chunkingNote, ENGINE_ID_COLUMN, fetchCard, resolveTableShape, SNIPPET_CHARS, type TableShape } from "../core/table-shape.js";
-import { joinGate, joinRefusal, type PlatformJoin } from "../core/join-gate.js";
+import { joinGate, joinRefusal, tablesNamed, type PlatformJoin } from "../core/join-gate.js";
+import { DataPlane, type HydrateToolSource } from "./data.js";
 import { topKAggregateRefusal } from "../core/topk-aggregate.js";
 import {
   indexRepoStaged,
@@ -1577,20 +1578,26 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    *
    * `column` is the text column the refusal is diagnosed against - the
    * chunks table's content unless the statement ran over a hosted table of
-   * another shape, whose own text column it then is. */
+   * another shape, whose own text column it then is. `on` names another
+   * table to judge against, through the client tuned for its database
+   * (`DataPlane.verdict`), when the statement ran over a database named on
+   * the call. */
   const platformVerdict = async (
     ctx: RepoCtx,
     statement: string,
     rows: readonly object[],
     question?: string,
     column: string = CONTENT_COLUMN,
+    on?: { db: HostedDb; table: string },
   ): Promise<{ verdict?: Record<string, unknown>; telemetry?: { rttMs: number; readTokens?: number; resultBytes?: number } }> => {
     // Under the API tools the verdict is the model's to ask for (`validate`),
     // not attached to every statement.
-    if (!ctx.hosted || !verdictDb || apiTools) return {};
+    if (apiTools) return {};
+    const judge = on ? on.db : ctx.hosted ? verdictDb : null;
+    if (!judge) return {};
     try {
-      const verdict = await verdictDb.validate({
-        table: TABLE,
+      const verdict = await judge.validate({
+        table: on ? on.table : TABLE,
         column,
         statement,
         rows,
@@ -1603,7 +1610,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // `lastCall` before the caller reads it. It goes through its own client,
       // which is why `withPlatform(entry, ctx)` (reading ctx.hosted) would
       // miss it.
-      const info = verdictDb.lastCall();
+      const info = judge.lastCall();
       const telemetry = info
         ? {
             rttMs: info.rttMs,
@@ -1788,6 +1795,41 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // table_card, validate, cite. With them on, sql carries no card and no
   // verdict - the model asks for both - see apiToolsEnabled.
   const apiTools = platformTools && apiToolsEnabled();
+  // The account's data (mcp/data.ts): every database the key may see,
+  // reached per call by the `database` argument, and the `tables` and
+  // `hydrate` tools over it. The key is an account's whichever way the
+  // platform was configured - a `--db` naming one database or the stored
+  // account - so this is there whenever a platform is. Nothing is asked of
+  // it at startup. Upload sessions are opened for the platform's own origin:
+  // a deployment lists the origins it takes uploads from, and a client of
+  // its API is of that origin as far as a listing can name one.
+  const data =
+    hosted !== null
+      ? new DataPlane({
+          account: { baseUrl: hosted.baseUrl, apiKey: hosted.apiKey },
+          clientOptions: hostedOptions ?? {},
+          cardTier: CARD_TIER,
+          onNote: (line) => console.error(line),
+          origin: new URL(hosted.baseUrl).origin,
+          verdictTimeoutMs: VERDICT_TIMEOUT_MS,
+        })
+      : null;
+  /** The refusal of a `database` argument on a server with no account. */
+  const noDataPlane = (tool: string) => fail(`${tool}: database names a database of an Infino account, and this server has none - ${noAccountSteps()}`);
+  /** What each query tool's text says of the account's data, where there is
+   * an account: one sentence, since the routing line below carries the rest
+   * and every sentence here is prompt text on every turn. */
+  const DATA_NOTE = data ? " With database (and table), it runs over that table of a database of the Infino account instead; tables lists them." : "";
+  /** The routing line for the account's data: where the databases are
+   * listed, how each query tool reaches one, and how data gets in. */
+  const DATA_INSTRUCTION = data
+    ? "\n- tables - the databases of this Infino account and their tables; with database and table, a table's columns, " +
+      "indexes, key and card: call it before the first query over data. Every query tool takes database to run over " +
+      "a database of the account instead of this repository: sql one statement over its tables (join_keys with " +
+      "database before a JOIN), search and find with table, ask with tables or none for the whole database.\n" +
+      "- hydrate - load a dataset into a database of the account, from a bucket, from files on this machine (path) " +
+      "or on a machine reached by ssh; hydrate_status follows the load, hydrate_cancel stops it. Only when asked.\n"
+    : "";
   // How the `answer` tool delivers the written answer: through the hook `cx
   // install` wrote (the entry sets CX_ANSWER_DISPLAY), or as text the model
   // relays. Read once; the instructions and the tool text say the same thing.
@@ -1907,11 +1949,13 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * statement ungated rather than unrun - the gate is a check, not a
    * precondition - and says so on stderr. */
   const platformKeys = new Map<string, Promise<PlatformJoin[]>>();
-  const keysAmong = (tables: string[]): Promise<PlatformJoin[]> => {
-    const set = [...tables].sort().join(",");
+  const keysAmong = (tables: string[], through?: HostedDb): Promise<PlatformJoin[]> => {
+    // Keyed by the database too: the same table names in two databases of
+    // the account are two tables.
+    const set = `${through ? through.target.database : ""}|${[...tables].sort().join(",")}`;
     let pending = platformKeys.get(set);
     if (!pending) {
-      pending = hostedDbFor(hosted!, { ...hostedOptions, coldStartSecs: 0 })
+      pending = (through ?? hostedDbFor(hosted!, { ...hostedOptions, coldStartSecs: 0 }))
         .joinKeys(tables)
         .then((record) => ((record.joins as PlatformJoin[] | undefined) ?? []).filter((j) => typeof j?.predicate === "string"))
         .catch((err) => {
@@ -1950,20 +1994,27 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * content unless the table is of another shape); `numbered` says whether
    * the rows are chunks, whose multi-line text is numbered from the row's
    * start_line as the local path numbers it - a table of rows has no lines
-   * to number. */
+   * to number. `over` is a database named on the call: the statement runs
+   * through its client, the verdict is asked through its verdict client
+   * against the table the statement named - none named, no verdict - and
+   * the rows are recorded under that table. */
   const sqlOnPlatform = async (
     ctx: RepoCtx,
     query: string,
     embeds: Record<string, string> | undefined,
     question: string | undefined,
-    opts: { column?: string; numbered: boolean; key?: string },
+    opts: { column?: string; numbered: boolean; key?: string; over?: { database: string; db: HostedDb; verdict: HostedDb; table?: string } },
   ) => {
     try {
       const t0 = performance.now();
-      const fromPlatform = await runSqlRows(ctx.hosted!, query, embeds);
-      recordOf(ctx).addRows(TABLE, fromPlatform, opts.key);
+      const db = opts.over?.db ?? ctx.hosted!;
+      const fromPlatform = await runSqlRows(db, query, embeds);
+      recordOf(ctx).addRows(opts.over?.table ?? TABLE, fromPlatform, opts.key);
       const placed = opts.numbered ? fromPlatform.map(numberRowLines) : fromPlatform;
-      const { verdict: judged, telemetry } = await platformVerdict(ctx, query, placed, question, opts.column);
+      const { verdict: judged, telemetry } =
+        opts.over && opts.over.table === undefined
+          ? {}
+          : await platformVerdict(ctx, query, placed, question, opts.column, opts.over ? { db: opts.over.verdict, table: opts.over.table! } : undefined);
       // A ranked aggregate's rows gain the platform's facts about their
       // groups - `file_lines`, `term_lines` - so a top-k total sits beside
       // the file's whole length in the row the model reads, and an ordered
@@ -1975,7 +2026,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       if (receiptOn) {
         // The statement's own metered tokens, then the verdict's: two
         // platform reads, one ledger line, so the charge shows both.
-        const entry = withPlatform(sqlEntry(query, rowsOut), ctx);
+        const entry = withPlatform(sqlEntry(query, rowsOut), { hosted: db });
         if (telemetry) {
           entry.platform = {
             rttMs: (entry.platform?.rttMs ?? 0) + telemetry.rttMs,
@@ -1997,6 +2048,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         ...(hint ? { hint } : {}),
         ...(verdict ? { validation: verdict } : {}),
         index: "platform",
+        ...(opts.over ? { database: opts.over.database } : {}),
         took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
         ...(usage ? { usage } : {}),
       });
@@ -2004,6 +2056,75 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       return fail(`sql failed: ${(err as Error).message}${refusalHint(err)}`);
     }
   };
+
+  /** A `sql` statement over a database named on the call: its tables are
+   * read once (DataPlane), the statement is held to the platform's keys
+   * when it spans two of them (the join gate, as for the sibling tables),
+   * and it runs on the platform with the verdict judged against the table
+   * it named - `table` when the caller said which, else the first of the
+   * database's tables the statement names. The table's shape is read for
+   * the verdict's text column and the rows' key, best-effort: a table the
+   * platform cannot describe still runs, without a verdict. */
+  const sqlOnDatabase = async (
+    ctx: RepoCtx,
+    database: string,
+    table: string | undefined,
+    query: string,
+    code: string,
+    embeds: Record<string, string> | undefined,
+    question: string | undefined,
+  ) => {
+    if (!data) return noDataPlane("sql");
+    let names: string[];
+    try {
+      names = await data.tableNames(database);
+    } catch (err) {
+      return fail(`sql failed: the tables of ${database} could not be listed: ${(err as Error).message}${refusalHint(err)}`);
+    }
+    if (table !== undefined && !names.includes(table)) return fail(`sql: ${database} has no table ${table}; its tables are ${names.join(", ")}`);
+    const verdict = await joinGate(code, names, (spanned) => keysAmong(spanned, data.quick(database)));
+    if (verdict.kind === "refuse") return fail(joinRefusal("sql", verdict));
+    const named = table ?? tablesNamed(code, names)[0];
+    let shape: TableShape | undefined;
+    if (named !== undefined) {
+      try {
+        shape = await data.shape(database, named);
+      } catch (err) {
+        console.error(`${database}.${named} could not be described; the statement runs without a verdict: ${(err as Error).message}`);
+      }
+    }
+    return sqlOnPlatform(ctx, query, embeds, question, {
+      column: shape?.primaryText ?? "",
+      numbered: false,
+      ...(shape ? { key: shape.keyColumn } : {}),
+      over: { database, db: data.client(database), verdict: data.verdict(database), ...(shape ? { table: named } : {}) },
+    });
+  };
+
+  /** The shape of a table named with its database on a search or find:
+   * both run over one table's text column, so the table must be named. */
+  const dataTable = async (
+    tool: string,
+    database: string,
+    table: string | undefined,
+  ): Promise<{ shape: TableShape; client: HostedDb } | { failed: ReturnType<typeof fail> }> => {
+    if (!data) return { failed: noDataPlane(tool) };
+    if (table === undefined) return { failed: fail(`${tool}: name the table of ${database} to run over (tables lists them)`) };
+    try {
+      return { shape: await data.shape(database, table), client: data.client(database) };
+    } catch (err) {
+      return { failed: fail(`${tool} failed: ${database}.${table} could not be described: ${(err as Error).message}${refusalHint(err)}`) };
+    }
+  };
+
+  /** How a table of the account is named on the query tools: the database
+   * on every one, the table on the two that run over a text column. */
+  const DATABASE_ARG = z
+    .string()
+    .min(1)
+    .optional()
+    .describe("A database of the Infino account to run over instead of a repository: the names are what `tables` lists. With it, `path` is not read.");
+  const TABLE_ARG = z.string().min(1).optional().describe("With `database`: the table to run over; its text column is the one searched.");
 
   const rows = mode.kind === "rows" ? mode.shape : null;
   // Whether find and search are offered: always over the chunks table, and
@@ -2141,7 +2262,8 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         // server is broken or go looking for a key.
         (platformTools ? "" : ` ${noAccountSteps()}.`)) +
         (apiTools ? apiToolsInstruction(Boolean(rows)) : "") +
-        (siblingNames.length > 0 ? siblingsInstruction(TABLE, siblingNames, agentTools, joinSearchable) : "")),
+        (siblingNames.length > 0 ? siblingsInstruction(TABLE, siblingNames, agentTools, joinSearchable) : "") +
+        DATA_INSTRUCTION),
     },
   );
 
@@ -2159,7 +2281,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     {
       title: "Code search (exact terms + meaning)",
       annotations: READ_ONLY,
-      description: rows
+      description: (rows
         ? rowsSearchDescription(rows)
         : mode.kind === "unresolved"
         ? unresolvedDescription("Ranked search", TABLE)
@@ -2190,7 +2312,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         "where the matching lines are the answer; put the words you expect on those lines in the " +
         "query. For every occurrence of an exact " +
         "string use find; for counts and rankings use sql. Several searches at once: pass queries. " +
-        "The result includes a 'usage' field, a one-line receipt of tokens returned, chunks and files.",
+        "The result includes a 'usage' field, a one-line receipt of tokens returned, chunks and files.") + DATA_NOTE,
       inputSchema: {
         query: z.string().optional().describe("What you're looking for - terms, a phrase, or a description."),
         queries: z
@@ -2217,14 +2339,41 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             "Absolute path to the repository root to search. Defaults to the server's configured root; " +
               "set it to target a specific repo when a session spans more than one.",
           ),
+        database: DATABASE_ARG,
+        table: TABLE_ARG,
       },
     },
-    async (args) => batched("search", args, async ({ query, k, lines, path }) => {
+    async (args) => batched("search", args, async ({ query, k, lines, path, database, table }) => {
       let ctx: RepoCtx;
       try {
-        ctx = repoFor(path);
+        ctx = repoFor(database !== undefined ? undefined : path);
       } catch (err) {
         return fail((err as Error).message);
+      }
+      // Over a table of a database named on the call: the table's own text
+      // and embedding columns, through its database's client; the record
+      // and the ledger are the default root's.
+      if (database !== undefined) {
+        const settled = await dataTable("search", database, table);
+        if ("failed" in settled) return settled.failed;
+        const { shape, client } = settled;
+        if (shape.primaryText === "") {
+          return fail(`search: no column of ${database}.${table} is full-text indexed, so there is no search over it; sql filters its columns${shape.vectorColumn ? `, and vector_search('${table}','${shape.vectorColumn}', {{q:"..."}}, k) ranks them by meaning` : ""}`);
+        }
+        try {
+          const t0 = performance.now();
+          const result = await searchRows(client, shape, query, k);
+          recordOf(ctx).addKeys(shape.table, shape.keyColumn, result.hits);
+          let usage: string | undefined;
+          if (receiptOn) {
+            const entry = withPlatform(rowSearchEntry(result), { hosted: client });
+            recordUsage(ctx.dir, entry);
+            usage = formatReceipt(entry, session);
+          }
+          return ok({ ...result, index: "platform", database, took_ms: Math.round((performance.now() - t0) * 1000) / 1000, ...(usage ? { usage } : {}) });
+        } catch (err) {
+          return fail(`search failed: ${(err as Error).message}${refusalHint(err)}`);
+        }
       }
       // Over the rows of a hosted table of another shape: the platform
       // fuses the table's own text and embedding columns. No local index, no
@@ -2309,7 +2458,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     {
       title: "Find exact text (every occurrence, like grep -n)",
       annotations: READ_ONLY,
-      description: rows
+      description: (rows
         ? rowsFindDescription(rows)
         : mode.kind === "unresolved"
         ? unresolvedDescription("Every row holding every word of an exact string", TABLE)
@@ -2343,7 +2492,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             "X works, where Y is handled - use ask, several at once; for rankings use sql. "
           : "For meaning or 'how does X work' use search; for rankings use sql. ") +
         "Several finds at once: pass queries. " +
-        "The result includes a 'usage' field, a one-line receipt of tokens returned, matches and files.",
+        "The result includes a 'usage' field, a one-line receipt of tokens returned, matches and files.") + DATA_NOTE,
       inputSchema: {
         query: z
           .string()
@@ -2410,14 +2559,38 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
               "set it to target a specific repo when a session spans more than one. This is a different " +
               "index; `under` narrows within one.",
           ),
+        database: DATABASE_ARG,
+        table: TABLE_ARG,
       },
     },
-    async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, path, share }) => {
+    async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, path, share, database, table }) => {
       let ctx: RepoCtx;
       try {
-        ctx = repoFor(path);
+        ctx = repoFor(database !== undefined ? undefined : path);
       } catch (err) {
         return fail((err as Error).message);
+      }
+      // Over a table of a database named on the call, as search runs: the
+      // rows whose text column holds every word, by the index's words.
+      if (database !== undefined) {
+        const settled = await dataTable("find", database, table);
+        if ("failed" in settled) return settled.failed;
+        const { shape, client } = settled;
+        if (shape.primaryText === "") return fail(`find: no column of ${database}.${table} is full-text indexed, so there is no find over it; sql filters its columns`);
+        try {
+          const t0 = performance.now();
+          const result = await findRows(client, shape, query, { limit });
+          recordOf(ctx).addKeys(shape.table, shape.keyColumn, result.matches);
+          let usage: string | undefined;
+          if (receiptOn) {
+            const entry = withPlatform(rowFindEntry(result), { hosted: client });
+            recordUsage(ctx.dir, entry);
+            usage = formatReceipt(entry, session);
+          }
+          return ok({ ...result, index: "platform", database, took_ms: Math.round((performance.now() - t0) * 1000) / 1000, ...(usage ? { usage } : {}) });
+        } catch (err) {
+          return fail(`find failed: ${(err as Error).message}${refusalHint(err)}`);
+        }
       }
       // Over the rows of a hosted table of another shape the find needs no
       // local index, so this comes before the local index - which would be
@@ -2493,7 +2666,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     {
       title: "SQL over the code index",
       annotations: READ_ONLY,
-      description: sqlDescription,
+      description: sqlDescription + DATA_NOTE,
       inputSchema: {
         query: z
           .string()
@@ -2527,12 +2700,14 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             "Absolute path to the repository root to query. Defaults to the server's configured root; " +
               "set it to target a specific repo when a session spans more than one.",
           ),
+        database: DATABASE_ARG,
+        table: z.string().min(1).optional().describe("With `database`: the table the statement is about, for the verdict on its rows; absent, the first table of the database the statement names."),
       },
     },
-    async (args) => batched("sql", args, async ({ query: written, embed, question, path }) => {
+    async (args) => batched("sql", args, async ({ query: written, embed, question, path, database, table }) => {
       let ctx: RepoCtx;
       try {
-        ctx = repoFor(path);
+        ctx = repoFor(database !== undefined ? undefined : path);
       } catch (err) {
         return fail((err as Error).message);
       }
@@ -2544,7 +2719,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // behind the context: the platform's form is the platform's alone, so
       // a statement for the local index stays as written, and the engine's
       // error, if it fails, names what the caller wrote.
-      const query = ctx.hosted ? normalizeQueryPlaceholders(written) : written;
+      const query = ctx.hosted || database !== undefined ? normalizeQueryPlaceholders(written) : written;
       // What the checks on the statement's text read: the statement without
       // its comments, since a table, a search call or an ORDER BY named in
       // one would read to the join gate, the top-k check and the row
@@ -2566,6 +2741,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // above and written anyway by every caller family.
       const topK = topKAggregateRefusal("sql", code);
       if (topK) return fail(topK);
+      // Over a database named on the call: the statement runs there, on the
+      // platform, held to the keys among that database's tables.
+      if (database !== undefined) return sqlOnDatabase(ctx, database, table, query, code, embeds, question);
       // A statement across two or more of the hosted tables is held to the
       // keys the platform found on their values: one written without any of
       // them is refused with the keys, and the model rewrites it. The model
@@ -2768,13 +2946,215 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           "Call it before writing a statement across tables.",
         inputSchema: {
           tables: z.array(z.string().min(1)).min(2).max(8).describe(`The tables the statement will span, ${TABLE} among them when it is one of them.`),
+          database: DATABASE_ARG,
         },
       },
-      async ({ tables }: { tables: string[] }) => {
+      async ({ tables, database }: { tables: string[]; database?: string }) => {
+        const through = database !== undefined ? data?.quick(database) : keysDb;
+        if (!through) return noDataPlane("join_keys");
         try {
-          return ok((await keysDb.joinKeys(tables)) as Record<string, unknown>);
+          return ok((await through.joinKeys(tables)) as Record<string, unknown>);
         } catch (err) {
           return fail(`join_keys failed: ${(err as Error).message}${refusalHint(err)}`);
+        }
+      },
+    );
+  }
+
+  if (data) {
+    const plane = data;
+    server.registerTool(
+      "tables",
+      {
+        title: "The account's databases and tables, and a table's shape",
+        annotations: READ_ONLY,
+        description:
+          "What the Infino account holds, before the first query over its data: with no argument, every " +
+          "database of the account with its tables (a database holding a chunks table is a repository's " +
+          "index; the others are data); with database, that database's tables; with database and table, the " +
+          "table's columns with their types, which columns are full-text indexed and which the platform embeds, " +
+          "the column that names a row, and the table's card - its statistics, sample rows and, when the " +
+          "optimizer wrote one, what each column means. Call it once before writing a statement over a table; " +
+          "then sql, search, find and ask take database (and table) to run over it.",
+        inputSchema: {
+          database: z.string().min(1).optional().describe("A database of the account: its tables. With table, that table's shape."),
+          table: z.string().min(1).optional().describe("With database: the table whose columns, indexes, key and card to return."),
+        },
+      },
+      async ({ database, table }: { database?: string; table?: string }) => {
+        try {
+          if (database === undefined) {
+            const databases = await plane.databases();
+            // Every database's tables at once, through the clients that
+            // never wait a cold start out: one that is starting is said to be.
+            const listed = await Promise.all(
+              databases.map(async (d) => {
+                try {
+                  const names = await plane.tableNames(d.name);
+                  return { name: d.name, state: d.state, kind: names.includes(DEFAULT_TABLE) ? "code" : "data", tables: names };
+                } catch (err) {
+                  return { name: d.name, state: d.state, tables: `not listed: ${(err as Error).message}` };
+                }
+              }),
+            );
+            return ok({ platform: plane.baseUrl, databases: listed, next: "tables with database and table gives a table's columns, text and vector columns, key and card" });
+          }
+          if (table === undefined) return ok({ database, tables: await plane.tableNames(database) });
+          const shape = await plane.shape(database, table);
+          return ok({
+            database,
+            table,
+            columns: shape.columns,
+            text_columns: shape.textColumns,
+            ...(shape.textColumnsInferred && shape.textColumns.length > 0 ? { text_columns_inferred: true } : {}),
+            primary_text: shape.primaryText === "" ? null : shape.primaryText,
+            vector_column: shape.vectorColumn,
+            ...(shape.vectorColumn ? { vector_source: shape.vectorSource } : {}),
+            key_column: shape.keyColumn,
+            link_column: shape.linkColumn,
+            title_column: shape.titleColumn,
+            list_columns: shape.listColumns,
+            ...(shape.chunking ? { chunking: shape.chunking } : {}),
+            ...(shape.card ? { card: shape.card } : {}),
+            how:
+              `sql with database "${database}" runs one statement over ${table}` +
+              (shape.primaryText !== ""
+                ? `; search and find with table "${table}" run over its ${shape.primaryText}`
+                : "; no column is full-text indexed, so there is no search or find over it") +
+              `; ask with tables ["${table}"] asks the platform's loop about it.`,
+          });
+        } catch (err) {
+          return fail(`tables failed: ${(err as Error).message}${refusalHint(err)}`);
+        }
+      },
+    );
+
+    /** The sources `hydrate` takes, flat so a model fills one shape: the
+     * kind, and the fields the kind reads. */
+    const SOURCE_KINDS = ["bucket", "prefix", "path", "ssh"] as const;
+    const sourceOf = (given: { kind: (typeof SOURCE_KINDS)[number]; bucket?: string; prefix?: string; path?: string; host?: string }): HydrateToolSource => {
+      switch (given.kind) {
+        case "bucket":
+          if (!given.bucket) throw new Error("a bucket source names the bucket");
+          return { kind: "bucket", bucket: given.bucket, prefix: given.prefix ?? "" };
+        case "prefix":
+          if (!given.prefix) throw new Error("a prefix source names the prefix under the database's root");
+          return { kind: "prefix", prefix: given.prefix };
+        case "path":
+          if (!given.path) throw new Error("a path source names a file or directory on this machine");
+          return { kind: "path", path: given.path };
+        case "ssh":
+          if (!given.host || !given.path) throw new Error("an ssh source names the host and the path on it");
+          return { kind: "ssh", host: given.host, path: given.path };
+      }
+    };
+
+    server.registerTool(
+      "hydrate",
+      {
+        title: "Load a dataset into a database of the account",
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+        description:
+          "Load a dataset into a table of a database of the Infino account, from wherever it is: a bucket " +
+          "prefix in object storage the platform reads itself (kind bucket, the platform's identity granted " +
+          "read on it), a prefix already under the database's own storage (kind prefix), a file or directory " +
+          "on this machine (kind path), or one on a machine this machine reaches with ssh (kind ssh, host as " +
+          "ssh resolves it) - the files are then put into the database's storage first and loaded from there. " +
+          "Parquet, CSV, NDJSON and Iceberg are read by their extension (format auto); documents (PDF, text) " +
+          "with format documents. fts names the columns to index for search and find, embed the column to " +
+          "embed and the text columns it embeds; left out, the platform picks from the data. The database is " +
+          "registered on the account if it does not exist. The load runs on the platform and this returns at " +
+          "once with the job: hydrate_status follows it. dry_run checks the load and writes nothing. Never " +
+          "call it unasked: it spends the account's storage and credit.",
+        inputSchema: {
+          database: z.string().min(1).describe("The database to load into; registered on the account if new."),
+          table: z.string().min(1).optional().describe("The table to load. Absent, one table per folder of the source, each named after its folder."),
+          kind: z.enum(SOURCE_KINDS).describe("Where the data is: bucket, prefix (under the database's storage), path (this machine), ssh (a machine reached by ssh)."),
+          bucket: z.string().optional().describe("kind bucket: the bucket's name."),
+          prefix: z.string().optional().describe("kind bucket: the key prefix inside it (empty for the whole bucket); kind prefix: the prefix under the database's root."),
+          path: z.string().optional().describe("kind path or ssh: the file or directory."),
+          host: z.string().optional().describe("kind ssh: the host, as the person's own ssh names it (an ssh config name, or user@machine)."),
+          format: z.enum(["auto", "parquet", "csv", "ndjson", "iceberg", "documents"]).optional().describe("How the files are read; auto by their extension (the default here)."),
+          fts: z.array(z.string().min(1)).optional().describe("The text columns to index for search and find."),
+          embed: z.object({ column: z.string().min(1), source: z.array(z.string().min(1)).min(1) }).optional().describe("The vector column to add and the text columns it embeds."),
+          no_embed: z.boolean().optional().describe("Load with no vector column."),
+          chunk: z.record(z.string(), z.unknown()).optional().describe("How a long text column is cut into passages, in the platform's own fields (column, max_tokens, overlap_tokens, ...)."),
+          if_exists: z.enum(["refuse", "append"]).optional().describe("When the table exists: refuse (the default) or append."),
+          dry_run: z.boolean().optional().describe("Check the load without writing anything."),
+          notify_email: z.string().optional().describe("An address the platform mails when the load ends."),
+          options: z.record(z.string(), z.unknown()).optional().describe("Any other field of the platform's hydrate request, as the platform spells it."),
+        },
+      },
+      async ({ database, table, kind, bucket, prefix, path, host, format, fts, embed, no_embed, chunk, if_exists, dry_run, notify_email, options }) => {
+        try {
+          const source = sourceOf({ kind, bucket, prefix, path, host });
+          const t0 = performance.now();
+          const result = await plane.hydrate({
+            database,
+            ...(table !== undefined ? { table } : {}),
+            source,
+            ...(format !== undefined ? { format } : {}),
+            ...(fts !== undefined ? { fts } : {}),
+            ...(embed !== undefined ? { embed } : {}),
+            ...(no_embed !== undefined ? { no_embed } : {}),
+            ...(chunk !== undefined ? { chunk: chunk as RowRecord } : {}),
+            ...(if_exists !== undefined ? { if_exists } : {}),
+            ...(dry_run !== undefined ? { dry_run } : {}),
+            ...(notify_email !== undefined ? { notify_email } : {}),
+            ...(options !== undefined ? { options: options as RowRecord } : {}),
+          });
+          return ok({ ...result, took_ms: Math.round((performance.now() - t0) * 1000) / 1000 });
+        } catch (err) {
+          return fail(`hydrate failed: ${(err as Error).message}${refusalHint(err)}`);
+        }
+      },
+    );
+
+    server.registerTool(
+      "hydrate_status",
+      {
+        title: "Where a load stands",
+        annotations: READ_ONLY,
+        description:
+          "The record of the hydrate job that loads (or loaded) a table: its state - pending, running, " +
+          "cancelling, stopped, succeeded, failed - the request it runs, its progress and the schema it " +
+          "found, the usage billed so far, and the error when it failed. Ask it after hydrate, and again " +
+          "until the state is succeeded; the table answers queries then.",
+        inputSchema: {
+          database: z.string().min(1).describe("The database the table is in."),
+          table: z.string().min(1).describe("The table the job loads."),
+        },
+      },
+      async ({ database, table }: { database: string; table: string }) => {
+        try {
+          return ok((await plane.quick(database).hydrateJob(table)) as Record<string, unknown>);
+        } catch (err) {
+          return fail(`hydrate_status failed: ${(err as Error).message}${refusalHint(err)}`);
+        }
+      },
+    );
+
+    server.registerTool(
+      "hydrate_cancel",
+      {
+        title: "Stop a load, or clear an ended one",
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+        description:
+          "Cancel a running hydrate job (it stops at its next commit and keeps or drops the table as its " +
+          "request's on_failure says), or clear the record of one that has ended so the table can be loaded " +
+          "again. Only when the person asked for it.",
+        inputSchema: {
+          database: z.string().min(1).describe("The database the table is in."),
+          table: z.string().min(1).describe("The table the job loads."),
+        },
+      },
+      async ({ database, table }: { database: string; table: string }) => {
+        try {
+          const answer = await plane.quick(database).hydrateCancel(table);
+          plane.forget(database);
+          return ok(answer === null ? { database, table, cleared: true } : { database, table, cancelling: answer });
+        } catch (err) {
+          return fail(`hydrate_cancel failed: ${(err as Error).message}${refusalHint(err)}`);
         }
       },
     );
@@ -2895,6 +3275,56 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           "Absolute path to the repository root to ask about. Defaults to the server's configured root; " +
             "set it to target a specific repo when a session spans more than one.",
         ),
+      database: DATABASE_ARG,
+      tables: z
+        .array(z.string().min(1))
+        .max(8)
+        .optional()
+        .describe("With `database`: the tables the question is about, when it is about some of them; absent, the loop sees every table of the database."),
+    };
+
+    /** `ask` over a database named on the call: the platform's loop over
+     * every table of it, or the tables named. One table named, its shape is
+     * read so the facts come back as rows of it - text as snippets, placed
+     * by its key and link (`rowsProjection`); several or none, the loop is
+     * shown their cards and the facts come back as the rows it selected. */
+    const askDatabase = async (question: string, database: string, tables: string[] | undefined) => {
+      if (!data) return noDataPlane("ask");
+      const ctx = repoFor();
+      const client = data.client(database);
+      let shape: TableShape | undefined;
+      if (tables?.length === 1) {
+        try {
+          shape = await data.shape(database, tables[0]);
+        } catch (err) {
+          return fail(`ask failed: ${database}.${tables[0]} could not be described: ${(err as Error).message}${refusalHint(err)}`);
+        }
+      }
+      try {
+        const t0 = performance.now();
+        const { result: returned, spend } = await runRetrievalAgent(
+          client,
+          {
+            question,
+            ...(shape ? { projection: rowsProjection(shape), shape, table: shape.table } : {}),
+            ...(!shape && tables?.length ? { tables } : {}),
+          },
+          { maxTurns: subagentMaxTurns(), maxWallSecs: subagentMaxWallSecs(), k: subagentK() },
+        );
+        const result = await completeTruncated(client, returned, shape);
+        const record = recordOf(ctx);
+        if (shape) record.addKeys(shape.table, shape.keyColumn, result.rows);
+        else record.addRows(tables?.[0] ?? database, result.rows);
+        let usage: string | undefined;
+        if (receiptOn) {
+          const entry = withPlatform(subagentEntry(result, spend), { hosted: client });
+          recordUsage(ctx.dir, entry);
+          usage = formatReceipt(entry, session);
+        }
+        return ok({ ...result, database, took_ms: Math.round((performance.now() - t0) * 1000) / 1000, ...(usage ? { usage } : {}) });
+      } catch (err) {
+        return fail(`ask failed: ${(err as Error).message}${refusalHint(err)}`);
+      }
     };
 
     /** One retrieval through the platform's loop: the facts back.
@@ -2943,7 +3373,8 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       return { ctx, over };
     };
 
-    const retrieve = async ({ question, under, path }: { question: string; under?: string; path?: string }) => {
+    const retrieve = async ({ question, under, path, database, tables }: { question: string; under?: string; path?: string; database?: string; tables?: string[] }) => {
+      if (database !== undefined) return askDatabase(question, database, tables);
       const settled = await loopContext("ask", path);
       if ("failed" in settled) return settled.failed;
       const { ctx, over } = settled;
@@ -3015,7 +3446,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       {
         title: "Ask the repository index: one retrieval, the facts back",
         annotations: READ_ONLY,
-        description: rows
+        description: (rows
           ? rowsAskDescription(rows, DEV_CONTEXT_NOTE)
           : mode.kind === "unresolved"
           ? unresolvedDescription("A question or task in plain language, answered with the rows it retrieved,", TABLE)
@@ -3072,7 +3503,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           "of these answers; a hit marked truncated is its row, one sql statement away. Answer from " +
           "the rows and cite path:line. " +
           DEV_CONTEXT_NOTE +
-          "The result includes a 'usage' field, a one-line receipt of what the call cost.",
+          "The result includes a 'usage' field, a one-line receipt of what the call cost.") + DATA_NOTE,
         inputSchema: retrievalInputs,
       },
       retrieve,

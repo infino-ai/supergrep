@@ -1,6 +1,6 @@
 {
-  "name": "code-context",
-  "description": "SuperGrep: retrieval subagents for Claude Sonnet - find/search/sql locally, ask over the platform copy in the cloud.",
+  "name": "supergrep",
+  "description": "SuperGrep: your code and your data through one MCP - find, search, sql, read and ask over any directory, and over every table in your Infino account; hydrate loads a dataset from a bucket, this machine or a remote one.",
   "version": "0.5.1",
   "author": { "name": "Infino AI" },
   "homepage": "https://github.com/infino-ai/supergrep"

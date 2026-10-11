@@ -57,6 +57,11 @@ const ASK_TIMEOUT_MARGIN_SECS = 60;
 /** Milliseconds per second, named so the unit conversions read as such. */
 const MS_PER_SEC = 1000;
 
+/** Wall clock for one file's `PUT` to its upload session: an hour, so a
+ * multi-gigabyte file on a slow link completes, while a connection that
+ * hangs does not hold a hydrate forever. */
+const UPLOAD_TIMEOUT_MS = 60 * 60 * MS_PER_SEC;
+
 /** The database is not ready to answer yet; retryable. */
 const HTTP_SERVICE_UNAVAILABLE = 503;
 /** The platform is declining for now; retryable when it says when. */
@@ -310,7 +315,10 @@ interface Exchange {
 
 interface CallSpec {
   op: string;
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "DELETE";
+  /** A path segment after the database (`/uploads` under `hydrate`), for the
+   * few routes that nest one. */
+  suffix?: string;
   /** Query-string parameters, appended after the database segment. */
   query?: Record<string, string>;
   body?: string | Uint8Array;
@@ -342,6 +350,40 @@ function keepBigIntegers(_key: string, value: unknown, context?: { source?: stri
   return value;
 }
 
+/** `PUT` one file's bytes to the upload session `url` an `openUploads`
+ * answer gave for it: `size` bytes, as the session was opened for - the
+ * storage refuses any other length - streamed from `body`. No bearer key:
+ * the session URL is itself the capability, and the key must not reach the
+ * storage host. The one request this client makes to a host other than the
+ * platform's, so it goes through the same fetch the platform calls do
+ * (`fetchImpl`, a test's scripted one) and no other. Fails with the
+ * storage's own words. */
+export async function uploadBytes(
+  url: string,
+  body: ReadableStream<Uint8Array>,
+  size: number,
+  fetchImpl: typeof fetch = platformFetch,
+): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetchImpl(url, {
+      method: "PUT",
+      headers: { "content-length": String(size) },
+      body,
+      // A streamed request body is sent half-duplex: the whole body goes up
+      // before the answer is read. fetch requires the mode to be named for
+      // any stream body; the DOM typing does not spell the field, hence the
+      // cast.
+      ...({ duplex: "half" } as Record<string, unknown>),
+      signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const timedOut = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+    throw new HostedError("upload", 0, timedOut ? `no answer within ${UPLOAD_TIMEOUT_MS} ms` : `request failed: ${(err as Error).message}`, { cause: err });
+  }
+  if (!response.ok) throw new HostedError("upload", response.status, serverMessage(response.status, await response.text()));
+}
+
 export class HostedDb {
   readonly target: HostedTarget;
   private readonly fetchImpl: typeof fetch;
@@ -366,6 +408,20 @@ export class HostedDb {
   /** Telemetry of the most recent logical call, or null before the first. */
   lastCall(): HostedCallInfo | null {
     return this.last;
+  }
+
+  /** The same platform, key and tuning, addressing another database of the
+   * account: how one server reaches every database the key may see. */
+  forDatabase(database: string): HostedDb {
+    return new HostedDb(
+      { ...this.target, database },
+      {
+        fetch: this.fetchImpl,
+        timeoutMs: this.timeoutMs,
+        coldStartSecs: this.coldStartMs / MS_PER_SEC,
+        ...(this.onCall ? { onCall: this.onCall } : {}),
+      },
+    );
   }
 
   // --- tables ---
@@ -517,6 +573,64 @@ export class HostedDb {
       timeoutMs: this.timeoutMs,
     });
     return this.parseJson(exchange, "hydrate") as RowRecord;
+  }
+
+  /** `POST /v1/hydrate/{db}`: admit a hydrate job from `request`, the
+   * platform's own request shape (`table`, `source`, `format`, `fts`,
+   * `embed`, `chunk`, `if_exists`, `dry_run`, ...; the gateway refuses a
+   * field it does not know, so nothing is added here). `202` with the job's
+   * name and state - or, naming no table, one job per folder of the source -
+   * and `200` for a dry run, which checks the job's admission and writes
+   * nothing. Answered by the gateway from the job's envelope, so a cold
+   * database never holds it. */
+  async hydrateSubmit(request: RowRecord): Promise<RowRecord> {
+    const exchange = await this.call({
+      op: "hydrate",
+      method: "POST",
+      body: jsonify(request),
+      contentType: JSON_CONTENT_TYPE,
+      acceptJson: true,
+      timeoutMs: this.timeoutMs,
+    });
+    return this.parseJson(exchange, "hydrate") as RowRecord;
+  }
+
+  /** `DELETE /v1/hydrate/{db}?table=`: cancel the table's live job (`202`,
+   * the job now `cancelling`, returned) or clear an ended one so the table
+   * can be hydrated again (`200`, no body: null). */
+  async hydrateCancel(table: string): Promise<RowRecord | null> {
+    const exchange = await this.call({
+      op: "hydrate",
+      method: "DELETE",
+      query: { table },
+      acceptJson: true,
+      timeoutMs: this.timeoutMs,
+    });
+    return this.parseJson(exchange, "hydrate") as RowRecord | null;
+  }
+
+  /** `POST /v1/hydrate/{db}/uploads`: open an upload of files that are in
+   * no bucket yet into the database's storage - files on the machine this
+   * runs on, or on one it reaches (core/uploads.ts). `files` are each file's
+   * path under the upload's root and its size; `origin` is the web origin
+   * the platform lists as allowed to upload (the sessions are issued for
+   * it). The answer carries the upload's id, the `prefix` under the database
+   * root a hydrate request then loads from, and one session URL per file,
+   * which the file's bytes are `PUT` to ([`uploadBytes`]) - straight to the
+   * storage the database lives on, never through the gateway. */
+  async openUploads(origin: string, files: Array<{ name: string; size: number }>, upload?: string): Promise<RowRecord> {
+    const body: RowRecord = { origin, files };
+    if (upload !== undefined) body.upload = upload;
+    const exchange = await this.call({
+      op: "hydrate",
+      suffix: "/uploads",
+      method: "POST",
+      body: jsonify(body),
+      contentType: JSON_CONTENT_TYPE,
+      acceptJson: true,
+      timeoutMs: this.timeoutMs,
+    });
+    return this.parseJson(exchange, "uploads") as RowRecord;
   }
 
   // --- writes ---
@@ -757,8 +871,8 @@ export class HostedDb {
     }
   }
 
-  private url(op: string, query?: Record<string, string>): string {
-    let url = `${this.target.baseUrl}${API_PREFIX}/${op}/${encodeURIComponent(this.target.database)}`;
+  private url(op: string, query?: Record<string, string>, suffix = ""): string {
+    let url = `${this.target.baseUrl}${API_PREFIX}/${op}/${encodeURIComponent(this.target.database)}${suffix}`;
     if (query) url += `?${new URLSearchParams(query).toString()}`;
     return url;
   }
@@ -777,7 +891,7 @@ export class HostedDb {
     const headers: Record<string, string> = { authorization: `Bearer ${this.target.apiKey}` };
     if (spec.acceptJson) headers.accept = JSON_CONTENT_TYPE;
     if (spec.contentType) headers["content-type"] = spec.contentType;
-    const url = this.url(spec.op, spec.query);
+    const url = this.url(spec.op, spec.query, spec.suffix);
     const started = Date.now();
     const coldStartDeadline = started + this.coldStartMs;
     const capacityDeadline = started + spec.timeoutMs;
