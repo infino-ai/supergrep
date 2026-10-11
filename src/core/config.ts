@@ -120,6 +120,10 @@ export interface HostedFlags {
   subagentMaxTurns?: string;
   subagentMaxWallSecs?: string;
   subagentK?: string;
+  /** `cx mcp --sign-in <url>`: the server over HTTP with sign-in. The
+   * process then holds no key of its own - every session brings the key of
+   * the account it signed in with - so `--db` names the platform alone. */
+  signIn?: string;
 }
 
 /** The flags that mean nothing without --db, by their command-line spelling. */
@@ -132,6 +136,7 @@ const HOSTED_ONLY_FLAGS: Array<[keyof HostedFlags, string]> = [
   ["subagentMaxTurns", "--subagent-max-turns"],
   ["subagentMaxWallSecs", "--subagent-max-wall-secs"],
   ["subagentK", "--subagent-k"],
+  ["signIn", "--sign-in"],
 ];
 
 /** A positive-integer flag value, or its default when the flag was not given.
@@ -209,11 +214,16 @@ export function hostedSettingsFromFlags(
     account = { baseUrl, apiKey };
   } else {
     ({ baseUrl, database } = parseHostedUrl(flags.db));
+    // With sign-in, no key is this process's: each session's calls carry
+    // the key of the account that signed in, and one found in a file or the
+    // environment is not used either, so no session can run on it.
     apiKey =
-      flags.apiKeyFile !== undefined
-        ? readFileSync(flags.apiKeyFile, "utf8").trim()
-        : (env[API_KEY_ENV] ?? storedKey() ?? "");
-    if (apiKey.length === 0) {
+      flags.signIn !== undefined
+        ? ""
+        : flags.apiKeyFile !== undefined
+          ? readFileSync(flags.apiKeyFile, "utf8").trim()
+          : (env[API_KEY_ENV] ?? storedKey() ?? "");
+    if (apiKey.length === 0 && flags.signIn === undefined) {
       throw new Error(
         `--db needs a key, and this machine has none: run \`cx login --db ${baseUrl}\` to store one ` +
           `(it goes in ${keyFilePath()}, mode 600), or pass --api-key-file <path>, or set ${API_KEY_ENV}`,

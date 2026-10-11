@@ -33,10 +33,12 @@ import {
   DEFAULT_CAPS,
   configureHosted,
   hostedSettingsFromFlags,
+  hostedTarget,
   resolveRoot,
   type HostedFlags,
 } from "./core/config.js";
 import { DEFAULT_HTTP_HOST, DEFAULT_HTTP_PATH } from "./mcp/http.js";
+import type { SignInSettings } from "./mcp/sign-in.js";
 
 /** The flags that name the platform database and tune the client, on the
  * commands that write the platform table (`index`) or serve it (`mcp`): where
@@ -61,6 +63,23 @@ function hostedOptions(command: Command): Command {
  * plugin runs in, one entry for every project. */
 function applyHosted(flags: HostedFlags, root: string): void {
   configureHosted(hostedSettingsFromFlags(flags, process.env, undefined, { accountRoot: root }));
+}
+
+/** The sign-in settings for `cx mcp --http --sign-in <url>`: the resource
+ * metadata URL as given, and the platform `--db` named. */
+function signInSettings(resourceMetadataUrl: string): SignInSettings {
+  let parsed: URL;
+  try {
+    parsed = new URL(resourceMetadataUrl);
+  } catch {
+    throw new Error(`--sign-in takes the URL of the resource metadata, https://host/.well-known/oauth-protected-resource[/path], got "${resourceMetadataUrl}"`);
+  }
+  if (parsed.protocol !== "https:" && parsed.hostname !== "localhost" && parsed.hostname !== "127.0.0.1") {
+    throw new Error(`--sign-in must be an https URL (plain http only on localhost), got "${resourceMetadataUrl}"`);
+  }
+  const target = hostedTarget();
+  if (target === null) throw new Error("--sign-in needs --db <url>: the platform the accounts are on");
+  return { resourceMetadataUrl: parsed.toString(), platformBaseUrl: target.baseUrl };
 }
 
 /** Published version of this package. `cx install` pins it into the `npx`
@@ -259,6 +278,12 @@ hostedOptions(
   .option("--http-host <host>", `the address --http binds (default ${DEFAULT_HTTP_HOST}, loopback)`)
   .option("--http-path <path>", `the URL path --http serves MCP at (default ${DEFAULT_HTTP_PATH})`)
   .option("--read-only", "offer no tool that writes - no hydrate, no hydrate_cancel (or CX_READ_ONLY=1): for a URL shared with no sign-in")
+  .option(
+    "--sign-in <url>",
+    "with --http: sign-in. Every call must carry an Infino account's key as its bearer token, and a call with none is answered 401 " +
+      "naming <url>, the OAuth resource metadata that says which authorization server signs people in (the deployment's, not this process). " +
+      "--db then names the platform alone: this process holds no key, each session runs on the account its token is the key of",
+  )
   .action(async (opts: { path?: string; http?: string; httpHost?: string; httpPath?: string; readOnly?: boolean } & HostedFlags) => {
     applyHosted(opts, resolveRoot(opts.path));
     const readOnly = opts.readOnly ? { readOnly: true } : {};
@@ -271,9 +296,11 @@ hostedOptions(
         ...(opts.httpHost !== undefined ? { host: opts.httpHost } : {}),
         ...(opts.httpPath !== undefined ? { path: opts.httpPath } : {}),
         ...readOnly,
+        ...(opts.signIn !== undefined ? { signIn: signInSettings(opts.signIn) } : {}),
       });
       return;
     }
+    if (opts.signIn !== undefined) throw new Error("--sign-in is for the server over HTTP: it needs --http <port>");
     const { serveMcp } = await import("./mcp/server.js");
     await serveMcp(opts.path, readOnly);
   });

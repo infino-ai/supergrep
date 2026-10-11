@@ -164,6 +164,16 @@ The same plugin reaches every table in your Infino account, not only the directo
 
 Nothing is configured per table or per database. Point the agent at a folder of CSVs, a Parquet export, a bucket, or a directory on a dev box, and ask it to load it; then ask questions. Files on your laptop or on a remote machine go straight into the database's storage over the platform's upload sessions (`ssh` is yours: the plugin runs one `find` and one `cat` per file over it and installs nothing there); a bucket is read in place and nothing is copied.
 
+### As a connector, with sign-in
+
+The same server runs over Streamable HTTP, as one URL that claude.ai, Claude Desktop, Claude Code and any other MCP client add as a remote connector:
+
+```sh
+cx mcp --http 9121 --db https://<platform> --sign-in https://<host>/.well-known/oauth-protected-resource/mcp
+```
+
+`--sign-in` is the resource server's half of sign-in as the MCP clients do it (OAuth 2.1): every call must carry an Infino account's key as its bearer token, and a call with none - or with a key the platform refuses - is answered 401 naming that metadata URL, which is what makes the client sign the person in. The authorization server the metadata names is the deployment's, not this process: it is what shows the person a page and hands the client a key (Infino's demo hands each connection a free trial account, the same kind `cx login --platform` gets you). Every call then runs on that account: `tables`, `hydrate`, `sql` and the rest over its own databases, and revoking the key in Infino ends the connection. The process holds no key of its own. Without `--sign-in`, every session runs on the one account the process was started with, the shape for a URL shared with no sign-in (add `--read-only`).
+
 ## Indexing from object storage
 
 For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in a bucket as Parquet or JSON - leave it there, point the platform at the bucket, and it builds the index from there. Nothing is copied, nothing is downloaded to your machine, and no row passes through your laptop or through the API. The `hydrate` tool above does this from inside a session; the API it calls is below.

@@ -1334,6 +1334,11 @@ export interface ServeOptions {
   hostedOptions?: HostedOptions;
   /** Offer no tool that writes (`readOnlyEnabled` when absent). */
   readOnly?: boolean;
+  /** The key this server's platform calls carry, in place of the one the
+   * process was configured with: the server over HTTP with sign-in, where
+   * each session is one person's account and the process has no key of
+   * its own. The platform stays the configured one. */
+  apiKey?: string;
 }
 
 export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {}): Promise<void> {
@@ -1346,12 +1351,15 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // beside the local index and read by the `ask` tool.
   // Resolved once here - a bad URL or a missing key fails the server at
   // startup, not on the first tool call. The key stays inside the target;
-  // only `hostedLabel` ever reaches a log line.
-  const hosted = hostedTarget();
+  // only `hostedLabel` ever reaches a log line. A session's own key, when
+  // the server was given one, replaces the configured key and nothing else.
+  const configured = hostedTarget();
+  const hosted = configured !== null && serveOptions.apiKey !== undefined ? { ...configured, apiKey: serveOptions.apiKey } : configured;
   // The account the target came from, when no --db named a database: then
   // every repository a session opens gets its own database on it (see
-  // RepoRegistry), registered here before its first build.
-  const account = hostedAccount();
+  // RepoRegistry), registered here before its first build. Never with a
+  // session's own key: that account registers nothing from here.
+  const account = serveOptions.apiKey !== undefined ? null : hostedAccount();
 
   const noEmbed = Boolean(process.env.CX_NO_EMBED);
   // The local model exists for exactly one job now: `--embed-provider local`
