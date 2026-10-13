@@ -48,7 +48,8 @@
     "build": "tsc",
     "watch": "tsc --watch",
     "test": "vitest run",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.3.0",

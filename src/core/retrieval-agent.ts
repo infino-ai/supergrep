@@ -18,8 +18,9 @@
 
 import type { HostedDb, RowRecord } from "./hosted.js";
 import { DEFAULT_SEARCH_K } from "./config.js";
+import { jsonify } from "./json.js";
 import { citeOf, normalizeUnder, numberLines } from "./searcher.js";
-import { rowFact, type TableShape } from "./table-shape.js";
+import { chunkingNote, rowFact, type TableShape } from "./table-shape.js";
 
 /** Place-naming rows kept in one result: as many as a search returns by
  * default, so an ask result costs the outer agent what a search does.
@@ -36,6 +37,22 @@ export const MAX_ROWS = 50;
 /** Characters kept of a hit's content: search's own cap on a chunk, so a
  * ask hit reads exactly like a search hit. */
 export const HIT_CONTENT_CHARS = 4000;
+
+/** Rows a cut result is completed to at most (`completeTruncated`): the
+ * platform returns the first k of a statement's rows, and when the statement
+ * matched more, the client reads the rest with the statement itself so the
+ * caller sees every row and not a sample of them (the owner, 2026-10-04, on
+ * an answer written from 10 of 27 matching issues: "it is unacceptable to
+ * simply take the top 10 results and say 'hey i found a couple of things'
+ * ... you can use scroll or issue another query"). Past this many rows the
+ * result is a survey, and the caller is handed the statement to run or
+ * narrow instead. */
+export const COMPLETE_ROWS_CAP = 200;
+
+/** Characters of content a hit past the platform's first k keeps: enough to
+ * say what the row is, with its place named so the caller reads it whole
+ * when it matters; the first k keep `HIT_CONTENT_CHARS` as before. */
+export const REST_CONTENT_CHARS = 400;
 
 /** The platform's `terminate` value for a loop whose query validated
  * (serialized snake_case). */
@@ -147,8 +164,15 @@ function scopeInstruction(under: string): string {
 }
 
 /** The `context` field of a sub_agent request for `request`: the caller's
- * background and the scope, whichever are there, and no field at all for
- * neither.
+ * background, what a row of a table cut into passages is, and the scope,
+ * whichever are there, and no field at all for none.
+ *
+ * The passage note is the one the caller's `sql` text carries
+ * (`chunkingNote`), given to the loop as well: the loop reads tables and not
+ * how they were loaded - it does not depend on the hydrate crate - so the
+ * record that says a table was cut into passages reaches it only from here,
+ * where the client has read it. Told nothing, a loop counting "how many
+ * village articles" counts passages.
  *
  * This is where `under` becomes an INSTRUCTION rather than a filter. The
  * sub_agent request type rejects unknown keys and has no path field of any
@@ -165,6 +189,8 @@ function scopeInstruction(under: string): string {
 function agentContext(request: RetrievalAgentRequest, under: string | undefined): { context: string } | Record<string, never> {
   const parts: string[] = [];
   if (request.context !== undefined) parts.push(request.context);
+  const passages = chunkingNote(request.shape?.chunking).trim();
+  if (passages) parts.push(passages);
   if (under !== undefined) parts.push(scopeInstruction(under));
   return parts.length > 0 ? { context: parts.join("\n\n") } : {};
 }
@@ -254,6 +280,78 @@ export interface RetrievalAgentResult {
   /** Echoed when `under` scoped the question, so a caller reading the facts
    * knows they answer for a subtree and not the repository. */
   under?: string;
+  /** Present when the platform returned the first k of the statement's rows
+   * and the client read the rest with the statement (`completeTruncated`):
+   * says so, and that the rows past the first k carry a shorter content. */
+  completed?: string;
+  /** Present when the statement matched more rows than a result is
+   * completed to, or the rest could not be read: how many, and the
+   * statement to run (or narrow) for them. */
+  more?: string;
+}
+
+/** The result with every row of its statement, when the platform returned
+ * only the first k of them and the rest are few enough to read
+ * (`COMPLETE_ROWS_CAP`): the statement is run again as it stands and the
+ * rows not already in the result follow it, the platform's ranked first k
+ * kept in front, the rest in the statement's order with their content cut
+ * to `REST_CONTENT_CHARS`. The second run is the same statement the loop
+ * validated, so the rows are the same rows; the platform has no cursor to
+ * page with, and running the statement is the one way to read past k. A
+ * statement that matched more than the cap, or that fails on the second
+ * run, leaves the result as it was with `more` saying how to read the rest.
+ * A result that was not cut, or carries no statement, is returned as it is. */
+export async function completeTruncated(
+  hosted: Pick<HostedDb, "querySql">,
+  result: RetrievalAgentResult,
+  shape?: TableShape,
+): Promise<RetrievalAgentResult> {
+  const coverage = result.coverage;
+  if (!coverage?.truncated || !result.sql) return result;
+  const statement = result.sql;
+  const rest = (why: string): RetrievalAgentResult => ({
+    ...result,
+    more: `${coverage.rowsTotal} rows matched and ${coverage.rowsReturned} are here${why}; every row is one sql call away - run the statement as it stands, or narrow it: ${statement}`,
+  });
+  if (coverage.rowsTotal > COMPLETE_ROWS_CAP) return rest(` (a result is completed to ${COMPLETE_ROWS_CAP} at most)`);
+  let all: RowRecord[];
+  try {
+    all = await hosted.querySql(statement);
+  } catch (err) {
+    return rest(` (reading the rest failed: ${(err as Error).message})`);
+  }
+  const found = factsFrom(all, COMPLETE_ROWS_CAP, shape, COMPLETE_ROWS_CAP);
+  const seenHits = new Set(result.hits.map((h) => `${h.path}:${h.startLine}`));
+  // jsonify: a platform row's 64-bit cells are bigints (`keepBigIntegers`).
+  const seenRows = new Set(result.rows.map((r) => jsonify(r)));
+  const hits = [...result.hits];
+  for (const hit of found.hits) {
+    const key = `${hit.path}:${hit.startLine}`;
+    if (seenHits.has(key)) continue;
+    seenHits.add(key);
+    hits.push({ ...hit, content: hit.content.slice(0, REST_CONTENT_CHARS) });
+  }
+  const rows = [...result.rows];
+  for (const row of found.rows) {
+    const key = jsonify(row);
+    if (seenRows.has(key)) continue;
+    seenRows.add(key);
+    rows.push(row);
+  }
+  const added = hits.length - result.hits.length + (rows.length - result.rows.length);
+  if (added === 0) return rest(" (the second run returned no row that was not already here)");
+  return {
+    ...result,
+    coverage: { ...coverage, rowsReturned: coverage.rowsReturned + added, truncated: false },
+    hits,
+    rows,
+    hitsTotal: Math.max(result.hitsTotal, hits.length),
+    rowsTotal: Math.max(result.rowsTotal, rows.length),
+    completed:
+      `the platform returned the first ${coverage.rowsReturned} of ${coverage.rowsTotal} rows the statement matched; ` +
+      `the client ran the statement again and the other ${added} follow them, so every matching row is here ` +
+      `(rows past the first ${coverage.rowsReturned} keep ${REST_CONTENT_CHARS} characters of content; read one whole with sql by its place)`,
+  };
 }
 
 /** What the loop cost on the platform, for the usage ledger and receipt:
@@ -418,16 +516,17 @@ function noAnswerMessage(terminate: string, detail: unknown): string {
  * (`rowFact`: text as snippets, list cells kept, the statement's aliases
  * kept) and `hits` stays empty: a row of a hydrated table names no place in
  * code even where its columns happen to be called path and start_line. */
-export function factsFrom(rows: unknown[], maxHits: number = MAX_HITS, shape?: TableShape): Facts {
+export function factsFrom(rows: unknown[], maxHits: number = MAX_HITS, shape?: TableShape, maxRows: number = MAX_ROWS): Facts {
   const hits: RetrievalAgentHit[] = [];
   const aggregates: RowRecord[] = [];
   const seenHits = new Set<string>();
   const seenRows = new Set<string>();
   const keepRow = (row: RowRecord) => {
-    const key = JSON.stringify(row);
+    // jsonify: a fact row's 64-bit cells are bigints (`keepBigIntegers`).
+    const key = jsonify(row);
     if (seenRows.has(key)) return;
     seenRows.add(key);
-    if (aggregates.length < MAX_ROWS) aggregates.push(row);
+    if (aggregates.length < maxRows) aggregates.push(row);
   };
   for (const raw of rows) {
     if (shape) {

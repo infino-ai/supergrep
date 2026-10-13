@@ -455,4 +455,17 @@ describe("sql", () => {
   it("rejects writes", async () => {
     await expect(runSql(handle, fakeEmbedder, "DELETE FROM chunks")).rejects.toThrow(/read-only/);
   });
+
+  it("runs a statement that opens with comments and ends with one, as the engine reads them", async () => {
+    // The CLI's path passes the guard's statement to the engine as it is:
+    // the leading comments with it, the closing semicolon and the comment
+    // after it read off.
+    const rows = await runSql(
+      handle,
+      fakeEmbedder,
+      "-- which files mention sessions\n/* ranked by keyword */ SELECT path FROM bm25_search('chunks','content','session', 10) -- the top ten\n; -- done",
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.map((r) => String(r.path))).toContain("src/auth.ts");
+  });
 });

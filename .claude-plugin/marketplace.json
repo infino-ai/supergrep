@@ -2,13 +2,13 @@
   "name": "infino-ai",
   "owner": { "name": "Infino AI" },
   "metadata": {
-    "description": "Infino AI's marketplace of Claude Code plugins. Currently SuperGrep (retrieval subagents for Claude Sonnet, package code-context), with more to come."
+    "description": "Infino AI's marketplace of Claude Code plugins. Currently SuperGrep (code and data through one MCP, package code-context), with more to come."
   },
   "plugins": [
     {
-      "name": "code-context",
+      "name": "supergrep",
       "source": "./",
-      "description": "SuperGrep: retrieval subagents for Claude Sonnet - find/search/sql locally, ask over the platform copy in the cloud."
+      "description": "SuperGrep: your code and your data through one MCP - find, search, sql, read and ask over any directory, and over every table in your Infino account; hydrate loads a dataset from a bucket, this machine or a remote one."
     }
   ]
 }

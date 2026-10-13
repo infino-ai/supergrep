@@ -90,9 +90,10 @@ export interface UsageEntry {
   /** Written by the removed `explore` tool; read only from older ledgers. */
   agentAnswered?: boolean;
   /** ask: what the platform call behind this entry cost on
-   * the wire - the round trip of the answering request and the read/write
-   * tokens the platform metered (from its response headers, when present).
-   * Lives in the ledger, never in the tool result. */
+   * the wire - the round trip of the answering request, the read/write
+   * tokens the platform metered and the bytes its egress meter recorded
+   * (from its response headers, when present). Lives in the ledger, never
+   * in the tool result. */
   platform?: { rttMs: number; readTokens?: number; writeTokens?: number; resultBytes?: number };
 }
 

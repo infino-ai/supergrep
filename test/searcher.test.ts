@@ -10,8 +10,10 @@ import {
   numberLines,
   numberRowLines,
   plainTerms,
+  withoutComments,
 } from "../src/core/searcher.js";
 import { hasIndexableToken, isAnalyzer } from "../src/core/analyzer.js";
+import { ordersRows } from "../src/core/facts.js";
 import { emptyManifest } from "../src/core/manifest.js";
 import type { Embedder } from "../src/core/embedder.js";
 
@@ -262,6 +264,92 @@ describe("guardSql", () => {
   it("rejects writes", () => {
     expect(() => guardSql("DROP TABLE chunks")).toThrow(/read-only/);
     expect(() => guardSql("INSERT INTO chunks VALUES (1)")).toThrow(/read-only/);
+  });
+
+  // The shape refused 13 times on the demo from 2026-09-30, and every
+  // other way a comment can stand before or after the statement. The
+  // statement comes back as written - the engine reads its own comments -
+  // trimmed and with a closing semicolon off its end, as before.
+  it("accepts a statement that opens with comments, and returns it as written", () => {
+    const opening = "-- For each top org, the subjects that cite it\nSELECT org FROM t";
+    expect(guardSql(opening)).toBe(opening);
+    expect(guardSql("-- one\n  -- two\nWITH m AS (SELECT 1) SELECT * FROM m")).toMatch(/WITH m AS/);
+    expect(guardSql("/* a block */ SELECT 1")).toBe("/* a block */ SELECT 1");
+    expect(guardSql("/* nested /* block */ comment */ SELECT 1")).toBe("/* nested /* block */ comment */ SELECT 1");
+    expect(guardSql("(SELECT 1) UNION ALL (SELECT 2)")).toBe("(SELECT 1) UNION ALL (SELECT 2)");
+    expect(guardSql("SELECT 1 -- a trailing comment")).toBe("SELECT 1 -- a trailing comment");
+    expect(guardSql("SELECT 1; -- after the closing semicolon\n")).toBe("SELECT 1; -- after the closing semicolon");
+    // The engine's parser skips empty statements, between semicolons and
+    // before the first one.
+    expect(guardSql("SELECT 1;;")).toBe("SELECT 1;");
+    expect(guardSql(";SELECT 1")).toBe(";SELECT 1");
+    expect(guardSql("; ; SELECT 1")).toBe("; ; SELECT 1");
+  });
+
+  it("reads a semicolon or a keyword inside a string, a quoted name or a comment as text", () => {
+    for (const sql of [
+      "SELECT ';' AS s",
+      "SELECT 'it''s; fine' AS s",
+      "SELECT E'a\\'; b' AS s",
+      "SELECT $$; DROP TABLE t$$ AS s",
+      'SELECT 1 AS "a;b"',
+      "SELECT 1 -- a comment; with a semicolon\nFROM t",
+      `SELECT path FROM hybrid_search('chunks','content','x','embedding', {{q:"wal; recovery -- why"}}, 20)`,
+      "-- DROP TABLE chunks\nSELECT 1",
+    ]) {
+      expect(guardSql(sql)).toBe(sql);
+    }
+  });
+
+  it("still refuses a second statement or a write, however commented", () => {
+    expect(() => guardSql("SELECT 1; -- one\nSELECT 2")).toThrow(/single statement/);
+    expect(() => guardSql("SELECT ';'; DELETE FROM chunks")).toThrow(/single statement/);
+    expect(() => guardSql("/* SELECT */ DROP TABLE chunks")).toThrow(/read-only/);
+    expect(() => guardSql("-- SELECT 1\nDELETE FROM chunks")).toThrow(/read-only/);
+    expect(() => guardSql("-- only a comment")).toThrow(/read-only/);
+    expect(() => guardSql("'SELECT' AS s")).toThrow(/read-only/);
+    expect(() => guardSql("SELECTX 1")).toThrow(/read-only/);
+  });
+
+  // Read as a comment to the end, the rest of the statement would vanish
+  // and a shorter one run: the filter after a nested `/*` in a path, or
+  // after a forgotten `*/`, gone from a count that then covers every row.
+  it("refuses a block comment that never closes, saying how to close it", () => {
+    for (const sql of [
+      "SELECT count(*) FROM chunks /* only files under src/* */ WHERE path LIKE 'src/%'",
+      "SELECT count(*) FROM chunks /* the failing ones WHERE resolved = 'false'",
+    ]) {
+      expect(() => guardSql(sql), sql).toThrow(/comment in the statement never closes/);
+      expect(withoutComments(sql), sql).toBe(sql);
+    }
+  });
+});
+
+describe("withoutComments", () => {
+  it("reads out line and block comments, each leaving its newlines", () => {
+    expect(withoutComments("-- which tables\nSELECT a /* the key */ FROM t -- done")).toBe("\nSELECT a   FROM t  ");
+    expect(withoutComments("SELECT 1--1\nFROM t")).toBe("SELECT 1\nFROM t");
+    expect(withoutComments("SELECT path,\n/* the file\n and its size */\ncount(*) n FROM chunks")).toBe("SELECT path,\n\n\ncount(*) n FROM chunks");
+  });
+
+  it("leaves no ORDER BY that only a comment wrote for the row ranking to read", () => {
+    expect(ordersRows(withoutComments("-- order by the count\nSELECT path, count(*) FROM chunks GROUP BY path"))).toBe(false);
+    expect(ordersRows(withoutComments("SELECT path FROM chunks ORDER BY path -- by path"))).toBe(true);
+  });
+
+  it("leaves a comment marker inside a string, a quoted name or the platform's placeholder alone", () => {
+    const kept = [
+      "SELECT '-- not a comment', 'a /* b */' FROM t",
+      'SELECT "x--y" FROM t',
+      "SELECT $$ -- $$ FROM t",
+      `SELECT path FROM vector_search('chunks','embedding', {{q:"a -- b /* c"}}, 10)`,
+    ];
+    for (const sql of kept) expect(withoutComments(sql)).toBe(sql);
+  });
+
+  it("leaves a statement without comments exactly as written", () => {
+    const sql = "SELECT c.path, count(*) FROM chunks c WHERE c.lang = 'rs' GROUP BY c.path ORDER BY 2 DESC";
+    expect(withoutComments(sql)).toBe(sql);
   });
 });
 
