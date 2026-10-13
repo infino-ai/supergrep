@@ -426,3 +426,62 @@ describe("the account's data through the server started for a repository", () =>
     expectNothingBuilt(s);
   });
 });
+
+describe("the tables a load makes, as the server keeps them", () => {
+  /** The table a load is making, and one made by a load this server never
+   * followed. */
+  const EVENTS = "events";
+  const LATE = "late";
+  /** What the platform holds: the database's tables and the load's state,
+   * changed by each test as the load moves. */
+  let tables: string[] = [ACCOUNTS];
+  let state = "running";
+  let s: Started;
+  beforeAll(async () => {
+    s = await start(
+      scriptPlatform({
+        list_tables: () => [200, tables],
+        schema: (body) => (tables.includes(String(body?.table_name)) ? [200, ACCOUNTS_COLUMNS] : [404, { error: `no such table ${String(body?.table_name)}` }]),
+        table_card: (body) => [404, { error: `no lean card for table ${String(body?.table)}` }],
+        query_sql: () => [200, [{ account_id: 42 }]],
+        validate: () => [200, { valid: true, check: "unchecked" }],
+        hydrate: (body) => [200, { job: `${String(body?.table)}-1`, state }],
+      }),
+      "cx-data-cache-",
+    );
+  });
+  afterAll(async () => {
+    await stop(s);
+  });
+
+  it("a status read that sees the load end shows the table it made; one that sees it running keeps what was read", async () => {
+    const before = await call(s, "tables", { database: DATA_DB });
+    expect(before.value).toEqual({ database: DATA_DB, tables: [ACCOUNTS] });
+
+    tables = [ACCOUNTS, EVENTS];
+    const running = await call(s, "hydrate_status", { database: DATA_DB, table: EVENTS });
+    expect(running.value).toMatchObject({ state: "running" });
+    const still = await call(s, "tables", { database: DATA_DB });
+    expect(still.ops).toEqual([]);
+    expect(still.value).toEqual({ database: DATA_DB, tables: [ACCOUNTS] });
+
+    state = "succeeded";
+    const ended = await call(s, "hydrate_status", { database: DATA_DB, table: EVENTS });
+    expect(ended.value).toMatchObject({ state: "succeeded" });
+    const after = await call(s, "tables", { database: DATA_DB });
+    expect(after.ops).toEqual(["list_tables"]);
+    expect(after.value).toEqual({ database: DATA_DB, tables: [ACCOUNTS, EVENTS] });
+  });
+
+  it("sql reads the tables once more before refusing one the kept list lacks", async () => {
+    tables = [ACCOUNTS, EVENTS, LATE];
+    const late = await call(s, "sql", { database: DATA_DB, table: LATE, query: `SELECT account_id FROM ${LATE}` });
+    expect(late.ok, String(late.value)).toBe(true);
+    expect(late.ops[0]).toBe("list_tables");
+
+    const missing = await call(s, "sql", { database: DATA_DB, table: "nosuch", query: "SELECT 1 FROM nosuch" });
+    expect(missing.ok).toBe(false);
+    expect(missing.ops).toEqual(["list_tables"]);
+    expect(String(missing.value)).toContain(`its tables are ${ACCOUNTS}, ${EVENTS}, ${LATE}`);
+  });
+});

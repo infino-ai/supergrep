@@ -2081,13 +2081,24 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     question: string | undefined,
   ) => {
     if (!data) return noDataPlane("sql");
+    const unlisted = (err: unknown) => fail(`sql failed: the tables of ${database} could not be listed: ${(err as Error).message}${refusalHint(err)}`);
     let names: string[];
     try {
       names = await data.tableNames(database);
     } catch (err) {
-      return fail(`sql failed: the tables of ${database} could not be listed: ${(err as Error).message}${refusalHint(err)}`);
+      return unlisted(err);
     }
-    if (table !== undefined && !names.includes(table)) return fail(`sql: ${database} has no table ${table}; its tables are ${names.join(", ")}`);
+    // A table the kept list lacks may have been made since it was read - by
+    // a load nobody followed with hydrate_status, or one started elsewhere -
+    // so the list is read once more before the table is refused.
+    if (table !== undefined && !names.includes(table)) {
+      try {
+        names = await data.tableNames(database, true);
+      } catch (err) {
+        return unlisted(err);
+      }
+      if (!names.includes(table)) return fail(`sql: ${database} has no table ${table}; its tables are ${names.join(", ")}`);
+    }
     const verdict = await joinGate(code, names, (spanned) => keysAmong(spanned, data.quick(database)));
     if (verdict.kind === "refuse") return fail(joinRefusal("sql", verdict));
     const named = table ?? tablesNamed(code, names)[0];
@@ -3138,7 +3149,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         },
         async ({ database, table }: { database: string; table: string }) => {
           try {
-            return ok((await plane.quick(database).hydrateJob(table)) as Record<string, unknown>);
+            return ok((await plane.hydrateStatus(database, table)) as Record<string, unknown>);
           } catch (err) {
             return fail(`hydrate_status failed: ${(err as Error).message}${refusalHint(err)}`);
           }
