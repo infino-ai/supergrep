@@ -11,7 +11,9 @@
 // `serveMcp` exactly as the stdio server is, with its own caches - and the
 // transport answers with the session's id, which the client sends on every
 // later request. A session that goes quiet is closed after SESSION_IDLE_MS;
-// a client's DELETE closes it at once. One session's work never reaches
+// a client's DELETE closes it at once; with sign-in, one key holds at most
+// MAX_SESSIONS_PER_KEY, its least recently used closed past that. One
+// session's work never reaches
 // another's: the registry, the data plane and the receipts are the
 // session's.
 //
@@ -46,15 +48,26 @@ const SESSION_HEADER = "mcp-session-id";
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 /** How often idle sessions are looked for. */
 const SWEEP_MS = 60 * 1000;
+/** The most sessions one account's key holds at once, with sign-in. A
+ * client that goes away without a DELETE leaves its session to the idle
+ * sweep, so a person who restarts a client within SESSION_IDLE_MS holds
+ * several; past this, the key's least recently used session is closed, and
+ * its client gets the 404 an idled-out session gets and starts a new one.
+ * Well above one person's clients and agents at once: a cap below a key's
+ * real concurrency would have its sessions close each other in turn. */
+const MAX_SESSIONS_PER_KEY = 32;
 /** The most of a request body read before a session exists: an
  * `initialize` request is a few hundred bytes. */
 const MAX_INITIALIZE_BYTES = 64 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
-/** JSON-RPC's own codes for the refusals answered here. */
+/** JSON-RPC codes for the refusals answered here, one per refusal, from
+ * the range JSON-RPC leaves to servers. Session-not-found is -32001, the
+ * code the SDK's own transport answers it with, so a client sees one code
+ * whichever layer refuses. */
 const JSONRPC_SESSION_NOT_FOUND = -32001;
 const JSONRPC_INVALID_REQUEST = -32600;
-const JSONRPC_UNAUTHORIZED = -32001;
 const JSONRPC_UNAVAILABLE = -32002;
+const JSONRPC_UNAUTHORIZED = -32003;
 const BEARER = /^Bearer\s+(\S+)$/i;
 
 export interface HttpServeOptions extends Pick<ServeOptions, "hostedOptions" | "readOnly"> {
@@ -64,6 +77,8 @@ export interface HttpServeOptions extends Pick<ServeOptions, "hostedOptions" | "
   path?: string;
   /** Idle time before a session is closed (SESSION_IDLE_MS). */
   idleMs?: number;
+  /** The most sessions one key holds (MAX_SESSIONS_PER_KEY). */
+  maxSessionsPerKey?: number;
   /** Sign-in: the URL of the OAuth resource metadata a call with no key is
    * pointed at. Absent, every session runs on the configured account. */
   signIn?: string;
@@ -118,9 +133,11 @@ export async function serveHttp(rootPath: string | undefined, opts: HttpServeOpt
   const host = opts.host ?? DEFAULT_HTTP_HOST;
   const path = opts.path ?? DEFAULT_HTTP_PATH;
   const idleMs = opts.idleMs ?? SESSION_IDLE_MS;
+  const maxPerKey = opts.maxSessionsPerKey ?? MAX_SESSIONS_PER_KEY;
   const sessions = new Map<string, Session>();
   // Over HTTP this machine is the server's, not the caller's: hydrate never
-  // reads its files.
+  // reads its files, and a query tool's path names no directory but the one
+  // the server was started for.
   const serveOptions: Omit<ServeOptions, "transport"> = {
     hostFiles: false,
     ...(opts.hostedOptions ? { hostedOptions: opts.hostedOptions } : {}),
@@ -132,13 +149,30 @@ export async function serveHttp(rootPath: string | undefined, opts: HttpServeOpt
   const signIn = (res: ServerResponse, message: string): void =>
     refuse(res, 401, JSONRPC_UNAUTHORIZED, message, { "www-authenticate": `Bearer resource_metadata="${opts.signIn}"` });
 
+  /** Close a session, out of the map first so no request reaches it. */
+  const drop = (id: string, session: Session): void => {
+    sessions.delete(id);
+    void session.transport.close().catch(() => undefined);
+  };
+
+  /** Make room for one more of `key`'s sessions: its least recently used
+   * are closed until fewer than the cap remain. Only with sign-in - without
+   * it every session's key is absent, and a cap would let any caller close
+   * another's. */
+  const makeRoom = (key: string): void => {
+    const held = [...sessions].filter(([, s]) => s.key === key).sort(([, a], [, b]) => a.lastSeen - b.lastSeen);
+    for (const [id, session] of held.slice(0, Math.max(0, held.length - maxPerKey + 1))) drop(id, session);
+  };
+
   /** A session's server and transport, registered once the transport has
    * answered the initialize request with the session's id. With sign-in,
-   * the session runs on the account `key` belongs to. */
+   * the session runs on the account `key` belongs to, and the key's oldest
+   * session makes way past MAX_SESSIONS_PER_KEY. */
   const open = async (key: string | undefined): Promise<StreamableHTTPServerTransport> => {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (id) => {
+        if (key !== undefined) makeRoom(key);
         sessions.set(id, { transport, lastSeen: Date.now(), ...(key !== undefined ? { key } : {}) });
       },
       onsessionclosed: (id) => {
@@ -181,6 +215,9 @@ export async function serveHttp(rootPath: string | undefined, opts: HttpServeOpt
       }
       session.lastSeen = Date.now();
       await session.transport.handleRequest(req, res);
+      // Seen again when the call ends, so a session busy with a long call is
+      // not the one the cap closes first.
+      session.lastSeen = Date.now();
       return;
     }
     // No session named: only an initialize request opens one. The body is
@@ -223,10 +260,7 @@ export async function serveHttp(rootPath: string | undefined, opts: HttpServeOpt
   const sweep = setInterval(() => {
     const cutoff = Date.now() - idleMs;
     for (const [id, session] of sessions) {
-      if (session.lastSeen < cutoff) {
-        sessions.delete(id);
-        void session.transport.close().catch(() => undefined);
-      }
+      if (session.lastSeen < cutoff) drop(id, session);
     }
   }, SWEEP_MS);
   sweep.unref();

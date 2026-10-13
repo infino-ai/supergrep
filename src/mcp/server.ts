@@ -1057,7 +1057,12 @@ function noFullTextSentence(shape: TableShape): string {
   );
 }
 
-export function rowsInstructions(shape: TableShape, platformTools: boolean): string {
+/** The sentence that offers `path`, where it is offered: a server that
+ * reads this machine's other repositories (`hostFiles`). */
+const OTHER_REPO_SENTENCE = (hostFiles: boolean): string =>
+  hostFiles ? " Every tool takes an optional 'path' (an absolute repo root) to target a repository instead, whose local code index it then reads." : "";
+
+export function rowsInstructions(shape: TableShape, platformTools: boolean, hostFiles = true): string {
   const { table, keyColumn: key, primaryText: text } = shape;
   const rowIs = shape.chunking ? `one row per passage of a record's ${shape.chunking.column}` : "one row per record";
   return (
@@ -1098,9 +1103,8 @@ export function rowsInstructions(shape: TableShape, platformTools: boolean): str
       ? `Hits are rows: a score, the row's ${key}, its scalar columns, and its text columns cut to a snippet of ` +
         `${SNIPPET_CHARS} characters. ${citeRows(shape)}`
       : `Rows come back with the columns their statement selected. ${citeRows(shape, "rows")}`) +
-    ` ${COUNTS_IN_THE_ANSWER} ` +
-    "Every tool takes an optional 'path' (an absolute repo root) to target a repository instead, whose local " +
-    "code index it then reads."
+    ` ${COUNTS_IN_THE_ANSWER}` +
+    OTHER_REPO_SENTENCE(hostFiles)
   );
 }
 
@@ -1308,14 +1312,14 @@ export type TableMode = { kind: "chunks" } | { kind: "rows"; shape: TableShape }
  * `unresolved`): the doors are registered for its rows, say what the table
  * is, and say that every call reports the cause - so a model reading the
  * text is not sent to write chunks-shaped SQL against it. */
-export function unresolvedInstructions(table: string, cause: string, platformTools: boolean): string {
+export function unresolvedInstructions(table: string, cause: string, platformTools: boolean, hostFiles = true): string {
   return (
     `code-context is an index of the ${table} table on the platform, one row per record. The table could not be ` +
     `described from the platform when this server started (${cause}), so ` +
     (platformTools ? "find, search, sql and ask" : "find, search and sql") +
     " each return that error until the server is restarted with the platform reachable; nothing runs against a " +
-    "local index in its place. Every tool takes an optional 'path' (an absolute repo root) to target a repository " +
-    "instead, whose local code index it then reads."
+    "local index in its place." +
+    OTHER_REPO_SENTENCE(hostFiles)
   );
 }
 
@@ -1335,19 +1339,33 @@ export interface ServeOptions {
   /** Offer no tool that writes (`readOnlyEnabled` when absent). */
   readOnly?: boolean;
   /** The key this session's platform calls carry instead of the configured
-   * one (the server over HTTP with sign-in). */
+   * one (the server over HTTP with sign-in). The repository the server was
+   * started for is then not served at all (see `signedIn`). */
   apiKey?: string;
-  /** Whether hydrate may read files on the machine this server runs on
-   * (kinds path and ssh). False over HTTP, where that machine is not the
-   * caller's: its files are the server's own. */
+  /** Whether the tools may read files on the machine this server runs on:
+   * hydrate's kinds path and ssh, and a query tool's `path` naming any
+   * directory but the one the server was started for. False over HTTP,
+   * where that machine is not the caller's: its files are the server's own. */
   hostFiles?: boolean;
 }
+
+/** What a signed-in caller is told when a tool would read the repository
+ * the server was started for: the server's own, which the account the
+ * caller signed in with holds no copy of. */
+const SIGNED_IN_ROOT =
+  "this server's own repository is not served to a signed-in account; name a database of your account (tables lists them)";
 
 export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {}): Promise<void> {
   const { hostedOptions } = serveOptions;
   const readOnly = serveOptions.readOnly ?? readOnlyEnabled();
   const hostFiles = serveOptions.hostFiles ?? true;
   const defaultRoot = resolveRoot(rootPath);
+  // With sign-in, every call runs on the caller's account, which holds no
+  // copy of this server's repository: the default root carries no platform
+  // client, nothing builds or syncs it, and every tool that would read it
+  // says so (SIGNED_IN_ROOT). A build would otherwise write this server's
+  // chunks into whatever database of the caller's account `--db` names.
+  const signedIn = serveOptions.apiKey !== undefined;
 
   // The platform database (--db <url>), when one is configured: the default
   // root's chunks table also lives there, written by every build and sync
@@ -1377,11 +1395,14 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // arg targets one, defaulting to the startup root. Each repo keeps its own
   // connection, auto-sync clock, and mutation lock, held in a small LRU so a
   // session that roams across many repos doesn't accumulate connections. Only
-  // the default root's context carries the platform client (see RepoRegistry).
+  // the default root's context carries the platform client (see RepoRegistry),
+  // and not under sign-in. Without host files, the default root is the only
+  // one served.
   const registry = new RepoRegistry(defaultRoot, {
     connect,
-    ...(hosted ? { hosted: { target: hosted, ...(hostedOptions ? { options: hostedOptions } : {}) } } : {}),
+    ...(hosted && !signedIn ? { hosted: { target: hosted, ...(hostedOptions ? { options: hostedOptions } : {}) } } : {}),
     ...(account ? { account } : {}),
+    ...(hostFiles ? {} : { defaultOnly: true }),
   });
   const repoFor = (requested?: string): RepoCtx => registry.get(requested);
 
@@ -1417,12 +1438,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // the next query sees the fresh one. CX_AUTO_SYNC=0 disables; the debounce
   // keeps the stat walk off the hot path (~20ms to ~2s depending on repo size).
   // A sync writes the platform table too, so the two never drift.
-  const autoSyncEnabled = autoSyncSetting();
+  const autoSyncEnabled = !signedIn && autoSyncSetting();
   const syncIntervalMs = Number(process.env.CX_SYNC_INTERVAL_SECS ?? 30) * 1000;
   // A search/sql on a never-indexed repo builds the index inline, then answers
   // on the same call (staged: keyword search live in seconds). Off restores the
   // strict "index it first" error.
-  const autoIndexEnabled = autoIndexSetting();
+  const autoIndexEnabled = !signedIn && autoIndexSetting();
 
   // A terse, local, factual receipt appended to each query result (tokens
   // returned, files touched, whole-file size it stood in for, session running
@@ -1732,6 +1753,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * build would write. Every local door goes through here, so the ownership
    * rule cannot be missed by one of them. */
   const localIndex = async (ctx: RepoCtx): Promise<{ handle: IndexHandle; autoIndexed?: IndexStats } | { failed: ReturnType<typeof fail> }> => {
+    if (signedIn) return { failed: fail(SIGNED_IN_ROOT) };
     let ensured: EnsureResult;
     try {
       ensured = await ensureIndexed(ctx, { autoIndexEnabled: autoIndexEnabled && ownsTable(ctx), getHandle, build: buildIndex });
@@ -1758,7 +1780,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const noPlatform = (tool: string, ctx: RepoCtx): ReturnType<typeof fail> | null =>
     ctx.hosted
       ? null
-      : fail(`${tool} works on the repository the server was started for, whose index is also on the platform database; ${ctx.root} is served by find, search and sql only`);
+      : signedIn
+        ? fail(`${tool}: ${SIGNED_IN_ROOT}`)
+        : fail(`${tool} works on the repository the server was started for, whose index is also on the platform database; ${ctx.root} is served by find, search and sql only`);
 
   /** The platform tools' second precondition, after the index exists: the
    * platform's chunks table does too. A table not there yet is either being
@@ -1887,8 +1911,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // The sibling tables (CX_SIBLING_TABLES). Every card is asked for alone:
   // asked beside its siblings it would come back carrying the platform's
   // joins, and no key reaches the tool text - the model calls join_keys.
-  const siblingNames = hosted ? siblingTables() : [];
-  if (hosted && TABLE !== DEFAULT_TABLE) {
+  // None of it under sign-in: the default root's table is this server's
+  // own, and the caller's account holds no copy of it.
+  const siblingNames = hosted && !signedIn ? siblingTables() : [];
+  if (hosted && !signedIn && TABLE !== DEFAULT_TABLE) {
     try {
       // With the load's record: a table cut into passages says so in the
       // tool text (`chunkingNote`), and a `vector` column the load embedded
@@ -1916,7 +1942,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       console.error(`the ${TABLE} table could not be described (${cause}); every tool call will say so`);
       mode = { kind: "unresolved", cause };
     }
-  } else if (platformTools) {
+  } else if (platformTools && !signedIn) {
     // The table's card, folded into the `sql` description once at startup so
     // every statement is written knowing the table's shape. Measured worth:
     // 37% off the wall clock of aggregation questions, with quality level and
@@ -2196,9 +2222,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     { name: "code-context", version: "0.1.2" },
     {
       instructions: withListedNames((rows
-        ? rowsInstructions(rows, agentTools)
+        ? rowsInstructions(rows, agentTools, hostFiles)
         : mode.kind === "unresolved"
-        ? unresolvedInstructions(TABLE, mode.cause, agentTools)
+        ? unresolvedInstructions(TABLE, mode.cause, agentTools, hostFiles)
         : logIndex
         ? logIndexInstructions(agentTools, startManifest?.files ?? 0, startManifest?.chunks ?? 0) + (platformTools ? "" : ` ${noAccountSteps()}.`)
         : // The first move was ls and cat CLAUDE.md, every run, before any of
@@ -2280,7 +2306,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         CITE_FROM_HIT +
         ` ${COUNTS_IN_THE_ANSWER}` +
         " Read files with read, every path in one call; Claude's own Read only for a hit marked truncated. " +
-        "Every tool takes an optional 'path' (an absolute repo root) to target another repository. " +
+        (hostFiles ? "Every tool takes an optional 'path' (an absolute repo root) to target another repository. " : "") +
         "A 'partial' marker means files over the index cap were left out, so a missing match is not " +
         "proof of absence." +
         // Without an account the two platform tools are not registered, and
@@ -2439,6 +2465,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // the default root alone) - there is no local vector fallback to fall
       // back to any more, so that case is a clear refusal, not a degraded run.
       if (!ctx.hosted) {
+        if (signedIn) return fail(`search: ${SIGNED_IN_ROOT}`);
         return fail(
           "search needs an account; the default repository has one but " +
             `'${path}' does not. Use sql's bm25_search/token_match for keyword ranking there instead.`,
@@ -2818,6 +2845,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // the platform's copy ever does (see wantsLocalEmbed above) - so
       // refuse plainly rather than let the engine fail on a missing column.
       if (!ctx.hosted && embedsAQuery(query)) {
+        if (signedIn) return fail(`sql: ${SIGNED_IN_ROOT}`);
         return fail(
           "this statement embeds a query (hybrid_search/vector_search), which needs an account - " +
             "there is no local vector index. Use bm25_search or token_match for keyword ranking instead. " +
