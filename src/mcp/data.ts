@@ -64,6 +64,12 @@ const DEFAULT_FORMAT = "auto";
  * are put in the database's storage. */
 const PREFIX_SOURCE = "prefix";
 
+/** The states a load is still under way in, as the platform's job record
+ * names them. A status read in any other - stopped, succeeded, failed, or
+ * one this client does not know - is a load that has ended, and may have
+ * added, rewritten or dropped its table. */
+const LIVE_JOB_STATES: ReadonlySet<string> = new Set(["pending", "running", "cancelling"]);
+
 export interface DataPlaneOptions {
   /** The platform and the key: the account every database is reached on. */
   account: AccountTarget;
@@ -154,9 +160,11 @@ export class DataPlane {
     return listDatabases(this.account, this.clientOptions.fetch ? { fetch: this.clientOptions.fetch } : {});
   }
 
-  /** The names of `database`'s tables, read once and kept until a hydrate
-   * into it (`forget`); a read that failed is not kept. */
-  tableNames(database: string): Promise<string[]> {
+  /** The names of `database`'s tables, read once and kept until a load into
+   * it is seen to end (`forget`); `fresh` reads them again first. A read
+   * that failed is not kept. */
+  tableNames(database: string, fresh = false): Promise<string[]> {
+    if (fresh) this.names.delete(database);
     let pending = this.names.get(database);
     if (!pending) {
       pending = this.quick(database)
@@ -191,11 +199,28 @@ export class DataPlane {
     return pending;
   }
 
-  /** Forget what was read of `database`: its tables and their shapes. After
-   * a hydrate into it, which adds a table or rewrites one. */
-  forget(database: string): void {
+  /** Forget what was read of `database`: its tables, and the shape of
+   * `table` or, with none named, of every table. After a load into it,
+   * which adds a table, rewrites one or drops one. */
+  forget(database: string, table?: string): void {
     this.names.delete(database);
+    if (table !== undefined) {
+      this.shapes.delete(`${database}\n${table}`);
+      return;
+    }
     for (const key of [...this.shapes.keys()]) if (key.startsWith(`${database}\n`)) this.shapes.delete(key);
+  }
+
+  /** The `hydrate_status` tool: the record of the job that loads `table`.
+   * A load seen to have ended forgets the database's tables and the table's
+   * shape, so the next call sees the table it made - the forget when the
+   * load is submitted is too early on its own, since a call while the load
+   * runs reads the tables back without the new one. */
+  async hydrateStatus(database: string, table: string): Promise<RowRecord> {
+    const record = await this.quick(database).hydrateJob(table);
+    const state = record?.state;
+    if (typeof state !== "string" || !LIVE_JOB_STATES.has(state)) this.forget(database, table);
+    return record;
   }
 
   /** Register `database` on the account, or find it there. */
@@ -208,12 +233,16 @@ export class DataPlane {
    * (`path`, `ssh`) they are listed, upload sessions opened for them, every
    * file's bytes sent to its session, and the load admitted from the prefix
    * the upload landed in. A dry run writes nothing: files are listed and
-   * counted, and a bucket or prefix source is checked by the platform. The
-   * database is registered first unless this is a dry run, which only
-   * reports that it would be. Returns the platform's answer with what was
-   * done around it. */
+   * counted, and a bucket or prefix source is checked by the platform. Files
+   * are listed before anything is written, so a path that is not there or
+   * an ssh host that refuses the listing registers nothing; the database is
+   * then registered unless this is a dry run, which only reports that it
+   * would be. Returns the platform's answer with what was done around it. */
   async hydrate(req: HydrateToolRequest): Promise<RowRecord> {
     const { database } = req;
+    const from = req.source.kind === "path" || req.source.kind === "ssh" ? req.source : undefined;
+    const listing: Listing | undefined = from === undefined ? undefined : from.kind === "path" ? await localFiles(from.path) : await remoteFiles(from.host, from.path, this.run);
+
     const done: RowRecord = {};
     if (req.dry_run) {
       const known = (await this.databases()).some((d) => d.name === database);
@@ -223,9 +252,7 @@ export class DataPlane {
     }
 
     let source: RowRecord;
-    if (req.source.kind === "path" || req.source.kind === "ssh") {
-      const from = req.source;
-      const listing: Listing = from.kind === "path" ? await localFiles(from.path) : await remoteFiles(from.host, from.path, this.run);
+    if (from !== undefined && listing !== undefined) {
       const bytes = listing.files.reduce((n, f) => n + f.size, 0);
       const where = from.kind === "path" ? from.path : `${from.host}:${from.path}`;
       if (req.dry_run) {

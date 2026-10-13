@@ -410,20 +410,6 @@ export class HostedDb {
     return this.last;
   }
 
-  /** The same platform, key and tuning, addressing another database of the
-   * account: how one server reaches every database the key may see. */
-  forDatabase(database: string): HostedDb {
-    return new HostedDb(
-      { ...this.target, database },
-      {
-        fetch: this.fetchImpl,
-        timeoutMs: this.timeoutMs,
-        coldStartSecs: this.coldStartMs / MS_PER_SEC,
-        ...(this.onCall ? { onCall: this.onCall } : {}),
-      },
-    );
-  }
-
   // --- tables ---
 
   /** `POST /v1/list_tables/{db}`: the database's table names. */

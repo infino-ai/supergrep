@@ -22,7 +22,7 @@ import { spawn } from "node:child_process";
 import { createReadStream, statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { basename, join, relative, resolve, sep } from "node:path";
-import { Readable } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 
 /** One file to upload: its path under the upload's root, `/`-separated as
  * the platform names it, and its size in bytes. */
@@ -174,14 +174,22 @@ export async function remoteFiles(host: string, path: string, run: Runner = runC
 export function fileBytes(source: { host?: string; path: string }, file: UploadFile, single: boolean): ReadableStream<Uint8Array> {
   const full = single ? source.path : `${source.path.replace(/\/+$/, "")}/${file.name}`;
   if (source.host === undefined) return Readable.toWeb(createReadStream(full)) as ReadableStream<Uint8Array>;
-  const child = spawn("ssh", sshArgs(source.host, `cat ${shellQuote(full)}`), { stdio: ["ignore", "pipe", "pipe"] });
+  const host = source.host;
+  const child = spawn("ssh", sshArgs(host, `cat ${shellQuote(full)}`), { stdio: ["ignore", "pipe", "pipe"] });
   const err: Buffer[] = [];
   child.stderr.on("data", (chunk: Buffer) => err.push(chunk));
-  // A cat that fails ends the stream with ssh's words rather than short.
+  // The bytes end only once ssh's exit is known. The child's stdout has
+  // ended by the time its `close` fires, so a cat that failed would end the
+  // stream short and the upload fail on its length; held open until then, a
+  // failed cat ends it with ssh's own words instead.
+  const bytes = new PassThrough();
+  child.stdout.pipe(bytes, { end: false });
+  child.on("error", (spawnErr) => bytes.destroy(new Error(`reading ${full} on ${host} failed: ${spawnErr.message}`)));
   child.on("close", (status) => {
-    if (status !== 0) child.stdout.destroy(new Error(`reading ${full} on ${source.host} failed (ssh exit ${status}): ${Buffer.concat(err).toString("utf8").trim().slice(0, MAX_STDERR_CHARS)}`));
+    if (status === 0) bytes.end();
+    else bytes.destroy(new Error(`reading ${full} on ${host} failed (ssh exit ${status}): ${Buffer.concat(err).toString("utf8").trim().slice(0, MAX_STDERR_CHARS)}`));
   });
-  return Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
+  return Readable.toWeb(bytes) as ReadableStream<Uint8Array>;
 }
 
 /** Send every file to its session, UPLOAD_CONCURRENCY at a time, in the

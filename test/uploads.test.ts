@@ -4,11 +4,24 @@
 // Listing the files a hydrate uploads - on this machine, and on a machine
 // reached over ssh, whose listing is `wc -c` over `find` - and sending them.
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { describe, expect, it } from "vitest";
-import { localFiles, parseRemoteListing, remoteFiles, remoteListCommand, shellQuote, uploadAll, UPLOAD_CONCURRENCY } from "../src/core/uploads.js";
+import { delimiter, join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { fileBytes, localFiles, parseRemoteListing, remoteFiles, remoteListCommand, shellQuote, uploadAll, UPLOAD_CONCURRENCY } from "../src/core/uploads.js";
+
+/** Everything a byte stream yields, as text; rejects with the stream's
+ * error when it ends in one. */
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  const reader = stream.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
 
 describe("local files", () => {
   it("lists a directory's files with /-separated names relative to it, and one file by its basename", async () => {
@@ -81,6 +94,47 @@ describe("remote files", () => {
     let ran = false;
     await expect(remoteFiles("-oProxyCommand=touch /tmp/x", "/srv/x", async () => ((ran = true), { stdout: "", stderr: "", status: 0 }))).rejects.toThrow("is not a host");
     expect(ran).toBe(false);
+  });
+});
+
+describe("reading a file over ssh", () => {
+  /** A stand-in `ssh` first on PATH. Asked for host `bad`, it writes part of
+   * the file, says why on stderr and exits 1, as a cat refused partway
+   * does; any other host gets the whole file. */
+  const FAKE_SSH = [
+    "#!/bin/sh",
+    'for arg in "$@"; do',
+    '  if [ "$arg" = bad ]; then printf par; echo "cat: /srv/x/a.csv: Permission denied" >&2; exit 1; fi',
+    "done",
+    "printf whole",
+    "",
+  ].join("\n");
+  /** The file both reads ask for. */
+  const FILE = { name: "a.csv", size: 5 };
+  let bin = "";
+  let path: string | undefined;
+
+  beforeAll(() => {
+    bin = mkdtempSync(join(tmpdir(), "cx-fake-ssh-"));
+    writeFileSync(join(bin, "ssh"), FAKE_SSH);
+    chmodSync(join(bin, "ssh"), 0o755);
+    path = process.env.PATH;
+    process.env.PATH = `${bin}${delimiter}${path ?? ""}`;
+  });
+
+  afterAll(() => {
+    process.env.PATH = path;
+    rmSync(bin, { recursive: true, force: true });
+  });
+
+  it("streams the file and ends when ssh exits clean", async () => {
+    expect(await readAll(fileBytes({ host: "dev1", path: "/srv/x" }, FILE, false))).toBe("whole");
+  });
+
+  it("ends a failed cat with ssh's own words, never short", async () => {
+    await expect(readAll(fileBytes({ host: "bad", path: "/srv/x" }, FILE, false))).rejects.toThrow(
+      "reading /srv/x/a.csv on bad failed (ssh exit 1): cat: /srv/x/a.csv: Permission denied",
+    );
   });
 });
 

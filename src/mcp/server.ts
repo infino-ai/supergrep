@@ -2091,13 +2091,24 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     question: string | undefined,
   ) => {
     if (!data) return noDataPlane("sql");
+    const unlisted = (err: unknown) => fail(`sql failed: the tables of ${database} could not be listed: ${(err as Error).message}${refusalHint(err)}`);
     let names: string[];
     try {
       names = await data.tableNames(database);
     } catch (err) {
-      return fail(`sql failed: the tables of ${database} could not be listed: ${(err as Error).message}${refusalHint(err)}`);
+      return unlisted(err);
     }
-    if (table !== undefined && !names.includes(table)) return fail(`sql: ${database} has no table ${table}; its tables are ${names.join(", ")}`);
+    // A table the kept list lacks may have been made since it was read - by
+    // a load nobody followed with hydrate_status, or one started elsewhere -
+    // so the list is read once more before the table is refused.
+    if (table !== undefined && !names.includes(table)) {
+      try {
+        names = await data.tableNames(database, true);
+      } catch (err) {
+        return unlisted(err);
+      }
+      if (!names.includes(table)) return fail(`sql: ${database} has no table ${table}; its tables are ${names.join(", ")}`);
+    }
     const verdict = await joinGate(code, names, (spanned) => keysAmong(spanned, data.quick(database)));
     if (verdict.kind === "refuse") return fail(joinRefusal("sql", verdict));
     const named = table ?? tablesNamed(code, names)[0];
@@ -3050,140 +3061,140 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     // URL with no sign-in), where `tables` and the query tools are the
     // whole surface.
     if (!readOnly) {
-    /** The sources `hydrate` takes, flat so a model fills one shape: the
-     * kind, and the fields the kind reads. */
-    const SOURCE_KINDS = ["bucket", "prefix", "path", "ssh"] as const;
-    const OFFERED_KINDS = hostFiles ? SOURCE_KINDS : (["bucket", "prefix"] as const);
-    const sourceOf = (given: { kind: (typeof SOURCE_KINDS)[number]; bucket?: string; prefix?: string; path?: string; host?: string }): HydrateToolSource => {
-      if (!(OFFERED_KINDS as readonly string[]).includes(given.kind)) throw new Error(`kind ${given.kind} reads this server's own machine, which is not yours; load from a bucket`);
-      switch (given.kind) {
-        case "bucket":
-          if (!given.bucket) throw new Error("a bucket source names the bucket");
-          return { kind: "bucket", bucket: given.bucket, prefix: given.prefix ?? "" };
-        case "prefix":
-          if (!given.prefix) throw new Error("a prefix source names the prefix under the database's root");
-          return { kind: "prefix", prefix: given.prefix };
-        case "path":
-          if (!given.path) throw new Error("a path source names a file or directory on this machine");
-          return { kind: "path", path: given.path };
-        case "ssh":
-          if (!given.host || !given.path) throw new Error("an ssh source names the host and the path on it");
-          return { kind: "ssh", host: given.host, path: given.path };
-      }
-    };
-
-    server.registerTool(
-      "hydrate",
-      {
-        title: "Load a dataset into a database of the account",
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-        description:
-          "Load a dataset into a table of a database of the Infino account, from wherever it is: a bucket " +
-          "prefix in object storage the platform reads itself (kind bucket, the platform's identity granted " +
-          "read on it)" +
-          (hostFiles
-            ? ", a prefix already under the database's own storage (kind prefix), a file or directory " +
-              "on this machine (kind path), or one on a machine this machine reaches with ssh (kind ssh, host as " +
-              "ssh resolves it) - the files are then put into the database's storage first and loaded from there. "
-            : " or a prefix already under the database's own storage (kind prefix). ") +
-          "Parquet, CSV, NDJSON and Iceberg are read by their extension (format auto); documents (PDF, text) " +
-          "with format documents. fts names the columns to index for search and find, embed the column to " +
-          "embed and the text columns it embeds; left out, the platform picks from the data. The database is " +
-          "registered on the account if it does not exist. The load runs on the platform and this returns at " +
-          "once with the job: hydrate_status follows it. dry_run checks the load and writes nothing. Never " +
-          "call it unasked: it spends the account's storage and credit.",
-        inputSchema: {
-          database: z.string().min(1).describe("The database to load into; registered on the account if new."),
-          table: z.string().min(1).optional().describe("The table to load. Absent, one table per folder of the source, each named after its folder."),
-          kind: z.enum(OFFERED_KINDS).describe(hostFiles ? "Where the data is: bucket, prefix (under the database's storage), path (this machine), ssh (a machine reached by ssh)." : "Where the data is: bucket, or prefix (under the database's storage)."),
-          bucket: z.string().optional().describe("kind bucket: the bucket's name."),
-          prefix: z.string().optional().describe("kind bucket: the key prefix inside it (empty for the whole bucket); kind prefix: the prefix under the database's root."),
-          path: z.string().optional().describe("kind path or ssh: the file or directory."),
-          host: z.string().optional().describe("kind ssh: the host, as the person's own ssh names it (an ssh config name, or user@machine)."),
-          format: z.enum(["auto", "parquet", "csv", "ndjson", "iceberg", "documents"]).optional().describe("How the files are read; auto by their extension (the default here)."),
-          fts: z.array(z.string().min(1)).optional().describe("The text columns to index for search and find."),
-          embed: z.object({ column: z.string().min(1), source: z.array(z.string().min(1)).min(1) }).optional().describe("The vector column to add and the text columns it embeds."),
-          no_embed: z.boolean().optional().describe("Load with no vector column."),
-          chunk: z.record(z.string(), z.unknown()).optional().describe("How a long text column is cut into passages, in the platform's own fields (column, max_tokens, overlap_tokens, ...)."),
-          if_exists: z.enum(["refuse", "append"]).optional().describe("When the table exists: refuse (the default) or append."),
-          dry_run: z.boolean().optional().describe("Check the load without writing anything."),
-          notify_email: z.string().optional().describe("An address the platform mails when the load ends."),
-          options: z.record(z.string(), z.unknown()).optional().describe("Any other field of the platform's hydrate request, as the platform spells it."),
-        },
-      },
-      async ({ database, table, kind, bucket, prefix, path, host, format, fts, embed, no_embed, chunk, if_exists, dry_run, notify_email, options }) => {
-        try {
-          const source = sourceOf({ kind, bucket, prefix, path, host });
-          const t0 = performance.now();
-          const result = await plane.hydrate({
-            database,
-            ...(table !== undefined ? { table } : {}),
-            source,
-            ...(format !== undefined ? { format } : {}),
-            ...(fts !== undefined ? { fts } : {}),
-            ...(embed !== undefined ? { embed } : {}),
-            ...(no_embed !== undefined ? { no_embed } : {}),
-            ...(chunk !== undefined ? { chunk: chunk as RowRecord } : {}),
-            ...(if_exists !== undefined ? { if_exists } : {}),
-            ...(dry_run !== undefined ? { dry_run } : {}),
-            ...(notify_email !== undefined ? { notify_email } : {}),
-            ...(options !== undefined ? { options: options as RowRecord } : {}),
-          });
-          return ok({ ...result, took_ms: Math.round((performance.now() - t0) * 1000) / 1000 });
-        } catch (err) {
-          return fail(`hydrate failed: ${(err as Error).message}${refusalHint(err)}`);
+      /** The sources `hydrate` takes, flat so a model fills one shape: the
+       * kind, and the fields the kind reads. */
+      const SOURCE_KINDS = ["bucket", "prefix", "path", "ssh"] as const;
+      const OFFERED_KINDS = hostFiles ? SOURCE_KINDS : (["bucket", "prefix"] as const);
+      const sourceOf = (given: { kind: (typeof SOURCE_KINDS)[number]; bucket?: string; prefix?: string; path?: string; host?: string }): HydrateToolSource => {
+        if (!(OFFERED_KINDS as readonly string[]).includes(given.kind)) throw new Error(`kind ${given.kind} reads this server's own machine, which is not yours; load from a bucket`);
+        switch (given.kind) {
+          case "bucket":
+            if (!given.bucket) throw new Error("a bucket source names the bucket");
+            return { kind: "bucket", bucket: given.bucket, prefix: given.prefix ?? "" };
+          case "prefix":
+            if (!given.prefix) throw new Error("a prefix source names the prefix under the database's root");
+            return { kind: "prefix", prefix: given.prefix };
+          case "path":
+            if (!given.path) throw new Error("a path source names a file or directory on this machine");
+            return { kind: "path", path: given.path };
+          case "ssh":
+            if (!given.host || !given.path) throw new Error("an ssh source names the host and the path on it");
+            return { kind: "ssh", host: given.host, path: given.path };
         }
-      },
-    );
+      };
 
-    server.registerTool(
-      "hydrate_status",
-      {
-        title: "Where a load stands",
-        annotations: READ_ONLY,
-        description:
-          "The record of the hydrate job that loads (or loaded) a table: its state - pending, running, " +
-          "cancelling, stopped, succeeded, failed - the request it runs, its progress and the schema it " +
-          "found, the usage billed so far, and the error when it failed. Ask it after hydrate, and again " +
-          "until the state is succeeded; the table answers queries then.",
-        inputSchema: {
-          database: z.string().min(1).describe("The database the table is in."),
-          table: z.string().min(1).describe("The table the job loads."),
+      server.registerTool(
+        "hydrate",
+        {
+          title: "Load a dataset into a database of the account",
+          annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+          description:
+            "Load a dataset into a table of a database of the Infino account, from wherever it is: a bucket " +
+            "prefix in object storage the platform reads itself (kind bucket, the platform's identity granted " +
+            "read on it)" +
+            (hostFiles
+              ? ", a prefix already under the database's own storage (kind prefix), a file or directory " +
+                "on this machine (kind path), or one on a machine this machine reaches with ssh (kind ssh, host as " +
+                "ssh resolves it) - the files are then put into the database's storage first and loaded from there. "
+              : " or a prefix already under the database's own storage (kind prefix). ") +
+            "Parquet, CSV, NDJSON and Iceberg are read by their extension (format auto); documents (PDF, text) " +
+            "with format documents. fts names the columns to index for search and find, embed the column to " +
+            "embed and the text columns it embeds; left out, the platform picks from the data. The database is " +
+            "registered on the account if it does not exist. The load runs on the platform and this returns at " +
+            "once with the job: hydrate_status follows it. dry_run checks the load and writes nothing. Never " +
+            "call it unasked: it spends the account's storage and credit.",
+          inputSchema: {
+            database: z.string().min(1).describe("The database to load into; registered on the account if new."),
+            table: z.string().min(1).optional().describe("The table to load. Absent, one table per folder of the source, each named after its folder."),
+            kind: z.enum(OFFERED_KINDS).describe(hostFiles ? "Where the data is: bucket, prefix (under the database's storage), path (this machine), ssh (a machine reached by ssh)." : "Where the data is: bucket, or prefix (under the database's storage)."),
+            bucket: z.string().optional().describe("kind bucket: the bucket's name."),
+            prefix: z.string().optional().describe("kind bucket: the key prefix inside it (empty for the whole bucket); kind prefix: the prefix under the database's root."),
+            path: z.string().optional().describe("kind path or ssh: the file or directory."),
+            host: z.string().optional().describe("kind ssh: the host, as the person's own ssh names it (an ssh config name, or user@machine)."),
+            format: z.enum(["auto", "parquet", "csv", "ndjson", "iceberg", "documents"]).optional().describe("How the files are read; auto by their extension (the default here)."),
+            fts: z.array(z.string().min(1)).optional().describe("The text columns to index for search and find."),
+            embed: z.object({ column: z.string().min(1), source: z.array(z.string().min(1)).min(1) }).optional().describe("The vector column to add and the text columns it embeds."),
+            no_embed: z.boolean().optional().describe("Load with no vector column."),
+            chunk: z.record(z.string(), z.unknown()).optional().describe("How a long text column is cut into passages, in the platform's own fields (column, max_tokens, overlap_tokens, ...)."),
+            if_exists: z.enum(["refuse", "append"]).optional().describe("When the table exists: refuse (the default) or append."),
+            dry_run: z.boolean().optional().describe("Check the load without writing anything."),
+            notify_email: z.string().optional().describe("An address the platform mails when the load ends."),
+            options: z.record(z.string(), z.unknown()).optional().describe("Any other field of the platform's hydrate request, as the platform spells it."),
+          },
         },
-      },
-      async ({ database, table }: { database: string; table: string }) => {
-        try {
-          return ok((await plane.quick(database).hydrateJob(table)) as Record<string, unknown>);
-        } catch (err) {
-          return fail(`hydrate_status failed: ${(err as Error).message}${refusalHint(err)}`);
-        }
-      },
-    );
+        async ({ database, table, kind, bucket, prefix, path, host, format, fts, embed, no_embed, chunk, if_exists, dry_run, notify_email, options }) => {
+          try {
+            const source = sourceOf({ kind, bucket, prefix, path, host });
+            const t0 = performance.now();
+            const result = await plane.hydrate({
+              database,
+              ...(table !== undefined ? { table } : {}),
+              source,
+              ...(format !== undefined ? { format } : {}),
+              ...(fts !== undefined ? { fts } : {}),
+              ...(embed !== undefined ? { embed } : {}),
+              ...(no_embed !== undefined ? { no_embed } : {}),
+              ...(chunk !== undefined ? { chunk: chunk as RowRecord } : {}),
+              ...(if_exists !== undefined ? { if_exists } : {}),
+              ...(dry_run !== undefined ? { dry_run } : {}),
+              ...(notify_email !== undefined ? { notify_email } : {}),
+              ...(options !== undefined ? { options: options as RowRecord } : {}),
+            });
+            return ok({ ...result, took_ms: Math.round((performance.now() - t0) * 1000) / 1000 });
+          } catch (err) {
+            return fail(`hydrate failed: ${(err as Error).message}${refusalHint(err)}`);
+          }
+        },
+      );
 
-    server.registerTool(
-      "hydrate_cancel",
-      {
-        title: "Stop a load, or clear an ended one",
-        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
-        description:
-          "Cancel a running hydrate job (it stops at its next commit and keeps or drops the table as its " +
-          "request's on_failure says), or clear the record of one that has ended so the table can be loaded " +
-          "again. Only when the person asked for it.",
-        inputSchema: {
-          database: z.string().min(1).describe("The database the table is in."),
-          table: z.string().min(1).describe("The table the job loads."),
+      server.registerTool(
+        "hydrate_status",
+        {
+          title: "Where a load stands",
+          annotations: READ_ONLY,
+          description:
+            "The record of the hydrate job that loads (or loaded) a table: its state - pending, running, " +
+            "cancelling, stopped, succeeded, failed - the request it runs, its progress and the schema it " +
+            "found, the usage billed so far, and the error when it failed. Ask it after hydrate, and again " +
+            "until the state is succeeded; the table answers queries then.",
+          inputSchema: {
+            database: z.string().min(1).describe("The database the table is in."),
+            table: z.string().min(1).describe("The table the job loads."),
+          },
         },
-      },
-      async ({ database, table }: { database: string; table: string }) => {
-        try {
-          const answer = await plane.quick(database).hydrateCancel(table);
-          plane.forget(database);
-          return ok(answer === null ? { database, table, cleared: true } : { database, table, cancelling: answer });
-        } catch (err) {
-          return fail(`hydrate_cancel failed: ${(err as Error).message}${refusalHint(err)}`);
-        }
-      },
-    );
+        async ({ database, table }: { database: string; table: string }) => {
+          try {
+            return ok((await plane.hydrateStatus(database, table)) as Record<string, unknown>);
+          } catch (err) {
+            return fail(`hydrate_status failed: ${(err as Error).message}${refusalHint(err)}`);
+          }
+        },
+      );
+
+      server.registerTool(
+        "hydrate_cancel",
+        {
+          title: "Stop a load, or clear an ended one",
+          annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+          description:
+            "Cancel a running hydrate job (it stops at its next commit and keeps or drops the table as its " +
+            "request's on_failure says), or clear the record of one that has ended so the table can be loaded " +
+            "again. Only when the person asked for it.",
+          inputSchema: {
+            database: z.string().min(1).describe("The database the table is in."),
+            table: z.string().min(1).describe("The table the job loads."),
+          },
+        },
+        async ({ database, table }: { database: string; table: string }) => {
+          try {
+            const answer = await plane.quick(database).hydrateCancel(table);
+            plane.forget(database);
+            return ok(answer === null ? { database, table, cleared: true } : { database, table, cancelling: answer });
+          } catch (err) {
+            return fail(`hydrate_cancel failed: ${(err as Error).message}${refusalHint(err)}`);
+          }
+        },
+      );
     }
   }
 
