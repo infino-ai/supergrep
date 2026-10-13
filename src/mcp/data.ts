@@ -208,12 +208,16 @@ export class DataPlane {
    * (`path`, `ssh`) they are listed, upload sessions opened for them, every
    * file's bytes sent to its session, and the load admitted from the prefix
    * the upload landed in. A dry run writes nothing: files are listed and
-   * counted, and a bucket or prefix source is checked by the platform. The
-   * database is registered first unless this is a dry run, which only
-   * reports that it would be. Returns the platform's answer with what was
-   * done around it. */
+   * counted, and a bucket or prefix source is checked by the platform. Files
+   * are listed before anything is written, so a path that is not there or
+   * an ssh host that refuses the listing registers nothing; the database is
+   * then registered unless this is a dry run, which only reports that it
+   * would be. Returns the platform's answer with what was done around it. */
   async hydrate(req: HydrateToolRequest): Promise<RowRecord> {
     const { database } = req;
+    const from = req.source.kind === "path" || req.source.kind === "ssh" ? req.source : undefined;
+    const listing: Listing | undefined = from === undefined ? undefined : from.kind === "path" ? await localFiles(from.path) : await remoteFiles(from.host, from.path, this.run);
+
     const done: RowRecord = {};
     if (req.dry_run) {
       const known = (await this.databases()).some((d) => d.name === database);
@@ -223,9 +227,7 @@ export class DataPlane {
     }
 
     let source: RowRecord;
-    if (req.source.kind === "path" || req.source.kind === "ssh") {
-      const from = req.source;
-      const listing: Listing = from.kind === "path" ? await localFiles(from.path) : await remoteFiles(from.host, from.path, this.run);
+    if (from !== undefined && listing !== undefined) {
       const bytes = listing.files.reduce((n, f) => n + f.size, 0);
       const where = from.kind === "path" ? from.path : `${from.host}:${from.path}`;
       if (req.dry_run) {

@@ -384,6 +384,14 @@ describe("the account's data through the server started for a repository", () =>
     }
   });
 
+  it("hydrate from files that cannot be listed registers no database", async () => {
+    const missing = join(tmpdir(), "cx-hydrate-missing", "nowhere");
+    const { ok, value, ops } = await call(s, "hydrate", { database: "never-made", table: "t", kind: "path", path: missing });
+    expect(ok).toBe(false);
+    expect(String(value)).toContain("nowhere");
+    expect(ops).toEqual([]);
+  });
+
   it("hydrate passes the platform's refusal through, in its words", async () => {
     const { ok, value } = await call(s, "hydrate", { database: DATA_DB, table: "refused", kind: "prefix", prefix: "_source/x/" });
     expect(ok).toBe(false);
