@@ -45,6 +45,15 @@ export const UPLOAD_CONCURRENCY = 4;
  * the person has not reached before is refused with ssh's own words. */
 const SSH_ARGS = ["-o", "BatchMode=yes"];
 
+/** ssh's arguments for running `command` on `host`. The host comes from a
+ * tool call, which a model fills from whatever it read, so it is never let
+ * be an option: one starting with `-` is refused, and `--` ends the
+ * options before it either way. */
+export function sshArgs(host: string, command: string): string[] {
+  if (host.startsWith("-")) throw new Error(`"${host}" is not a host`);
+  return [...SSH_ARGS, "--", host, command];
+}
+
 /** The summary line `wc -c` writes after several files. Told from a file
  * named `total` by the path: a file is listed as `./total`. */
 const WC_TOTAL_LINE = "total";
@@ -153,7 +162,7 @@ export function parseRemoteListing(stdout: string, path: string): Listing {
  * the person's own `ssh` resolves - a name from their ssh config, or
  * `user@machine`. */
 export async function remoteFiles(host: string, path: string, run: Runner = runCommand): Promise<Listing> {
-  const ran = await run("ssh", [...SSH_ARGS, host, remoteListCommand(path)]);
+  const ran = await run("ssh", sshArgs(host, remoteListCommand(path)));
   if (ran.status !== 0) throw new Error(`listing ${path} on ${host} failed (ssh exit ${ran.status}): ${ran.stderr.trim().slice(0, MAX_STDERR_CHARS)}`);
   return parseRemoteListing(ran.stdout, path);
 }
@@ -166,7 +175,7 @@ export function fileBytes(source: { host?: string; path: string }, file: UploadF
   const full = single ? source.path : `${source.path.replace(/\/+$/, "")}/${file.name}`;
   if (source.host === undefined) return Readable.toWeb(createReadStream(full)) as ReadableStream<Uint8Array>;
   const host = source.host;
-  const child = spawn("ssh", [...SSH_ARGS, host, `cat ${shellQuote(full)}`], { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn("ssh", sshArgs(host, `cat ${shellQuote(full)}`), { stdio: ["ignore", "pipe", "pipe"] });
   const err: Buffer[] = [];
   child.stderr.on("data", (chunk: Buffer) => err.push(chunk));
   // The bytes end only once ssh's exit is known. The child's stdout has

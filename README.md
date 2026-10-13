@@ -164,6 +164,16 @@ The same plugin reaches every table in your Infino account, not only the directo
 
 Nothing is configured per table or per database. Point the agent at a folder of CSVs, a Parquet export, a bucket, or a directory on a dev box, and ask it to load it; then ask questions. Files on your laptop or on a remote machine go straight into the database's storage over the platform's upload sessions (`ssh` is yours: the plugin runs one `find` and one `cat` per file over it and installs nothing there); a bucket is read in place and nothing is copied.
 
+### As a connector, with sign-in
+
+The same server runs over Streamable HTTP, as one URL that claude.ai, Claude Desktop, Claude Code and any other MCP client add as a remote connector:
+
+```sh
+cx mcp --http 9121 --db https://<platform> --sign-in https://<host>/.well-known/oauth-protected-resource/mcp
+```
+
+With `--sign-in`, every call carries an Infino account's key, and a call with none is told where to sign in (the OAuth resource metadata at that URL), which is how Claude knows to sign the person in. Every call then runs on that account's own databases. Without it, every session runs on the one account the process was started with (add `--read-only` for a URL shared with no sign-in).
+
 ## Indexing from object storage
 
 For a corpus too big for your laptop - years of logs, a document dump, anything you already keep in a bucket as Parquet or JSON - leave it there, point the platform at the bucket, and it builds the index from there. Nothing is copied, nothing is downloaded to your machine, and no row passes through your laptop or through the API. The `hydrate` tool above does this from inside a session; the API it calls is below.

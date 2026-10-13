@@ -84,10 +84,16 @@ describe("remote files", () => {
       return { stdout: "  7 ./a.csv\n", stderr: "", status: 0 };
     });
     expect(ok).toEqual({ files: [{ name: "a.csv", size: 7 }], single: false });
-    expect(calls).toEqual([["ssh", "-o", "BatchMode=yes", "dev1", remoteListCommand("/srv/x")]]);
+    expect(calls).toEqual([["ssh", "-o", "BatchMode=yes", "--", "dev1", remoteListCommand("/srv/x")]]);
     await expect(remoteFiles("dev1", "/srv/x", async () => ({ stdout: "", stderr: "Permission denied (publickey).", status: 255 }))).rejects.toThrow(
       "listing /srv/x on dev1 failed (ssh exit 255): Permission denied (publickey).",
     );
+  });
+
+  it("never lets the host be read as an ssh option", async () => {
+    let ran = false;
+    await expect(remoteFiles("-oProxyCommand=touch /tmp/x", "/srv/x", async () => ((ran = true), { stdout: "", stderr: "", status: 0 }))).rejects.toThrow("is not a host");
+    expect(ran).toBe(false);
   });
 });
 

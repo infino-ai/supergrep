@@ -7,7 +7,7 @@
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Connection } from "@infino-ai/infino";
-import { RepoRegistry } from "../src/mcp/repos.js";
+import { OTHER_ROOT_REFUSED, RepoRegistry } from "../src/mcp/repos.js";
 
 /** A fake connection tagged with the dir it was opened for, so tests can
  * assert identity (same ctx reused) and count (no redundant connects). */
@@ -28,11 +28,12 @@ const HOSTED = {
  * paths as directories, one as a file, and everything else as missing. */
 function makeRegistry(
   defaultRoot: string,
-  opts: { dirs?: string[]; files?: string[]; maxOpen?: number; hosted?: boolean } = {},
+  opts: { dirs?: string[]; files?: string[]; maxOpen?: number; hosted?: boolean; defaultOnly?: boolean } = {},
 ) {
   const dirs = new Set([defaultRoot, ...(opts.dirs ?? [])]);
   const files = new Set(opts.files ?? []);
   let connects = 0;
+  let stats = 0;
   const connectedDirs: string[] = [];
   const registry = new RepoRegistry(defaultRoot, {
     connect: (dir) => {
@@ -41,14 +42,16 @@ function makeRegistry(
       return fakeConn(dir);
     },
     stat: (p) => {
+      stats++;
       if (dirs.has(p)) return { isDirectory: () => true };
       if (files.has(p)) return { isDirectory: () => false };
       throw new Error("ENOENT");
     },
     maxOpen: opts.maxOpen,
     ...(opts.hosted ? { hosted: HOSTED } : {}),
+    ...(opts.defaultOnly ? { defaultOnly: true } : {}),
   });
-  return { registry, connects: () => connects, connectedDirs };
+  return { registry, connects: () => connects, stats: () => stats, connectedDirs };
 }
 
 const A = "/repos/alpha";
@@ -148,6 +151,25 @@ describe("RepoRegistry with a platform database", () => {
     expect(b.hosted).toBeUndefined();
     expect(b.target).toBe(join(B, ".infino"));
     expect(connects()).toBe(2);
+  });
+});
+
+describe("RepoRegistry serving the default root alone", () => {
+  it("serves the default root however it is spelled, from one context", () => {
+    const { registry, connects } = makeRegistry(A, { defaultOnly: true });
+    const ctx = registry.get();
+    for (const spelled of [A, `${A}/`, `${A}/./`, ""]) expect(registry.get(spelled)).toBe(ctx);
+    expect(connects()).toBe(1);
+  });
+
+  it("refuses any other directory with one text, before looking at it", () => {
+    const { registry, connects, stats } = makeRegistry(A, { dirs: [B, `${A}/sub`], files: ["/repos/file.ts"], defaultOnly: true });
+    for (const other of [B, "/repos/nope", `${A}/sub`, "/repos/file.ts", "relative/x"]) {
+      expect(() => registry.get(other), other).toThrow(OTHER_ROOT_REFUSED);
+    }
+    // Nothing was looked up or opened: the refusal says nothing of what is there.
+    expect(stats()).toBe(0);
+    expect(connects()).toBe(0);
   });
 });
 

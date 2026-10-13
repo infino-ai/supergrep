@@ -120,6 +120,9 @@ export interface HostedFlags {
   subagentMaxTurns?: string;
   subagentMaxWallSecs?: string;
   subagentK?: string;
+  /** `cx mcp --sign-in <url>`: each session brings its own key, so `--db`
+   * names the platform alone. */
+  signIn?: string;
 }
 
 /** The flags that mean nothing without --db, by their command-line spelling. */
@@ -132,6 +135,7 @@ const HOSTED_ONLY_FLAGS: Array<[keyof HostedFlags, string]> = [
   ["subagentMaxTurns", "--subagent-max-turns"],
   ["subagentMaxWallSecs", "--subagent-max-wall-secs"],
   ["subagentK", "--subagent-k"],
+  ["signIn", "--sign-in"],
 ];
 
 /** A positive-integer flag value, or its default when the flag was not given.
@@ -195,6 +199,7 @@ export function hostedSettingsFromFlags(
   let database: string;
   let apiKey: string;
   let account: AccountSettings | undefined;
+  if (flags.signIn !== undefined && (flags.db === undefined || flags.db === "")) throw new Error("--sign-in needs --db <url>: the platform the accounts are on");
   if (flags.db === undefined || flags.db === "") {
     const stored = fallback.accountRoot !== undefined ? (fallback.storedAccount ?? readStoredAccount)() : undefined;
     const key = stored?.uploadConsentAt !== undefined ? (env[API_KEY_ENV] ?? storedKey() ?? "") : "";
@@ -209,11 +214,14 @@ export function hostedSettingsFromFlags(
     account = { baseUrl, apiKey };
   } else {
     ({ baseUrl, database } = parseHostedUrl(flags.db));
+    // With sign-in the process holds no key, not even one it could find.
     apiKey =
-      flags.apiKeyFile !== undefined
-        ? readFileSync(flags.apiKeyFile, "utf8").trim()
-        : (env[API_KEY_ENV] ?? storedKey() ?? "");
-    if (apiKey.length === 0) {
+      flags.signIn !== undefined
+        ? ""
+        : flags.apiKeyFile !== undefined
+          ? readFileSync(flags.apiKeyFile, "utf8").trim()
+          : (env[API_KEY_ENV] ?? storedKey() ?? "");
+    if (apiKey.length === 0 && flags.signIn === undefined) {
       throw new Error(
         `--db needs a key, and this machine has none: run \`cx login --db ${baseUrl}\` to store one ` +
           `(it goes in ${keyFilePath()}, mode 600), or pass --api-key-file <path>, or set ${API_KEY_ENV}`,

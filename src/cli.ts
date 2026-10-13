@@ -259,6 +259,7 @@ hostedOptions(
   .option("--http-host <host>", `the address --http binds (default ${DEFAULT_HTTP_HOST}, loopback)`)
   .option("--http-path <path>", `the URL path --http serves MCP at (default ${DEFAULT_HTTP_PATH})`)
   .option("--read-only", "offer no tool that writes - no hydrate, no hydrate_cancel (or CX_READ_ONLY=1): for a URL shared with no sign-in")
+  .option("--sign-in <url>", "with --http: every call carries an Infino account's key, and a call with none is told to sign in at <url>, the OAuth resource metadata; --db then names the platform alone")
   .action(async (opts: { path?: string; http?: string; httpHost?: string; httpPath?: string; readOnly?: boolean } & HostedFlags) => {
     applyHosted(opts, resolveRoot(opts.path));
     const readOnly = opts.readOnly ? { readOnly: true } : {};
@@ -271,9 +272,11 @@ hostedOptions(
         ...(opts.httpHost !== undefined ? { host: opts.httpHost } : {}),
         ...(opts.httpPath !== undefined ? { path: opts.httpPath } : {}),
         ...readOnly,
+        ...(opts.signIn !== undefined ? { signIn: opts.signIn } : {}),
       });
       return;
     }
+    if (opts.signIn !== undefined) throw new Error("--sign-in is for the server over HTTP: it needs --http <port>");
     const { serveMcp } = await import("./mcp/server.js");
     await serveMcp(opts.path, readOnly);
   });

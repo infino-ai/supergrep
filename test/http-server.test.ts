@@ -7,6 +7,9 @@
 // session and carrying no initialize is refused without building anything;
 // the health path answers the proxy.
 
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -24,6 +27,8 @@ type HttpServed = Awaited<ReturnType<typeof serveHttp>>;
 
 const DATA_DB = "lab";
 const TRANS = "trans";
+/** The code an unknown session is answered with: the SDK transport's own. */
+const SESSION_NOT_FOUND_CODE = -32001;
 
 function platform(): Platform {
   return scriptPlatform({
@@ -79,7 +84,29 @@ describe("the server over Streamable HTTP, read-only", () => {
     expect(scripted.sent.length).toBe(sent);
     const unknown = await fetch(url, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-session-id": "nope" }, body: "{}" });
     expect(unknown.status).toBe(404);
+    expect(((await unknown.json()) as { error: { code: number } }).error.code).toBe(SESSION_NOT_FOUND_CODE);
     expect(served.sessions()).toBe(0);
+  });
+
+  it("reads no directory of its machine but the one it was started for, and offers none", async () => {
+    const other = mkdtempSync(join(tmpdir(), "cx-http-other-"));
+    writeFileSync(join(other, "secret.txt"), "zebracornflower\n");
+    const { client, transport } = await connect(url);
+    try {
+      expect(client.getInstructions()).not.toContain("to target another repository");
+      for (const path of [other, join(other, "missing")]) {
+        const result = (await client.callTool({ name: "find", arguments: { query: "zebracornflower", path } })) as { content: Array<{ text: string }>; isError?: boolean };
+        expect(result.isError, path).toBe(true);
+        expect(result.content[0].text, path).toContain("which is not yours");
+        expect(result.content[0].text, path).not.toContain("zebracornflower");
+      }
+      expect(existsSync(join(other, ".infino"))).toBe(false);
+    } finally {
+      // Closed, not left to the idle sweep: the next test counts sessions.
+      await transport.terminateSession();
+      await client.close();
+      rmSync(other, { recursive: true, force: true });
+    }
   });
 
   it("opens a session per client, offers tables and the query tools but nothing that writes, and runs a statement over a database", async () => {

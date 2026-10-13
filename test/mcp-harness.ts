@@ -28,10 +28,12 @@ export interface Sent {
   path: string;
 }
 
-/** What a route is told beside the body. */
+/** What a route is told beside the body; `headers` as the client sent them,
+ * a plain object with lowercase names. */
 export interface Request {
   method: string;
   path: string;
+  headers: Record<string, string>;
 }
 
 /** What each route answers, by op: a status and a JSON payload. A GET
@@ -80,7 +82,7 @@ export function scriptPlatform(routes: Routes): Platform {
         ? Object.fromEntries(parsed.searchParams)
         : undefined;
     sent.push({ op, body, method, path });
-    const [status, payload] = routes[op]?.(body, { method, path }) ?? [500, { error: `unexpected ${op}` }];
+    const [status, payload] = routes[op]?.(body, { method, path, headers: (init?.headers ?? {}) as Record<string, string> }) ?? [500, { error: `unexpected ${op}` }];
     return new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json", "x-infino-read-tokens": "0.010" } });
   };
   return { fetch: fetchImpl, sent };

@@ -5,7 +5,9 @@
 // a session touches: the optional `root` tool argument targets one, defaulting
 // to the startup root. Each repo keeps its own engine connection, auto-sync
 // clock, and mutation lock, held in a small LRU so a session that roams across
-// many repos doesn't accumulate connections without bound.
+// many repos doesn't accumulate connections without bound. Over HTTP the
+// machine is the server's, not the caller's, and the registry serves the
+// default root alone (`defaultOnly`).
 //
 // When a platform database is configured (--db <url>) the DEFAULT root's
 // context also carries the platform client: that repository's chunks table
@@ -76,9 +78,19 @@ export interface RepoRegistryOptions {
    * database: then every root, not only the default, gets its own client on
    * its own database (`accountTargetFor`). */
   account?: AccountSettings;
+  /** Serve the default root alone: a path naming any other directory -
+   * beside it, above it or inside it - is refused before it is looked at.
+   * Set over HTTP, where this machine is the server's, not the caller's. */
+  defaultOnly?: boolean;
 }
 
 const DEFAULT_MAX_OPEN = 8;
+
+/** The refusal of a path other than the default root, on a registry that
+ * serves the default alone. One text whatever the path names, so a caller
+ * learns nothing of what exists on this machine. */
+export const OTHER_ROOT_REFUSED =
+  "path names a directory on the machine this server runs on, which is not yours; this server answers over the repository it was started for - leave path out";
 
 export class RepoRegistry {
   private readonly repos = new Map<string, RepoCtx>();
@@ -88,6 +100,7 @@ export class RepoRegistry {
   private readonly maxOpen: number;
   private readonly hosted?: { target: HostedTarget; options?: HostedOptions };
   private readonly account?: AccountSettings;
+  private readonly defaultOnly: boolean;
 
   constructor(defaultRoot: string, opts: RepoRegistryOptions) {
     this.defaultRoot = defaultRoot;
@@ -96,6 +109,7 @@ export class RepoRegistry {
     this.maxOpen = opts.maxOpen ?? DEFAULT_MAX_OPEN;
     this.hosted = opts.hosted;
     this.account = opts.account;
+    this.defaultOnly = opts.defaultOnly ?? false;
   }
 
   /** Index directory for a root. CX_INDEX_DIR is a single-repo override that
@@ -122,10 +136,13 @@ export class RepoRegistry {
   }
 
   /** Resolve + validate a requested root into its (cached) context. Throws a
-   * clear error for a missing or non-directory path. Most-recently-used repos
-   * stay live; the least-recently-used is evicted past `maxOpen`. */
+   * clear error for a missing or non-directory path, and, serving the
+   * default root alone, OTHER_ROOT_REFUSED for any other before it is
+   * looked at. Most-recently-used repos stay live; the least-recently-used
+   * is evicted past `maxOpen`. */
   get(requested?: string): RepoCtx {
     const root = requested ? resolveRoot(requested) : this.defaultRoot;
+    if (this.defaultOnly && root !== this.defaultRoot) throw new Error(OTHER_ROOT_REFUSED);
     const existing = this.repos.get(root);
     if (existing) {
       // Reinsert to mark most-recently-used (Map preserves insertion order).
