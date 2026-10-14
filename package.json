@@ -52,15 +52,15 @@
     "prepare": "npm run build"
   },
   "dependencies": {
-    "@huggingface/transformers": "^4.3.0",
+    "@huggingface/transformers": "^4.3.1",
     "@infino-ai/infino": "^0.8.7",
-    "@modelcontextprotocol/sdk": "^1.30.1",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@vscode/tree-sitter-wasm": "^0.3.1",
     "apache-arrow": "21.2.0",
     "commander": "^15.0.0",
-    "ignore": "^7.0.10",
+    "ignore": "^7.0.12",
     "undici": "^8.11.2",
-    "zod": "^4.6.5"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/node": "^26",
