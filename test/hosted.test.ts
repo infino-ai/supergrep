@@ -119,8 +119,8 @@ describe("tableCard", () => {
 
 describe("parseHostedUrl", () => {
   it("splits https://host/db into base URL and database", () => {
-    expect(parseHostedUrl("https://api.platform.infino.ws/my-app")).toEqual({
-      baseUrl: "https://api.platform.infino.ws",
+    expect(parseHostedUrl("https://api.platform.example/my-app")).toEqual({
+      baseUrl: "https://api.platform.example",
       database: "my-app",
     });
   });
