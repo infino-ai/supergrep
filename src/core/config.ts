@@ -371,8 +371,12 @@ export function agentToolsEnabled(): boolean {
  * deployment. Says nothing when CX_AGENT_TOOLS is off, which removes both
  * tools. */
 export function answerToolEnabled(): boolean {
-  return ON_VALUES.includes((process.env.CX_ANSWER_TOOL ?? "").toLowerCase());
+  return ON_VALUES.includes((process.env[ANSWER_TOOL_ENV] ?? "").toLowerCase());
 }
+
+/** The switch `answerToolEnabled` reads; `cx install` writes it into an
+ * entry it writes the answer hooks beside. */
+export const ANSWER_TOOL_ENV = "CX_ANSWER_TOOL";
 
 /** Whether the MCP server offers the platform's own API routes as tools the
  * model calls itself (CX_API_TOOLS, default off): `table_card`, `validate`

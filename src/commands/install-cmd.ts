@@ -47,7 +47,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { bold, dim, green, yellow } from "../core/output.js";
-import { API_KEY_ENV } from "../core/config.js";
+import { ANSWER_TOOL_ENV, API_KEY_ENV, answerToolEnabled } from "../core/config.js";
 import { HostedError } from "../core/hosted.js";
 import { createDatabase, databaseNameFor, requestTrial, type Trial } from "../core/account-api.js";
 import { readStoredAccount, readStoredKey, writeStoredAccount, writeStoredKey } from "../core/keystore.js";
@@ -411,7 +411,9 @@ function runningFromPackage(): boolean {
  * fetched, or an installed copy being used to write an entry for a checkout. */
 export function serverEntry(opts: InstallCmdOptions, version: string): ServerEntry {
   const tail = ["mcp", ...platformArgs(opts)];
-  const env = opts.answerHook ? { env: { [ANSWER_DISPLAY_ENV]: ANSWER_DISPLAY_HOOK } } : {};
+  // The hooks name the `answer` tool, so an entry written with them switches
+  // the tool on too: the server registers it whatever its own environment says.
+  const env = opts.answerHook ? { env: { [ANSWER_DISPLAY_ENV]: ANSWER_DISPLAY_HOOK, [ANSWER_TOOL_ENV]: "1" } } : {};
   const [command, head] = commandFor(opts, version);
   return { command, args: [...head, ...tail], alwaysLoad: true, ...env };
 }
@@ -858,10 +860,13 @@ export async function installCmd(
   }
 
   const setup = await resolvePlatform(opts, root, deps);
-  // With `ask` enabled, the `answer` tool is too, and its result reaches the
-  // person through a hook rather than the model's retyping; the entry tells
-  // the server so, and the hooks are written beside it.
-  const answerHook = hooksHere && Boolean(setup.db);
+  // With the `answer` tool switched on (CX_ANSWER_TOOL), its result reaches
+  // the person through a hook rather than the model's retyping; the entry
+  // tells the server so, and the hooks are written beside it. Off, which is
+  // the default, no hooks are written and a re-run removes earlier ones:
+  // every one of them names the tool, and the Stop hook would send the
+  // model back for a call it cannot make.
+  const answerHook = hooksHere && Boolean(setup.db) && answerToolEnabled();
   const entry = serverEntry({ ...opts, db: setup.db, answerHook }, version);
   const existed = name in servers;
   const next: Config = { ...config, mcpServers: { ...servers, [name]: entry } };

@@ -637,14 +637,50 @@ describe("cx install: the first install on a machine with no account", () => {
   });
 });
 
-describe("cx install: the answer-display hooks", () => {
+describe("cx install: no answer hooks while the answer tool is off", () => {
+  const settingsIn = (dir: string) => join(dir, ".claude", "settings.json");
+
+  // The answer tool is off unless CX_ANSWER_TOOL says otherwise, and every
+  // hook below names it: written without it, the Stop hook would send the
+  // model back for a tool it does not have.
+  it("writes no hooks and no env beside a platform entry by default", async () => {
+    await installCmd({ path: root, db: "https://host/db" }, VERSION);
+    expect(read(configIn(root)).mcpServers["code-context"].env).toBeUndefined();
+    expect(existsSync(settingsIn(root))).toBe(false);
+  });
+
+  it("removes the hooks an earlier install wrote, leaving other hooks alone", async () => {
+    process.env.CX_ANSWER_TOOL = "1";
+    try {
+      await installCmd({ path: root, db: "https://host/db" }, VERSION);
+    } finally {
+      delete process.env.CX_ANSWER_TOOL;
+    }
+    const settings = read(settingsIn(root));
+    settings.hooks.PostToolUse.unshift({ matcher: "Bash", hooks: [{ type: "command", command: "echo theirs" }] });
+    writeFileSync(settingsIn(root), JSON.stringify(settings));
+    await installCmd({ path: root, db: "https://host/db" }, VERSION);
+    expect(read(settingsIn(root)).hooks).toEqual({ PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo theirs" }] }] });
+    expect(read(configIn(root)).mcpServers["code-context"].env).toBeUndefined();
+  });
+});
+
+describe("cx install: the answer-display hooks, with the answer tool on", () => {
   const settingsIn = (dir: string) => join(dir, ".claude", "settings.json");
   const matcher = answerHookMatcher("code-context");
+  beforeEach(() => {
+    process.env.CX_ANSWER_TOOL = "1";
+  });
+  afterEach(() => {
+    delete process.env.CX_ANSWER_TOOL;
+  });
 
   it("writes one PostToolUse hook per chunk beside a platform entry, and tells the server so", async () => {
     await installCmd({ path: root, db: "https://host/db" }, VERSION);
     const entry = read(configIn(root)).mcpServers["code-context"];
-    expect(entry.env).toEqual({ CX_ANSWER_DISPLAY: "hook" });
+    // The entry switches the tool on too, so the server the client starts
+    // registers the tool these hooks name, whatever its own environment says.
+    expect(entry.env).toEqual({ CX_ANSWER_DISPLAY: "hook", CX_ANSWER_TOOL: "1" });
     const all = read(settingsIn(root)).hooks.PostToolUse as Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }>;
     // Three chunk entries on the answer tool, then the one on the retrieval
     // tools that reminds the model the writer has the rows.
