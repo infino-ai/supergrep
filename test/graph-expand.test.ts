@@ -46,9 +46,9 @@ describe("expandAcrossGraph", () => {
   it("returns every row the platform reached whole: its _id and every value, none cut", async () => {
     const long = "the filing deadline moved ".repeat(400);
     const passages = Array.from({ length: 40 }, (_, i) => ({ _id: `${1000 + i}`, area: "tax", content: `${long}${i}` }));
-    const db = platform({ connected: [{ table: "chunks_lab", rows: passages }], seeds: 1 });
-    const out = await expandAcrossGraph(db, "chunks_lab", [{ _id: "7", content: "seed" }]);
-    expect(out?.tables).toEqual([{ table: "chunks_lab", rows: passages }]);
+    const db = platform({ connected: [{ table: "chunks_docs", rows: passages }], seeds: 1 });
+    const out = await expandAcrossGraph(db, "chunks_docs", [{ _id: "7", content: "seed" }]);
+    expect(out?.tables).toEqual([{ table: "chunks_docs", rows: passages }]);
   });
 
   const answer: RowRecord = {
@@ -62,7 +62,7 @@ describe("expandAcrossGraph", () => {
   it("hands an engine id to the platform as its digits in text, which the route reads exactly", async () => {
     const db = platform(answer);
     const id = 33045846845217366828836519439606n;
-    await expandAcrossGraph(db, "chunks_lab", [{ _id: id, title: "t" }, { _id: "7", title: "u" }]);
+    await expandAcrossGraph(db, "chunks_docs", [{ _id: id, title: "t" }, { _id: "7", title: "u" }]);
     expect(db.asked[0].rows).toEqual([
       { _id: "33045846845217366828836519439606", title: "t" },
       { _id: "7", title: "u" },

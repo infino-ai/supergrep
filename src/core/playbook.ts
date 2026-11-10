@@ -3,9 +3,9 @@
 //
 // A playbook: bullets a model is told beside the instructions it always
 // gets, learned from recorded runs rather than written by hand (ACE, Zhang
-// et al., arXiv 2510.04618). The file is the bench's (`bench/playbook.mjs`
-// writes and curates it); this is the client's reading of it: the block the
-// outer model gets in the server's instructions, and a label naming it. The format is one JSON file:
+// et al., arXiv 2510.04618). Whatever writes the file, this is the client's
+// reading of it: the block the outer model gets in the server's
+// instructions, and a label naming it. The format is one JSON file:
 //   {label, corpus?, bullets: [{id, scope, status, when, text, helpful,
 //    harmful, origin}]}
 // With no playbook configured nothing here renders anything, so a server
@@ -19,8 +19,8 @@ import { resolve } from "node:path";
 export const PLAYBOOK_ENV = "CX_PLAYBOOK";
 
 /** The scope of the bullets the outer model reads; the other scopes
- * (`loop`, `table:<name>`) are the platform loop's and reach it as memory
- * rows the bench writes, never through this client. */
+ * (`loop`, `table:<name>`) are for the platform's own loop and never reach
+ * it through this client. */
 export const SCOPE_OUTER = "outer";
 
 /** A bullet read by the models. */
@@ -29,8 +29,8 @@ export const STATUS_ACTIVE = "active";
 /** The `when` of a bullet that applies to every question. */
 export const WHEN_ALWAYS = "always";
 
-/** The line that opens a rendered block, the same words the bench renders,
- * so a model reads one playbook whichever side rendered it. */
+/** The line that opens a rendered block. Kept fixed so a model reads the
+ * same block whichever program rendered the playbook. */
 export const BLOCK_HEADER = "Playbook (learned from recorded runs; each line names when it applies). Before each step, find the bullets whose situation matches this question and follow them; before the final answer, name the ids you followed:";
 
 export interface PlaybookBullet {
@@ -60,8 +60,8 @@ export interface ConfiguredPlaybook {
 }
 
 /** Read and check a playbook file. A malformed file is an error naming the
- * bullet and the key: a server that silently read half a playbook would be
- * measured as something it is not. */
+ * bullet and the key: a server that silently read half a playbook would
+ * behave as something it was not configured to be. */
 export function loadPlaybook(path: string): Playbook {
   const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
   if (!parsed || typeof parsed !== "object") throw new Error(`${path}: a playbook is a JSON object`);
@@ -81,8 +81,7 @@ export function loadPlaybook(path: string): Playbook {
   return playbook as Playbook;
 }
 
-/** One bullet as a line of the block: its id, when it applies, what to do.
- * The same shape the bench renders. */
+/** One bullet as a line of the block: its id, when it applies, what to do. */
 export function bulletLine(bullet: PlaybookBullet): string {
   const when = bullet.when === WHEN_ALWAYS ? "Always" : `When ${bullet.when}`;
   return `- [${bullet.id}] ${when}: ${bullet.text}`;

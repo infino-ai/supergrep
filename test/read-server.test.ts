@@ -224,8 +224,8 @@ function rowOf(stored: Stored, query: string): Record<string, unknown> {
  * that no row precedes by id. */
 function evaluate(query: string): Array<Record<string, unknown>> {
   let kept: Stored[];
-  if (query.includes("LEFT JOIN")) {
-    const numbers = (/IN \(([\d, ]+)\)$/.exec(query)?.[1] ?? "").split(",").map(Number);
+  if (query.includes("NOT IN (SELECT")) {
+    const numbers = (/WHERE a\."chunk" IN \(([\d, ]+)\)/.exec(query)?.[1] ?? "").split(",").map(Number);
     const ids = new Set(STORED.map((s) => s.id));
     kept = STORED.filter((s) => !ids.has(s.id - 1n) && numbers.includes(Number(s.cells.chunk)));
   } else if (query.includes("BETWEEN")) {

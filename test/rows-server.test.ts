@@ -542,6 +542,125 @@ describe("a run the deployment gives the web", () => {
 // table's rows lie (`pages`): the server then offers `page`, which hands the
 // model a row's page as the image the platform reads off the document. A
 // table whose card says nothing of pages gets no such tool.
+describe("graph expansion that fails", () => {
+  const started = async (status: number) => start(describable(SPELLINGS[1], { graph_expand: () => [status, { error: "graph store unavailable" }] }), "cx-rows-");
+  /** The rows of the last search, beside the graph's account of it. */
+  const searchOnce = async (s: Started) => {
+    const r = await call(s, "search", { query: "distributed systems", k: 3 });
+    expect(r.ok, String(r.value)).toBe(true);
+    return { ops: r.ops, graph: (r.value as { graph?: string; hits: unknown[] }).graph, hits: (r.value as { hits: unknown[] }).hits };
+  };
+
+  it("pauses after a failure that may pass, keeps the rows, and does not ask again during the pause", async () => {
+    const s = await started(503);
+    try {
+      const first = await searchOnce(s);
+      expect(first.hits.length).toBeGreaterThan(0);
+      // One graph attempt: its own client waits out no cold start.
+      expect(first.ops).toEqual(["hybrid_search", "graph_expand"]);
+      expect(first.graph).toMatch(/^graph expansion paused for 60 s/);
+      const second = await searchOnce(s);
+      expect(second.ops).toEqual(["hybrid_search"]);
+    } finally {
+      await stop(s);
+    }
+  });
+
+  it("turns off for the session on an answer that will not change", async () => {
+    const s = await started(403);
+    try {
+      expect((await searchOnce(s)).graph).toMatch(/^graph expansion off for this session/);
+      expect((await searchOnce(s)).ops).toEqual(["hybrid_search"]);
+    } finally {
+      await stop(s);
+    }
+  });
+});
+
+describe("graph expansion on the ledger", () => {
+  let s: Started;
+  beforeAll(async () => {
+    s = await start(
+      describable(SPELLINGS[1], { graph_expand: () => [200, { seeds: 1, connected: [] }, "0.5"] }),
+      "cx-rows-",
+    );
+  });
+  afterAll(async () => {
+    await stop(s);
+  });
+
+  it("files the graph read beside the search's own on the receipt", async () => {
+    const { ok, ops } = await call(s, "search", { query: "distributed systems", k: 3 });
+    expect(ok).toBe(true);
+    expect(ops).toEqual(["hybrid_search", "graph_expand"]);
+    const lines = readFileSync(join(s.root, ".infino", USAGE_LOG), "utf8").trim().split("\n");
+    const entry = JSON.parse(lines.at(-1)!) as { tool: string; platform?: { readTokens?: number } };
+    expect(entry.tool).toBe("search");
+    // The search's metered 0.010 and the graph's 0.5.
+    expect(entry.platform?.readTokens).toBeCloseTo(0.51, 5);
+  });
+});
+
+describe("an account without the agent routes", () => {
+  const PAGED_CARD = { card: { schema: [] }, pages: true };
+  let s: Started;
+  beforeAll(async () => {
+    process.env.CX_WEB_FETCH = "1";
+    try {
+      s = await start(
+        describable(SPELLINGS[1], {
+          account: () => [200, { agent_apis: false }],
+          table_card: () => [200, PAGED_CARD],
+        }),
+        "cx-rows-",
+      );
+    } finally {
+      delete process.env.CX_WEB_FETCH;
+    }
+  });
+  afterAll(async () => {
+    await stop(s);
+  });
+
+  it("reads the account's features once at startup, and offers no page and no web_fetch", async () => {
+    expect(s.features).toBe(1);
+    expect(s.sent.find((x) => x.op === "account")?.path).toBe("account/features");
+    const names = (await s.client.listTools()).tools.map((t) => t.name);
+    expect(names).not.toContain("page");
+    expect(names).not.toContain("web_fetch");
+    expect(names).toContain("search");
+  });
+
+  it("searches without asking the platform's graph for connected rows", async () => {
+    const { ok, value, ops } = await call(s, "search", { query: "distributed systems", k: 3 });
+    expect(ok, String(value)).toBe(true);
+    expect(ops).toEqual(["hybrid_search"]);
+  });
+});
+
+describe("an account whose features cannot be read", () => {
+  let s: Started;
+  beforeAll(async () => {
+    process.env.CX_WEB_FETCH = "1";
+    try {
+      s = await start(describable(SPELLINGS[1], { account: () => [404, { error: "no such route" }] }), "cx-rows-");
+    } finally {
+      delete process.env.CX_WEB_FETCH;
+    }
+  });
+  afterAll(async () => {
+    await stop(s);
+  });
+
+  it("reads as an account without the agent routes: no web_fetch, and search still runs", async () => {
+    const names = (await s.client.listTools()).tools.map((t) => t.name);
+    expect(names).not.toContain("web_fetch");
+    const { ok, ops } = await call(s, "search", { query: "rust", k: 3 });
+    expect(ok).toBe(true);
+    expect(ops).toEqual(["hybrid_search"]);
+  });
+});
+
 describe("a table whose deployment says where its rows' pages lie", () => {
   const IMAGE = { media_type: "image/jpeg", data: "/9j/2Q==", width: 1350, height: 1803 };
   /** The table's card as the platform serves it, with the deployment's
@@ -597,7 +716,7 @@ describe("a table of another shape the platform could not describe at startup", 
     // The database's tables once, then the table's schema and the listed
     // table's, read at once and each once - and nothing more of either.
     expect(s.startup).toEqual(["list_tables", "schema", "schema"]);
-    expect(s.sent.slice(0, s.startup.length).filter((x) => x.op === "schema").map((x) => String(x.body?.table_name)).sort()).toEqual(["chunks", JOBS_TABLE]);
+    expect(s.sent.filter((x) => x.op !== "account").slice(0, s.startup.length).filter((x) => x.op === "schema").map((x) => String(x.body?.table_name)).sort()).toEqual(["chunks", JOBS_TABLE]);
     const { tools } = await s.client.listTools();
     const byName = new Map(tools.map((t) => [t.name, t.description ?? ""]));
     expect(byName.has("ask")).toBe(false);

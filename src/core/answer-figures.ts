@@ -4,12 +4,11 @@
 // The figures of a final answer that no tool result holds: numbers the model
 // produced itself rather than read or computed through a tool.
 //
-// Measured need (OfficeQA, 2026-10-07): the caller read all sixteen figures
-// of a question right and computed a five-span exponential average by hand.
-// Its first step came out 67 cents high (940,998.60 / 3), the error carried
-// into every later step, and the answer was six cents off - wrong under the
-// benchmark's exact match. A sentence telling the model to compute through
-// `sql` is a request it can skip; this is the check behind it. A figure a
+// A model that reads every input right can still compute a figure by hand
+// and get it slightly wrong - a multi-step average whose first step is off by
+// cents carries the error into every later step - and an answer checked for
+// an exact figure is then wrong. A sentence telling the model to compute
+// through `sql` is a request it can skip; this is the check behind it. A figure a
 // statement computed is in that statement's result, and a figure read from a
 // row is in the row; one in neither came from the model's own arithmetic.
 
@@ -100,12 +99,10 @@ export function unbackedFigures(reply: string, values: readonly number[]): strin
 }
 
 /** How a reply says it named a reading of the question and did not compute
- * it. Measured need (OfficeQA, 2026-10-07): question 24 answered 1.0093 with
- * "I did not compute that variant" - the variant was the key, 1.0087 - in
- * two passes of three, under an instruction to compute every reading it
- * names; question 30 re-signed a figure and offered the key's reading as "if
- * you instead take the literal ratio". Each reply said so; the phrases are
- * what it said. */
+ * it - "I did not compute that variant", "if you instead take the literal
+ * ratio" - when the reading it left uncomputed may be the one the question
+ * meant. A model told to compute every reading it names still does this; the
+ * phrases are the ones such replies use. */
 const UNCOMPUTED_READING =
   /\b(?:did not|didn't|have not|haven't|was not able to|could not) (?:compute|calculate|work out|run)\b|\balternative reading\b|\bif you (?:instead|include|exclude|count|use|take)\b|\bunder the other reading\b/i;
 

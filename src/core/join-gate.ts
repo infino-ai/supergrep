@@ -191,9 +191,8 @@ function setBranches(text: string): string[] {
  * JOINed, or listed in one FROM). Queries that only sit side by side join
  * nothing and run as written: the branches of a UNION, INTERSECT or EXCEPT,
  * and subqueries over one table each in a SELECT list with no table of its
- * own. Asked how many rows each of two tables has, the model wrote a UNION
- * of the two counts, the gate refused it, and the model went back to one
- * query per table (2026-10-19). */
+ * own. A UNION of two tables' counts is the natural answer to how many rows
+ * each has; refusing it sent the model back to one query per table. */
 export function joinsTables(query: string, known: readonly string[]): boolean {
   for (const branch of setBranches(query)) {
     const { outer, subqueries } = splitSubqueries(branch);

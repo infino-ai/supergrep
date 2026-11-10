@@ -1225,7 +1225,7 @@ export interface ReadRange {
  * returned, or - for a read of several ranges - the ranges still to come,
  * the first cut to start after that line, in the same paired form they were
  * asked for. */
-export type ReadMore = { from: number } | { from: number[]; to: number[] };
+export type ReadMore = { from: number; to?: number } | { from: number[]; to: number[] };
 
 export interface ReadFileResult {
   path: string;
@@ -1257,16 +1257,16 @@ export function readHits(files: ReadonlyArray<ReadFileResult | ReadFileMiss>): R
 export interface ReadCall {
   paths: string[];
   from: number | number[];
-  to?: number[];
+  to?: number | number[];
 }
 
 /** The read calls that fetch the rest of every file a read cut short - by
  * the line cap or by the result's budget - one call per distinct `more`, so
  * files that resume at the same line share a call. Empty when every file
  * came back whole. Said on the result because `from` applies to every path
- * of a call: a caller handed six cut documents would otherwise have to work
- * out the calls itself, and a legal-document benchmark's caller, holding a cut document,
- * went back to paging it through sql (2026-10-08). */
+ * of a call: a caller handed several cut documents would otherwise have to
+ * work out the calls itself, and one holding a cut document tends to go back
+ * to paging it through sql. */
 export function readNextCalls(files: ReadonlyArray<ReadFileResult | ReadFileMiss>): ReadCall[] {
   const calls = new Map<string, ReadCall>();
   for (const file of readHits(files)) {
@@ -1282,10 +1282,9 @@ export function readNextCalls(files: ReadonlyArray<ReadFileResult | ReadFileMiss
 /** The ranges a read's `from` and `to` name. Plain numbers are one range
  * (either end left open); lists pair up in order, one range per pair -
  * `from [559, 1938], to [610, 1975]` is lines 559-610 and 1938-1975 - so the
- * windows around several places in a file come back in one call. Measured on
- * the demo (2026-09-28): Haiku, after a find named the unsafe sites, wrote
- * exactly those lists in six of its fifteen reads. Undefined when neither
- * end is given: the whole file. */
+ * windows around several places in a file come back in one call - what a
+ * caller writes after a find has named several sites in one file. Undefined
+ * when neither end is given: the whole file. */
 export function readRanges(from: number | number[] | undefined, to: number | number[] | undefined): ReadRange[] | undefined {
   if (from === undefined && to === undefined) return undefined;
   if (!Array.isArray(from) && !Array.isArray(to)) {
@@ -1301,10 +1300,14 @@ export function readRanges(from: number | number[] | undefined, to: number | num
 }
 
 /** Where a read cut at `last` resumes: the next line, with the same end, for
- * one range; for several, every range not yet finished, the first starting
- * after `last`. */
+ * one range - an end the caller named is kept, so following `more` stops
+ * where the caller asked; for several, every range not yet finished, the
+ * first starting after `last`. */
 function moreAfter(ranges: readonly ReadRange[], last: number): ReadMore {
-  if (ranges.length === 1) return { from: last + 1 };
+  if (ranges.length === 1) {
+    const { to } = ranges[0];
+    return to === Number.MAX_SAFE_INTEGER ? { from: last + 1 } : { from: last + 1, to };
+  }
   const rest = [...ranges]
     .sort((a, b) => a.from - b.from)
     .filter((r) => r.to > last)
@@ -1324,8 +1327,8 @@ export interface ReadOptions {
 /** The bytes `text` takes inside a JSON string, UTF-8 encoded: what a line
  * costs the result it is sent in. Escaping inflates text past its length - a
  * quote or a backslash doubles, a control character becomes six, a line
- * break two - and a character past ASCII is two to four bytes; on the demo
- * (2026-10-08) a page of 60,000 characters went out as 64 KB. */
+ * break two - and a character past ASCII is two to four bytes, so a page of
+ * 60,000 characters can go out as 64 KB. */
 function serializedBytes(text: string): number {
   return Buffer.byteLength(JSON.stringify(text)) - JSON_QUOTES_BYTES;
 }
@@ -1563,27 +1566,21 @@ export async function findRows(
 // A document of a table loaded as passages is NOT the rows sharing its path.
 // The load copies a record's columns onto each of its passages except the
 // ones it keeps on the first passage alone - by default every nested column
-// and every long text column not embedded with the passage (embedding-
-// pipeline hydrate/src/chunk.rs, `first_chunk_only`) - and on the live
-// chunks_lab that is `path` itself: NULL on every passage but `chunk = 0`.
-// A read by `WHERE path IN (...)` got one passage a document (2026-10-08,
-// a benchmark task: six documents, about 2,000 characters each of some 60,000).
-// Which columns stay on the first passage is not in the load's record, so no
-// column can be trusted to name every passage. What does: the load appends a
-// record's passages together, so passage k sits at the engine id of its
-// first passage plus k - every one of chunks_lab's 195,530 later passages
-// does, but where a commit boundary fell inside a record (2 of them), whose
-// rest begins the next commit's block of ids.
+// and every long text column not embedded with the passage - and on a table
+// of documents that can be `path` itself: NULL on every passage but
+// `chunk = 0`. A read by `WHERE path IN (...)` then gets one passage a
+// document. Which columns stay on the first passage is not in the load's
+// record, so no column can be trusted to name every passage. What does: the
+// load appends a record's passages together, so passage k sits at the engine
+// id of its first passage plus k - except where a commit boundary fell inside
+// a record, whose rest begins the next commit's block of ids.
 
 /** The engine id as a read selects it: as text, since it is 32 digits and a
  * number would round it. */
 const READ_ID_ALIAS = "__cx_id";
-/** The id after a row's, in the statement that finds where a commit's block
- * of ids begins. */
-const READ_NEXT_ALIAS = "__cx_next";
 /** The ids one round of the walk reads past each document's last passage: a
- * document of the benchmark tables runs to some 30 passages, so most are
- * read in one round. */
+ * typical document runs to a few dozen passages, so most are read in one
+ * round. */
 const READ_WALK_WINDOW = 256n;
 /** The rounds of the walk at most, past which a document is returned as far
  * as it got, with a note: READ_WALK_WINDOW passages a round. */
@@ -1621,14 +1618,18 @@ export function readWindowSql(shape: TableShape, document: TableDocument, window
 /** The statement that finds where a document goes on past a commit
  * boundary: the rows numbered one of `numbers` that begin a block of ids -
  * no row holds the id before theirs - with every cell, for the walk to match
- * against the document's first row. */
+ * against the document's first row. Only the candidates' predecessors are
+ * looked up - the rows whose id is one less than a candidate's - so the
+ * statement reads the rows numbered as asked and those ids, never the
+ * table joined against itself. */
 export function readContinuationSql(shape: TableShape, document: TableDocument, numbers: readonly number[]): string {
   const cells = readCells(shape, document).map((c) => `a.${sqlIdentifier(c)}`).join(", ");
-  const next = sqlIdentifier(READ_NEXT_ALIAS);
+  const numbered = `${sqlIdentifier(document.orderColumn!)} IN (${[...new Set(numbers)].join(", ")})`;
+  const id = ENGINE_ID_COLUMN;
   return (
-    `SELECT CAST(a.${ENGINE_ID_COLUMN} AS VARCHAR) AS ${sqlIdentifier(READ_ID_ALIAS)}, ${cells} FROM ${shape.table} a ` +
-    `LEFT JOIN (SELECT ${ENGINE_ID_COLUMN} + 1 AS ${next} FROM ${shape.table}) b ON b.${next} = a.${ENGINE_ID_COLUMN} ` +
-    `WHERE b.${next} IS NULL AND a.${sqlIdentifier(document.orderColumn!)} IN (${[...new Set(numbers)].join(", ")})`
+    `SELECT CAST(a.${id} AS VARCHAR) AS ${sqlIdentifier(READ_ID_ALIAS)}, ${cells} FROM ${shape.table} a ` +
+    `WHERE a.${numbered} AND a.${id} NOT IN (` +
+    `SELECT ${id} + 1 FROM ${shape.table} WHERE ${id} IN (SELECT ${id} - 1 FROM ${shape.table} WHERE ${numbered}))`
   );
 }
 

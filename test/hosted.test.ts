@@ -814,3 +814,39 @@ describe("reads that ask for a rerank", () => {
     await expect(db.querySqlChecked("DELETE FROM t", { rerank: { question: "q" } })).rejects.toThrow("read-only");
   });
 });
+
+describe("a checked read whose check cannot answer", () => {
+  const VALIDATE = { validate: { table_name: "t", field_name: "body" } };
+  const rows = [{ id: 1 }, { id: 2 }];
+  const error = (status: number, message: string): Scripted => ({
+    status,
+    body: JSON.stringify({ message }),
+    headers: { "content-type": "application/json" },
+  });
+
+  it("resends without the check where the deployment does not validate, and asks for it no more", async () => {
+    const { db, calls } = client([error(400, "validate is not available on this deployment"), json(rows), json(rows)]);
+    expect(await db.querySqlChecked("SELECT id FROM t", VALIDATE)).toEqual({ rows });
+    expect(calls.map((c) => bodyJson(c).validate === undefined)).toEqual([false, true]);
+    expect(db.validatesOnRead).toBe(false);
+    // The next read goes out plain at once.
+    expect(await db.querySqlChecked("SELECT id FROM t", VALIDATE)).toEqual({ rows });
+    expect(calls).toHaveLength(3);
+    expect(bodyJson(calls[2]).validate).toBeUndefined();
+  });
+
+  it("returns the rows plain when the checked read fails for any other reason, and keeps asking next time", async () => {
+    // A 503 on the checked attempt is not waited out: it has the plain read to fall back to.
+    const { db, calls } = client([error(503, "the worker is restarting"), json(rows)], { coldStartSecs: 60 });
+    expect(await db.querySqlChecked("SELECT id FROM t", VALIDATE)).toEqual({ rows });
+    expect(calls).toHaveLength(2);
+    expect(bodyJson(calls[1]).validate).toBeUndefined();
+    expect(db.validatesOnRead).toBe(true);
+  });
+
+  it("lets a refusal of the statement itself stand, without a second read", async () => {
+    const { db, calls } = client([error(400, "query_sql is read-only")]);
+    await expect(db.querySqlChecked("DELETE FROM t", VALIDATE)).rejects.toThrow("read-only");
+    expect(calls).toHaveLength(1);
+  });
+});

@@ -79,7 +79,7 @@ import {
 } from "../core/config.js";
 import { StartupCache, startupCachePath, startupCacheSecs } from "../core/startup-cache.js";
 import { keyFilePath, readStoredAccount } from "../core/keystore.js";
-import { createDatabase } from "../core/account-api.js";
+import { accountFeatures, createDatabase } from "../core/account-api.js";
 import { configuredPlaybook, withPlaybook } from "../core/playbook.js";
 import { MEMORY_RECALL_TIMEOUT_MS, recallMemory, type Recalled } from "../core/memory.js";
 import { readManifest, readPlatformManifest, type Manifest } from "../core/manifest.js";
@@ -247,17 +247,16 @@ import { ARITHMETIC_SENTENCE, READING_HABITS, SEARCH_RULE_SENTENCE, TASK_CHECKLI
 
 export { ARITHMETIC_SENTENCE, READING_HABITS, SEARCH_RULE_SENTENCE, TASK_CHECKLIST_SENTENCE } from "./wording.js";
 
-/** The `sql` tool's description, named because it is the one description whose
- * every clause was put there by a measurement and can be regressed by an edit
- * that reads better. Five of its clauses are load-bearing in that sense and
- * `test/tool-text.test.ts` asserts each one, each assertion shown to fail when
- * its clause is rewritten: hybrid named before bm25 (a tool named second was
- * measured taken 0 times in 1,103 queries); the placeholder marked as the
- * caller's to fill (a model copied one literally in 8 of 8 calls); the total
- * named `ranked_lines` and reported as ranked, since fusion unions the keyword
- * and meaning arms so a row can place in the top k without holding the terms;
- * the pair that says a path filter narrows a search but is never the topic -
- * every aggregation statement in the bench that aggregated at all was a
+/** The `sql` tool's description, named because every clause of it is there
+ * for a reason an edit that reads better can undo. Five of its clauses are
+ * load-bearing in that sense and `test/tool-text.test.ts` asserts each one,
+ * each assertion shown to fail when its clause is rewritten: hybrid named
+ * before bm25 (a function named second is rarely the one a model uses); the
+ * placeholder marked as the caller's to fill (otherwise a model copies it
+ * literally); the total named `ranked_lines` and reported as ranked, since
+ * fusion unions the keyword and meaning arms so a row can place in the top k
+ * without holding the terms; the pair that says a path filter narrows a
+ * search but is never the topic - otherwise an aggregation tends to be a
  * directory guess measuring file lengths; and the scan clause naming every
  * predicate rather than ILIKE alone. */
 /** The card tier folded into the `sql` description on a platform database:
@@ -287,9 +286,10 @@ const CARD_TIER = configuredCardTier((line) => console.error(line));
  * platform's graph searches its facts by, whatever table the rows are of. */
 const KEYWORD_SEARCH_CALL = /\b(?:hybrid|bm25)_search\s*\(/i;
 /** The playbook this server was started with (CX_PLAYBOOK, `cx mcp
- * --playbook`), or null: its outer bullets join the instructions. Read once; a file that does not load stops the server before it
- * serves a tool, since a server measured with half a playbook would be
- * measured as something it is not. */
+ * --playbook`), or null: its outer bullets join the instructions. Read
+ * once; a file that does not load stops the server before it serves a tool,
+ * since a server with half a playbook would be something it was not
+ * configured to be. */
 const PLAYBOOK = configuredPlaybook((line) => console.error(line));
 /** Whether the text carries the semantic layer: on the enriched tier only, so
  * the lean text stays what it was measured as. */
@@ -298,30 +298,30 @@ const WITH_SEMANTICS = CARD_TIER !== LEAN_CARD_TIER;
 /** Every tool here reads the index; none writes. Said out loud because a
  * caller that runs a message's tool calls concurrently only when each one is
  * read-only - Claude Code does exactly that - otherwise runs them one at a
- * time. Without this, four platform calls issued together were announced at
- * once and executed serially (measured 2026-09-12: 31s where the slowest alone
- * was 15s), so every sentence below that asks for calls side by side was a
- * promise the harness could not keep. */
+ * time. Without this, platform calls issued together run one after another
+ * - the wait is the sum rather than the slowest - so every sentence below
+ * that asks for calls side by side would be a promise the client cannot
+ * keep. */
 const READ_ONLY = { readOnlyHint: true } as const;
 
 /** The largest `read` result, in bytes as sent, that Claude Code shows the
  * model inline. Past its limit it writes the result to a file and the model
- * sees only a preview: on the demo (2026-10-08, a legal-document benchmark task) a read
- * of six documents filling 60,000 characters went out as 64 KB and came back
- * as `<persisted-output>`, while a 49,484-character read came back whole. */
+ * sees only a preview (`<persisted-output>`): a read of 60,000 characters,
+ * escaped and encoded, goes out as some 64 KB and lands in a file, while
+ * one just under 50,000 comes back whole. */
 export const READ_INLINE_MAX_BYTES = 49_000;
 
 /** The largest result, in characters, the `page` tool declares to Claude
  * Code (`anthropic/maxResultSizeChars`, whose ceiling this is). A page's
- * image travels as base64, and on OfficeQA's scans 94% of pages pass the
- * default 50,000 characters, where Claude Code would write the result to a
- * file the model never sees; at this size 98.4% go through whole. */
+ * image travels as base64, and most scanned pages pass the default 50,000
+ * characters, where Claude Code would write the result to a file the model
+ * never sees; at this size nearly all go through whole. */
 export const PAGE_RESULT_MAX_CHARS = 500_000;
 
 /** The bytes a `read` result's numbered lines may take as sent, JSON-escaped
  * and UTF-8 encoded, before each path's share (`readBudget`):
  * READ_INLINE_MAX_BYTES less room for what every result carries besides -
- * `index`, `took_ms`, the usage line. Measured as sent rather than as text,
+ * `index`, `took_ms`, the usage line. Counted as sent rather than as text,
  * since escaping inflates it. */
 export const READ_BUDGET_BYTES = 45_000;
 
@@ -352,9 +352,8 @@ function jsonOrAsIs(value: unknown): unknown {
 }
 
 /** A line number or a list of them, for read's from and to. A list sent as
- * its JSON text is read as the list: the demo's Haiku (2026-09-28) sent
- * `from: "[559, 592, 623]"` in six of fifteen reads, and a schema that
- * refused it cost each one a turn. */
+ * its JSON text - `from: "[559, 592, 623]"`, which smaller models send - is
+ * read as the list: a schema that refused it would cost the call a turn. */
 export const lineOrLines = z.preprocess(jsonOrAsIs, z.union([z.number().int().positive(), z.array(z.number().int().positive()).min(1)]));
 
 /** How long `sql` waits for the platform's verdict on its rows before
@@ -369,6 +368,22 @@ export const lineOrLines = z.preprocess(jsonOrAsIs, z.union([z.number().int().po
  * hand - sat for 116 s waiting on a best-effort check. That is a regression
  * against the tool as it was, and a platform outage must not become one. */
 const VERDICT_TIMEOUT_MS = 3_000;
+/** The budget one graph expansion has: it adds to a result already in
+ * hand, so it never holds that result longer than this. */
+const GRAPH_TIMEOUT_MS = 5_000;
+/** How long expansion pauses after a failure that may pass (a timeout, a
+ * 429, a 5xx) before it is tried again. */
+const GRAPH_BACKOFF_MS = 60_000;
+/** The answers that say the graph is not there for this account or
+ * deployment, and will not be within a session. */
+const GRAPH_LASTING_STATUSES = new Set([401, 403, 404, 501]);
+/** What a result carries from the graph - `connected`, or `graph` saying
+ * why there is none - and the metered call behind it, for the receipt. */
+type GraphResult = { section: { connected: GraphExpansion } | { graph: string } | Record<string, never>; call?: CallTelemetry };
+const NO_GRAPH_RESULT: GraphResult = { section: {} };
+/** How long the startup waits on the account's features before reading it
+ * as an account without the agent routes. */
+const ACCOUNT_FEATURES_TIMEOUT_MS = 3_000;
 
 /** How long a server's start-up waits on the database's tables other than
  * its own, from the moment the server starts, before the handshake goes
@@ -379,13 +394,12 @@ const VERDICT_TIMEOUT_MS = 3_000;
  * table's reads, which decide what the tools are, fit in the rest. The table
  * the server is for is never cut by it.
  *
- * Measured 2026-10-30 on the public demo's database, 213 tables behind the
- * platform's per-account rate limit: describing every other table before the
- * handshake took 20-71 s and 1,500-2,100 requests a start (1,100-1,600 of
- * them 429s), with a few cards answering nothing for their whole 60 s; the
- * 41 tables of the database the listing was written for took 3.9 s
- * (2026-10-20). A table not described within it is named in the text as
- * one that could not be (`siblingsNote`). */
+ * On a database of a few hundred tables behind the platform's per-account
+ * rate limit, describing every other table before the handshake can take
+ * over a minute and thousands of requests, most of them refused for rate,
+ * with a few cards answering nothing for their whole timeout; a database of
+ * a few dozen tables takes a few seconds. A table not described within the
+ * budget is named in the text as one that could not be (`siblingsNote`). */
 const STARTUP_BUDGET_MS = 10_000;
 
 /** What `sql` says about its verdict when a platform is there to give one.
@@ -424,7 +438,7 @@ const VALIDATION_NOTE =
   "say so or leave it out rather than renumber the rest.";
 
 /** What introduces the cards in the `sql` description. Stated as each
- * table's own measured shape, because that is what it is: the optimizer
+ * table's own shape, because that is what it is: the optimizer
  * computed it from the table after optimizing it, so the distinct counts and
  * ranges are the table's, not an estimate. A wide table's card is laid out
  * within the budget the platform's own loop lays it out within (core/
@@ -442,8 +456,7 @@ const CARD_PREAMBLE =
  * carried before wide tables were laid out. The wide-table sentences, the
  * table's name in front of its card and the describe_columns tool are for a
  * card that maps columns; on a narrow table they are text about nothing the
- * model can see, and on OfficeQA (2026-10-19) the 90 questions with them went
- * 62 against 66 without, losing two questions every earlier run had right. */
+ * model can see, and they make its answers worse. */
 const NARROW_CARD_PREAMBLE =
   ` The table's own measured shape, computed from it - use it to choose columns and write the ` +
   `statement without discovering the shape first:\n`;
@@ -474,7 +487,7 @@ export function cardNamesKinds(card: RowRecord | undefined): boolean {
 
 /** What a text over several tables says about choosing among them: the
  * loop's words, word for word (the platform loop's text,
- * SEVERAL_TABLES_SENTENCE, held to it by test/loop-sentences.test.ts). Shown
+ * SEVERAL_TABLES_SENTENCE). Shown
  * two tables of events, a model took the one named first and the column
  * named like the question's words and told the reader the data held no tool
  * calls, while the other table's card said where they were. */
@@ -492,8 +505,8 @@ export const SEVERAL_TABLES_SENTENCE =
 export const TEXT_COLUMNS_LISTED = 24;
 
 /** How the lookup is told to be called with the question, the loop's words
- * word for word (the platform loop's text, DESCRIBE_COLUMNS_QUESTION_RULE,
- * held to it by test/loop-sentences.test.ts): the question first, the
+ * word for word (the platform loop's text, DESCRIBE_COLUMNS_QUESTION_RULE):
+ * the question first, the
  * table when the caller knows it. */
 export const DESCRIBE_COLUMNS_QUESTION_RULE =
   " Pass the question you are answering as `question`: without `table` it returns the cards of the " +
@@ -531,9 +544,8 @@ const OVERVIEW_PREAMBLE =
   "columns:\n";
 
 /** The lookup's `question` parameter, the loop's words word for word
- * (the platform loop's text, DESCRIBE_COLUMNS_QUESTION_PARAM, held to it by
- * test/loop-sentences.test.ts): one ranking for a lookup inside the loop
- * and out. */
+ * (the platform loop's text, DESCRIBE_COLUMNS_QUESTION_PARAM): one ranking
+ * for a lookup inside the loop and out. */
 export const DESCRIBE_COLUMNS_QUESTION_PARAM =
   "What you need the columns for, in a sentence: the matching columns that question needs come first, " +
   "best first, the rest after by rows with a value.";
@@ -568,9 +580,9 @@ export const RELATED_TO_SENTENCE =
   "A question asking what is related to something is a join or a question of meaning: include hybrid_search or " +
   "vector_search in the statement or the search. ";
 /** A question about a kind of language is one of meaning, whatever words it
- * lists (2026-10-07): asked for rage over a product's poll answers, the caller
- * listed "rage", "angry", "furious" and matched them as words, and missed the
- * complaints that use none of them ("stop polling me"). Said beside
+ * lists: asked for rage in free-text answers, a caller lists "rage",
+ * "angry", "furious" and matches them as words, and misses the complaints
+ * that use none of them ("stop polling me"). Said beside
  * `RELATED_TO_SENTENCE` in the rows' sql text, where a table has a vector;
  * the loop carries the same sentence (the platform loop's text,
  * `LANGUAGE_KIND_SENTENCE`). */
@@ -639,9 +651,8 @@ export const ROWS_REGEX_SENTENCE =
  * (the platform loop's text, `SQL_DIALECT_NOTE`) carries the same sentence,
  * word for word. The id is 32 digits, a DECIMAL(38, 0): written bare, the
  * engine reads it as a float and the statement fails with "Cannot cast to
- * Decimal128(38, 15). Overflowing" - on the OfficeQA benchmark (2026-10-06)
- * the caller wrote `WHERE _id = 3299...` to reread a row it had found and
- * lost the turn. Quoted, it compares exactly. */
+ * Decimal128(38, 15). Overflowing" - a caller writing `WHERE _id = 3299...`
+ * to reread a row it found loses the turn. Quoted, it compares exactly. */
 export const ROWS_ID_SENTENCE =
   "A row id is too wide for a number: compare it as a string, _id = '32995980872922260363525666898294', or the " +
   "query fails on overflow. ";
@@ -806,11 +817,10 @@ export function columnList(shape: TableShape): string {
 }
 
 /** How many columns the sql text names of another table whose card does not
- * lay its columns out. Every column of every such table went in whole, and
- * on a database of over a hundred tables (2026-11-05) the newly loaded tables with no card yet, a few
- * thousand columns each, made the sql text 16.8 MB: past the 16 MB Claude
- * Code takes in one message from a server, so every session started with no
- * tools at all. */
+ * lay its columns out. With every column of every such table in whole, newly
+ * loaded tables with no card yet and a few thousand columns each can make the
+ * sql text larger than the 16 MB Claude Code takes in one message from a
+ * server, and every session then starts with no tools at all. */
 export const SIBLING_COLUMNS_SHOWN = 100;
 
 /** A sibling table's columns for the sql text: `columnList`, but a table
@@ -1019,13 +1029,10 @@ export function isLogIndex(manifest: { languages?: Record<string, number>; chunk
  * is and how it is cited, and the closing clauses. One builder,
  * `instructionsFor`, lays every shape out the same way, so a sentence every
  * shape needs - the sweep, the counts, the choosing among several tables,
- * the describe_columns line - is added once and
- * reaches them all. The texts were four, each edited where a failure
- * showed, and they drifted: the rows text had one sql handoff from
- * 2026-09-11 and the code text another from 2026-09-24; the code text with
- * sibling tables never
- * said the question may be about any of them. Each shape's own measured
- * sentences are kept as they were; what the shapes share is said once. */
+ * the describe_columns line - is added once and reaches them all. Four
+ * separate texts, each edited where a failure showed, drift apart. Each
+ * shape's own sentences are kept as they were; what the shapes share is said
+ * once. */
 export interface InstructionSurface {
   /** The opening, ending in a period: what code-context is an index of and
    * what the first move is. The builder follows it with the choosing
@@ -1096,10 +1103,9 @@ export const DESCRIBE_COLUMNS_LINE =
   "family's prefix (`property_*`), a column's name, or `*`; call it before a statement names a mapped " +
   "column, and before counting a column of a table with a `kind_column`.\n";
 
-/** The surface of a code checkout. The first move was ls and cat CLAUDE.md,
- * every run, before any of these tools (the demo, 2026-09-24): the model
- * looks around a checkout it has been told nothing about. It has been
- * told: the table's columns, what is in it and how to read it are in the
+/** The surface of a code checkout. Told nothing, the model's first move is
+ * ls and cat CLAUDE.md, before any of these tools: it looks around a
+ * checkout it knows nothing about. It has been told: the table's columns, what is in it and how to read it are in the
  * sql tool's text, so the looking around is named as not needed. */
 export function codeSurface(table: string, siblings: readonly string[], options: SurfaceOptions = {}): InstructionSurface {
   const { describeColumns = false } = options;
@@ -1155,9 +1161,9 @@ export function logSurface(files: number, chunks: number): InstructionSurface {
   return {
     frame:
       `code-context is an index of the ${files} log files in this directory - every line of every log, in ` +
-      // The first move on the demo (2026-09-24) was `ls -S` of the directory,
-      // then grep, and twelve Bash calls with none of these tools; it was
-      // never told the looking around was not needed.
+      // Told nothing, the first move is `ls -S` of the directory and then a
+      // run of Bash calls with none of these tools; it is told the looking
+      // around is not needed.
       `${chunks} windows. Begin with these tools, not with ls or a look at the directory: what the logs hold ` +
       "is here.",
     doors: [
@@ -1206,11 +1212,10 @@ export const JOIN_KEYS_RULE = "YOU MUST CALL join_keys BEFORE ANY sql CALL IF TH
 /** The graph the platform keeps over these tables - every row linked to
  * the rows it shares a verified key value with, and to what its text names
  * - and the two functions that walk it, said in the sibling text as rules
- * for WHEN each is the move, with the seed statement written out. The
- * first wording described the functions and was measured unused: eight
- * cross-table questions on the SWE corpus, Opus, zero walk calls, the
- * model writing the same joins it wrote without the graph (2026-10-03).
- * The same text is the inner loop's `SQL_GRAPH_WALK`. */
+ * for WHEN each is the move, with the seed statement written out. A
+ * wording that only described the functions went unused: the model wrote
+ * the same joins it would write without the graph. The platform's own loop
+ * carries the same text. */
 export const GRAPH_WALK_SENTENCE =
   " The platform also keeps a graph over these tables: each row is linked to the rows it shares a " +
   "key value with and, where a text column was read, to the names its text mentions (a test, a " +
@@ -1373,11 +1378,10 @@ export function indexFirst(table = "chunks"): string {
   const tools = "find, search and sql";
   // "only for what the index could not give you" left the model the judge
   // of what the index gives, and it judged reading a file's lines as not
-  // that: on the demo's 64-project corpus (2026-09-24) a run ranked the
-  // longest test logs with one sql JOIN and then read the logs with ten
-  // Bash calls, wc, grep, tail and sed, when their lines were one statement
-  // away. So the statement is written out, and the file tools are named as
-  // not the way to read (the owner: "instruction sentence only").
+  // that: a run ranks the longest test logs with one sql JOIN and then reads
+  // the logs with Bash - wc, grep, tail and sed - when their lines are one
+  // statement away. So the statement is written out, and the file tools are
+  // named as not the way to read.
   return (
     `Look with the index first: ${tools} cover every file in one call and return the lines themselves, ` +
     "the files they name are one read away, every path in one call, " +
@@ -1549,10 +1553,9 @@ export function rowsFindDescription(shape: TableShape): string {
 }
 
 /** Where a whole document is read, said in every rows text of a table of
- * documents (`TableShape.document`); empty for a table of records. A legal-document
- * benchmark run (2026-10-07) had no such door: across 176 tasks the caller paged
- * each document through sql, `chunk BETWEEN 1 AND 10` a statement, some 18
- * calls a task. */
+ * documents (`TableShape.document`); empty for a table of records. Without
+ * it a caller pages each document through sql, `chunk BETWEEN 1 AND 10` a
+ * statement, many calls a document. */
 export function readDocumentsSentence(shape: TableShape): string {
   const document = shape.document;
   if (!document) return "";
@@ -1833,6 +1836,23 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // table of another shape is read there too: the local index is always
   // lexical (no local vectors), so there is no local search to choose.
   const remoteSearch = hosted !== null;
+  // Whether the account may use the agent routes - graph expansion, pages,
+  // web fetch, memory recall - read once from the account plane. An account
+  // without them answers each of those 403, so none of them is offered or
+  // called unless the account says it has them (`accountFeatures`: a
+  // refusal, a timeout or a platform without the route all read as no).
+  const agentApis =
+    hosted !== null
+      ? await accountFeatures(
+          { baseUrl: hosted.baseUrl, apiKey: hosted.apiKey },
+          { ...(hostedOptions?.fetch ? { fetch: hostedOptions.fetch } : {}), timeoutMs: ACCOUNT_FEATURES_TIMEOUT_MS },
+        )
+          .then((f) => f.agentApis)
+          .catch((err) => {
+            console.error(`account features unavailable, agent tools off: ${(err as Error).message}`);
+            return false;
+          })
+      : false;
 
   const noEmbed = Boolean(process.env.CX_NO_EMBED);
   // The local model exists for exactly one job now: `--embed-provider local`
@@ -2043,7 +2063,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * (`MEMORY_RECALL_TIMEOUT_MS`), like the verdict's, since a platform search
    * answering in milliseconds must not wait seconds on it. */
   const memoryDb =
-    hosted && memoryEnabled() ? hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0, timeoutMs: MEMORY_RECALL_TIMEOUT_MS }) : null;
+    hosted && agentApis && memoryEnabled() ? hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0, timeoutMs: MEMORY_RECALL_TIMEOUT_MS }) : null;
 
   /** The memory nearest a question, with the call it made for the ledger:
    * started beside a platform call and awaited after it. Only the tools that
@@ -2283,10 +2303,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // The platform tool (`search`) is registered whenever a platform database
   // is configured. A tool's routing line joins the instructions only when
   // the tool is registered: the instructions are prompt text on every turn,
-  // and a line for a tool that is not there would cost tokens and steer
-  // toward nothing - measured: a configuration that hid the platform tools
-  // through the SDK's disallowedTools alone still carried their lines here,
-  // and the caller spent a turn calling into the refusal. `platformTools`
+  // and a line for a tool that is not there costs tokens and steers toward
+  // nothing - a client that hides a tool still sends its line here, and the
+  // caller spends a turn calling into the refusal. `platformTools`
   // also keeps what belongs to the database: the sql text's card and
   // validation note.
   const platformTools = hosted !== null;
@@ -2449,15 +2468,13 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       card = shape.card;
       primaryPages = shape.pages === true;
       // The chunks shape alone does not make a table this client's. A table
-      // of passages something else loaded has the same columns - a benchmark's
-      // data rooms, one hosted table a room, named by CX_TABLE a question at a
-      // time (2026-10-11) - and the chunks mode runs find, read and a plain
-      // sql on the LOCAL index under that name, which holds the table this
-      // process built and no other. On every room task every such call
-      // failed "table not found", and search asked the hosted index for the
-      // local vector column's name (`embedding`, where the table has `emb`);
-      // the platform's own loop was the one door that reached the rooms. So the chunks
-      // mode is kept for a table the local index holds, and any other runs
+      // of passages something else loaded has the same columns - one hosted
+      // table per collection, named by CX_TABLE - and the chunks mode would
+      // run find, read and a plain sql on the LOCAL index under that name,
+      // which holds the table this process built and no other: every such
+      // call fails "table not found", and search asks the hosted index for
+      // the local vector column's name (`embedding`, where the table has
+      // `emb`). So the chunks mode is kept for a table the local index holds, and any other runs
       // over its rows on the platform, driven by its own shape, exactly as a
       // table of another shape does.
       if (!shape.isChunks) mode = { kind: "rows", shape };
@@ -2499,12 +2516,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // dropped, since the join is still the model's to write. Each is asked for
   // alone (see above). Their vector columns are not checked here
   // (`checkVector: false`): a check is a search by meaning, which loads the
-  // table's vector index on the worker, and one per table of a 41-table
-  // database at startup filled the worker's memory and stalled every query
-  // on it (2026-10-20); the platform embeds the query when a statement first
+  // table's vector index on the worker, and one per table of a database of
+  // dozens of tables at startup can fill the worker's memory and stall every
+  // query on it; the platform embeds the query when a statement first
   // searches one. They are described at once, not one after another: read
-  // in turn, the 40 other tables of that database took 15.6 s for their
-  // schemas alone, past half the time a client gives a server to start.
+  // in turn, a few dozen tables' schemas alone can take past half the time a
+  // client gives a server to start.
   // What the start-up's deadline cut is counted and said in one line, not a
   // line a table: on a database of hundreds of tables that is most of them.
   const siblings: TableShape[] = [];
@@ -2561,8 +2578,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // Cards that do not fit as they are would be ranked for a question
       // the start-up does not have: the text names every table in a line
       // instead, and describe_columns with the model's question returns the
-      // cards it needs (the owner, 2026-11-07: list every table in one line
-      // and let the model call describe_columns with its question).
+      // cards it needs.
       if (promptCards.ranked) promptCards = await reader.promptCards(cardTables, CARD_TIER, undefined, true);
     } catch (err) {
       console.error(
@@ -2620,8 +2636,8 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // the joins it verified, and the rows a search or a statement returns
   // are handed to it: the platform walks from them and the rows of the
   // other tables it reaches come back beside the result as `connected`,
-  // named by table. Never
-  // the model's to ask for - measured not asked for (core/graph-expand.ts).
+  // named by table. Never the model's to ask for: a model offered the graph
+  // functions does not call them (core/graph-expand.ts).
 
   /** The hosted tables the expansion may start from: the primary, alone or
    * with each described sibling - a one-table corpus has a graph of its own
@@ -2629,10 +2645,26 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * graph covers is the platform's to say; a table it does not cover is not
    * asked about again this session (`graphUncovered`). */
   const graphTables = new Set<string>([TABLE, ...siblingNames]);
-  // Off for the session after a failure: a platform whose graph store is
-  // not there yet refuses every walk the same way, and the result the
-  // walk was to add to stands without it. Said once on stderr.
-  let graphOff = false;
+  // Off for the session when the account has no agent routes, or when the
+  // platform answers that the graph is not there for it (403, 404, 501):
+  // those answers do not change within a session. Any other failure - a
+  // timeout, a 429, a 5xx - pauses expansion for GRAPH_BACKOFF_MS and then
+  // it is tried again. Either way the result the walk was to add to stands
+  // without it.
+  let graphOff = !agentApis;
+  let graphPausedUntil = 0;
+  // The client each repository's expansion goes through: the repository's
+  // own database, with a short budget of its own and no cold-start wait, so
+  // a cold or slow graph never holds the result it was to add to.
+  const graphClients = new WeakMap<RepoCtx, HostedDb>();
+  const graphClientOf = (ctx: RepoCtx): HostedDb => {
+    let client = graphClients.get(ctx);
+    if (!client) {
+      client = hostedDbFor(ctx.hosted!.target, { ...hostedOptions, coldStartSecs: 0, timeoutMs: GRAPH_TIMEOUT_MS });
+      graphClients.set(ctx, client);
+    }
+    return client;
+  };
   // The tables the platform said its graph does not cover (or that it
   // builds no graph): each answered once, then not asked about again.
   const graphUncovered = new Set<string>();
@@ -2651,23 +2683,27 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     source: string,
     rows: readonly RowRecord[],
     searched?: Searched,
-  ): Promise<{ connected: GraphExpansion } | { graph: string } | Record<string, never>> => {
-    if (graphOff || !ctx.hosted || !graphTables.has(source) || graphUncovered.has(source)) return {};
+  ): Promise<GraphResult> => {
+    if (graphOff || Date.now() < graphPausedUntil || !ctx.hosted || !graphTables.has(source) || graphUncovered.has(source)) return NO_GRAPH_RESULT;
     const trace: string[] = [];
+    const client = graphClientOf(ctx);
+    const metered = () => callTelemetry(client.lastCall());
     try {
-      const connected = await expandAcrossGraph(ctx.hosted, source, rows, {
+      const connected = await expandAcrossGraph(client, source, rows, {
         trace: (line) => trace.push(line),
         memory: graphMemory,
         onUncovered: () => graphUncovered.add(source),
         searched,
       });
-      if (!connected) return { graph: trace.join("; ") || "nothing reached" };
-      return { connected };
+      if (!connected) return { section: { graph: trace.join("; ") || "nothing reached" }, call: metered() };
+      return { section: { connected }, call: metered() };
     } catch (err) {
-      graphOff = true;
-      const why = `graph expansion off for this session: ${(err as Error).message}`;
+      const lasting = err instanceof HostedError && GRAPH_LASTING_STATUSES.has(err.status);
+      if (lasting) graphOff = true;
+      else graphPausedUntil = Date.now() + GRAPH_BACKOFF_MS;
+      const why = `${lasting ? "graph expansion off for this session" : `graph expansion paused for ${GRAPH_BACKOFF_MS / 1000} s`}: ${(err as Error).message}`;
       console.error(why);
-      return { graph: why };
+      return { section: { graph: why }, call: metered() };
     }
   };
   /** The one hosted table a statement is over, or null when it names none,
@@ -2728,15 +2764,24 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       const embedded = Object.values(embeds ?? {}).join(" ");
       const searched: Searched = { statement: query, ...(embedded.trim() ? { query: embedded } : {}) };
       const searchesWords = embedded.trim() !== "" || KEYWORD_SEARCH_CALL.test(query);
-      const connected = opts.over
-        ? {}
+      const graph = opts.over
+        ? NO_GRAPH_RESULT
         : source
           ? await connectAcrossGraph(ctx, source, fromPlatform, searched)
           : searchesWords
             ? await connectAcrossGraph(ctx, TABLE, [], searched)
-            : {};
+            : NO_GRAPH_RESULT;
       const placed = opts.numbered ? fromPlatform.map(numberRowLines) : fromPlatform;
-      const judged = checked.validation ? verdictForModel(checked.validation) : undefined;
+      // A check asked for and not answered - the checked read failed and the
+      // rows came back plain - is asked of the verdict client on its own,
+      // under its short cap with no cold-start wait, as the rows are posted
+      // back; it never holds or fails the rows. A deployment that has said it
+      // does not validate on a read is not asked again.
+      const postedBack =
+        checks.validate && !checked.validation && db.validatesOnRead
+          ? await platformVerdict(ctx, query, placed, asked, opts.column ?? CONTENT_COLUMN, opts.over && opts.over.table !== undefined ? { db: opts.over.verdict, table: opts.over.table } : undefined)
+          : {};
+      const judged = checked.validation ? verdictForModel(checked.validation) : postedBack.verdict;
       // A ranked aggregate's rows gain the platform's facts about their
       // groups - `file_lines`, `term_lines` - so a top-k total sits beside
       // the file's whole length in the row the model reads, and an ordered
@@ -2747,9 +2792,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       const rowsOut = reranked ? folded : rankRows(folded, withoutComments(query));
       let usage: string | undefined;
       if (receiptOn) {
-        // One platform read: the statement, its verdict and its rerank are
-        // metered on the one call.
-        const entry = withCalls(sqlEntry(query, rowsOut), own);
+        // The statement, its verdict and its rerank are metered on the one
+        // call - and a verdict posted back on its own is a second read.
+        const entry = withCalls(sqlEntry(query, rowsOut), own, postedBack.telemetry, graph.call);
         recordUsage(ctx.dir, entry);
         usage = formatReceipt(entry, session);
       }
@@ -2758,7 +2803,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       return ok({
         rows: held.rows,
         ...(hint ? { hint } : {}),
-        ...connected,
+        ...graph.section,
         ...(verdict ? { validation: verdict } : {}),
         index: "platform",
         ...(opts.over ? { database: opts.over.database } : {}),
@@ -3028,10 +3073,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // at all (see searchDoors): the routing and the other tools' text name
   // neither there.
   if (searchDoors) {
-    // search is registered only with an account: local vectors don't exist any
-    // more (the owner's decision, 2026-09-09 - see wantsLocalEmbed above), so a
-    // local "search" would just be a thinner bm25_search under a misleading
-    // name. Without an account, reach for sql's bm25_search/token_match instead.
+    // search is registered only with an account: the local index holds no
+    // vectors (see wantsLocalEmbed above), so a local "search" would just be
+    // a thinner bm25_search under a misleading name. Without an account, reach for sql's bm25_search/token_match instead.
     if (platformTools) {
       server.registerTool(
         "search",
@@ -3054,9 +3098,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             CITE_FROM_HIT +
             " When one " +
             "search is not enough, refine the query and search again. " +
-            // Measured on LogDx-CI (35 CI failure logs, evidence lines marked):
-            // at 200 lines returned per log, whole chunks kept 0.797 of the
-            // critical signals and the matching lines 0.853; see focusLines.
+            // Over long logs, the matching lines keep more of what matters
+            // than whole chunks do for the same number of lines returned;
+            // see focusLines.
             "Set lines to get each hit as only the lines carrying your query's words, with two lines " +
             "of context, in place of the whole chunk - for logs, test output and other long records, " +
             "where the matching lines are the answer; put the words you expect on those lines in the " +
@@ -3137,16 +3181,16 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             try {
               const t0 = performance.now();
               const [{ value: result, own }, recalled] = await Promise.all([answeredBy(searchRows(ctx.hosted!, over.shape, query, k, question), ctx), recallFor(query)]);
-              const connected = await connectAcrossGraph(ctx, TABLE, result.hits, { query });
+              const graph = await connectAcrossGraph(ctx, TABLE, result.hits, { query });
               let usage: string | undefined;
               if (receiptOn) {
-                const entry = withMemoryTokens(withCalls(rowSearchEntry(result), own, callTelemetry(recalled.call)), recalled.block);
+                const entry = withMemoryTokens(withCalls(rowSearchEntry(result), own, callTelemetry(recalled.call), graph.call), recalled.block);
                 recordUsage(ctx.dir, entry);
                 usage = formatReceipt(entry, session);
               }
               return ok({
                 ...result,
-                ...connected,
+                ...graph.section,
                 index: "platform",
                 ...(recalled.block ? { memory: recalled.block } : {}),
                 took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
@@ -3186,7 +3230,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             ]);
             // The hits seed the graph by their place: a chunk's path and
             // start line name its row.
-            const connected = await connectAcrossGraph(
+            const graph = await connectAcrossGraph(
               ctx,
               TABLE,
               result.hits.map((hit) => ({ path: hit.path, start_line: hit.startLine })),
@@ -3197,17 +3241,17 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
               // withPlatform, as the rows path does: the platform
               // returns the tokens it metered for this call, and without this
               // a remote search is the one hosted path whose read tokens never
-              // reach the ledger. They were being estimated at a measured rate
-              // per search instead, which is a made-up number standing in for
-              // one the response already carried. The recall's read rides on
+              // reach the ledger. Estimating them at a fixed rate per search
+              // would be a made-up number standing in for one the response
+              // already carries. The recall's read rides on
               // the same line.
-              const entry = withMemoryTokens(withCalls(searchEntry(result, ctx.root), own, callTelemetry(recalled.call)), recalled.block);
+              const entry = withMemoryTokens(withCalls(searchEntry(result, ctx.root), own, callTelemetry(recalled.call), graph.call), recalled.block);
               recordUsage(ctx.dir, entry);
               usage = formatReceipt(entry, session);
             }
             return ok({
               ...result,
-              ...connected,
+              ...graph.section,
               index: "platform",
               ...(recalled.block ? { memory: recalled.block } : {}),
               took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
@@ -3236,9 +3280,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           "Literal text within one line, case-sensitive unless ignoreCase. Use it where you would " +
           "grep: every use or definition of an identifier, an error message, a config key. Set defines " +
           "to get only where a name is defined rather than everywhere it appears. " +
-          // Measured 2026-09-20: three finds for guessed signatures returned
-          // nothing and the model fell back to a regex Grep; the bare name with
-          // defines would have listed the declarations on the first call.
+          // A find for a guessed signature returns nothing and sends the model
+          // to a regex Grep; the bare name with defines lists the declarations
+          // on the first call.
           FIND_BY_BARE_NAME +
           // A flood keeps every place: the lines past the text budget come as
           // path and line numbers (`more`), and a line's text is a sql read.
@@ -3612,13 +3656,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     }),
   );
 
-  // The files the index named, read whole: several in one call. Measured on
-  // the live demo (2026-09-26): after the index had named the files, the
-  // caller read them with its own Read one per turn, each turn re-sending the
-  // transcript. Over a table of documents (`TableShape.document`) a document
-  // is the rows sharing a path; without a door for it a legal-document benchmark run's
-  // caller paged each one through sql, about 18 calls a task (2026-10-07). A
-  // table of records has no document to read, and the rows of one that could
+  // The files the index named, read whole: several in one call. Without it,
+  // once the index has named the files, the caller reads them with its own
+  // Read one per turn, each turn re-sending the transcript. Over a table of
+  // documents (`TableShape.document`) a document is the rows sharing a path;
+  // without a door for it a caller pages each one through sql, many calls a
+  // document. A table of records has no document to read, and the rows of one that could
   // not be described none either: neither registers it.
   if (mode.kind === "chunks" || rows?.document) {
     server.registerTool(
@@ -3768,7 +3811,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     // figure - is still on the page, and the platform hands back its scanned
     // image. With one such table the tool names none; with several, the
     // model says which table the row is in.
-    const pageTables = pagedTables([{ table: TABLE, pages: primaryPages }, ...siblings]);
+    const pageTables = agentApis ? pagedTables([{ table: TABLE, pages: primaryPages }, ...siblings]) : [];
     if (pageTables.length > 0) {
       const rowInput = {
         document: z.string().min(1).describe("The row's `document`, as the table holds it."),
@@ -3816,7 +3859,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     // reads the page the search named. The platform reads it, as it reads a
     // row's page: nothing is fetched from this machine, and the platform
     // refuses any address not on the public internet.
-    if (webFetchEnabled()) {
+    if (agentApis && webFetchEnabled()) {
       server.registerTool(
         "web_fetch",
         {

@@ -254,13 +254,27 @@ describe("chunkFile", () => {
     expect(second?.scope).toBe("Title");
   });
 
-  it("keeps a long heading whole, as symbol and as scope", async () => {
+  it("cuts a long heading to the name cap, as symbol and as scope", async () => {
     const title = Array(40).fill("word").join(" ");
     const md = [`# ${title}`, ...Array(70).fill("text"), "## Second", ...Array(10).fill("more")].join("\n");
     const chunks = await chunkFile("doc.md", md);
-    expect(chunks.some((c) => c.symbol === title)).toBe(true);
+    expect(chunks.some((c) => c.symbol === title.slice(0, 80))).toBe(true);
     const second = chunks.find((c) => c.content.startsWith("## Second"));
-    expect(second?.scope).toBe(title);
+    expect(second?.scope).toBe(title.slice(0, 80));
+  });
+
+  it("puts a name over several lines on one, and cuts every symbol to its cap", async () => {
+    // A selector list of many names, one a line: the name is one line, and
+    // no chunk's symbol runs past its cap whatever the definitions hold.
+    const selectors = Array.from({ length: 60 }, (_, i) => `.selector-number-${i}`).join(",\n");
+    const css = `${selectors} {\n  color: red;\n}\n`;
+    const chunks = await chunkFile("style.css", css);
+    for (const c of chunks) {
+      expect(c.symbol ?? "").not.toContain("\n");
+      expect((c.symbol ?? "").length).toBeLessThanOrEqual(120);
+      expect((c.scope ?? "").length).toBeLessThanOrEqual(120);
+    }
+    expect(chunks.some((c) => (c.symbol ?? "").startsWith(".selector-number-0, .selector-number-1"))).toBe(true);
   });
 
   it("leaves symbol unset for fixed-window (unparsed) chunks", async () => {

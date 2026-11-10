@@ -72,10 +72,9 @@ export const SQL_RESULT_CHAR_BUDGET = 24_000;
 /** A text cell longer than this is cut and the cut marked, so one wide
  * column cannot spend the whole budget on its first rows. Half the budget,
  * the loop's rule for one text field (the platform's renderer,
- * `TOOL_RESULT_MAX_CHARS`): a row of two such cells still fits. At 1,500 a
- * row reread by its key came back cut - a legal-document passage runs to a median of
- * 2,225 characters (2026-10-07) - so the text a hit's snippet points to was
- * not one `sql` away after all. */
+ * `TOOL_RESULT_MAX_CHARS`): a row of two such cells still fits. A smaller cap
+ * cut a typical document passage, which runs past 2,000 characters, so the
+ * text a hit's snippet points to was not one `sql` away after all. */
 export const SQL_CELL_CHAR_CAP = SQL_RESULT_CHAR_BUDGET / 2;
 /** A string cell at most this long is a key or a name, kept on a row past
  * the budget; a longer one is text, dropped there. */

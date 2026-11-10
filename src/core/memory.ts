@@ -4,9 +4,8 @@
 // Memory: what the model produced in earlier sessions on this database,
 // written back and recalled.
 //
-// Nothing the model produced used to outlive its session: on 2026-10-07 the
-// benchmark tasks' drafts and memos went to local files and the conversation went
-// nowhere, while the point of the product is a model with memory. The Stop
+// Without it, nothing the model produces outlives its session: drafts and
+// memos go to local files and the conversation goes nowhere. The Stop
 // hook (`cx hook memory`) now writes each turn's question and final answer,
 // and the text of every file the model wrote under the session's folder, to
 // the database's memory (`HostedDb.remember`); the platform's searches
@@ -14,8 +13,8 @@
 //
 // The memory is the database's, not a table of it: the platform keeps it in a
 // store of its own under the database's root, which no table listing, card or
-// join shows, because nothing the customer did not create may appear in
-// their account as a table. Everyone with a key to the database recalls what
+// join shows, because nothing the account's owner did not create may
+// appear in the account as a table. Everyone with a key to the database recalls what
 // was remembered on it, as they read its tables.
 
 import type { HostedCallInfo, HostedDb, RowRecord } from "./hosted.js";
@@ -38,7 +37,7 @@ export const MEMORY_HITS = 3;
 export const MEMORY_RECALL_TIMEOUT_MS = 5_000;
 
 /** What a result's `memory` field says about its hits, carried in the result
- * itself so the tool descriptions, which are measured, stay as they are. */
+ * itself so the tool descriptions stay as they are. */
 export const MEMORY_NOTE =
   "Earlier answers and files from sessions on this database, nearest the question first: what was concluded or written " +
   "before, not evidence. Cite the rows above, not these; where they disagree with the rows, the rows win.";

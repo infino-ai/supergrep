@@ -89,12 +89,11 @@ const DEFAULT_CHUNK_INDEX_COLUMN = "chunk";
 /** How a whole document is read back from a table of rows (the `read`
  * tool): the column naming the document each row belongs to, the text
  * column holding the document's text, and the column ordering its rows when
- * the load cut it into several. A table of files loaded as passages - the
- * demo's law-firm tables, one row per passage of a file, every passage
- * carrying the file's `path` - holds each file as the rows sharing that path,
- * and a caller with no way to read one whole paged it through `sql` ten
- * passages a statement (a legal-document benchmark run, 2026-10-07: some 18 calls a
- * task, none of them a read). */
+ * the load cut it into several. A table of files loaded as passages - one
+ * row per passage of a file, every passage carrying the file's `path` -
+ * holds each file as the rows sharing that path, and a caller with no way to
+ * read one whole pages it through `sql` a few passages a statement, many
+ * calls a document. */
 export interface TableDocument {
   /** The text column naming a row's document: the table's own `path`, or a
    * name ending in `_path`. */
@@ -127,13 +126,11 @@ export function chunkingFrom(record: RowRecord | null | undefined, fields: Schem
 }
 
 /** The one sentence a table cut into passages carries: what a row is, and
- * how a whole record is read from its rows. Measured 2026-09-30 on the
- * Wikipedia table: told nothing, the caller took a first passage for the
- * article, answered "which kinds of article run longest" from the first 512
- * tokens of each, and spent four of its eleven calls sampling columns to learn
- * what a row was. Both loops read it - the caller in the `sql` text, the
- * platform's retrieval loop in its own context (the owner,
- * 2026-09-30: a prompt change goes to the inner loop and the outer one alike).
+ * how a whole record is read from its rows. Told nothing, a caller takes a
+ * first passage for the whole record - answering "which records run
+ * longest" from each one's first passage - and spends calls sampling columns
+ * to learn what a row is. The caller reads it in the `sql` text; the
+ * platform's retrieval loop carries the same sentence in its own context.
  * Empty for a table loaded one row per record. */
 export function chunkingNote(chunking: TableChunking | undefined): string {
   if (!chunking) return "";
@@ -410,9 +407,9 @@ export function vectorCandidate(
   };
   if (!embedded || !field) {
     // No record of a load that embedded a column: a table made by a copy or
-    // a statement rather than a hydrate job - a benchmark's data rooms (2026-10-11),
-    // copied from a hydrated table, vectors and all - and until then every
-    // such table was searched by keyword alone. The platform's check of the
+    // a statement rather than a hydrate job - one copied from a hydrated
+    // table, vectors and all - and without this such a table is searched by
+    // keyword alone. The platform's check of the
     // column (`platformEmbedsQueriesFor`) is what says whether it embeds
     // queries for it, so the column is a candidate all the same when the
     // table has one vector column, or its card names one; of several that
@@ -441,14 +438,12 @@ const VECTOR_CHECK_K = 1;
  * filled it, asked of the platform itself: one search by meaning for one row
  * (`vector_search` with `query_text`). The platform runs it only for an
  * embedding column of the model it embeds queries with, and refuses any
- * other, naming both models when they differ (an embedding loader's
- * embedding/src/query_text.rs `embed_against_column`) - the inner loop's own check, made by the code that
- * embeds every `search` and every `{{q:"..."}}`, and the one place the
- * column's model can be read: a `vector` column the load's record names was
- * filled with the model the platform embedded with then, which need not be
- * the one it embeds with now, and a table can be loaded under a model of
- * its own. The demo's checks send the same search before every run
- * (demo/platform-health.mjs `requireTextQuery`).
+ * other, naming both models when they differ - the platform loop's own
+ * check, made by the code that embeds every `search` and every
+ * `{{q:"..."}}`, and the one place the column's model can be read: a
+ * `vector` column the load's record names was filled with the model the
+ * platform embedded with then, which need not be the one it embeds with
+ * now, and a table can be loaded under a model of its own.
  *
  * Any failure leaves the column unoffered, said to `onNote` in the
  * platform's words: a refusal is the platform's no, and anything else - an
@@ -609,8 +604,8 @@ export interface ResolveOptions extends Omit<ShapeOptions, "vector"> {
    * vector column. True when absent. False for the other tables of a
    * database: each check is a search by meaning, which loads that table's
    * vector index on the worker, and run at startup for every table of a
-   * 41-table database they filled the worker's memory and stalled it
-   * (2026-10-20). Unchecked, the column is offered as the card and the load
+   * database of dozens of tables they can fill the worker's memory and stall
+   * it. Unchecked, the column is offered as the card and the load
    * describe it, and the platform embeds the query when a statement first
    * searches it, answering with its own words if it cannot. */
   checkVector?: boolean;
@@ -669,9 +664,9 @@ export function familiesAllowance(tables: number, budget: number, floor: number)
 
 /** The tables of the database other than `table`, as the platform lists
  * them: what a statement over `table` may join. The platform is the one that
- * knows a database's tables; a list typed into a deployment named 10 of a
- * database's 41 and the model never learned the rest existed (2026-10-20). A
- * platform that cannot list them leaves `table` alone, said on `onNote`. */
+ * knows a database's tables; a list typed into a deployment goes stale, and
+ * the model never learns of the tables left off it. A platform that cannot
+ * list them leaves `table` alone, said on `onNote`. */
 export async function databaseTables(
   hosted: Pick<HostedDb, "listTables">,
   table: string,
@@ -818,14 +813,11 @@ export async function resolveTableShape(
  * to several thousand characters of HTML, and ten of those per search would
  * cost more than the answer.
  *
- * Long enough to hold a passage whole. At 500 a search hit
- * on a table of document passages showed a fifth of most of them: the
- * benchmark tables (2026-10-07) run to a median of 1,085 characters and a
- * 99th percentile of 2,215 (OfficeQA, 362,845 passages), and a median of
- * 2,225 and a 99th percentile of 2,757 (a legal-document corpus, 247,807), so the figure a
- * question turned on was cut out of the text the caller read. At 3,000 both
- * read whole; ten hits are about the 24,000 characters the loop allows one
- * tool result. */
+ * Long enough to hold a passage whole. Document passages typically run from
+ * about one to under three thousand characters; at 500 a hit showed a fifth
+ * of most of them, and the figure a question turned on was cut out of the
+ * text the caller read. At 3,000 they read whole; ten hits are about the
+ * 24,000 characters the loop allows one tool result. */
 export const SNIPPET_CHARS = 3_000;
 
 /** The named entities HTML text carries most - the five the escaping itself

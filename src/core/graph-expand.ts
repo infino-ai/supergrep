@@ -12,15 +12,14 @@
 // answering loop makes the same call on its own retrievals, so the two
 // loops are expanded by one implementation.
 //
-// Why here and not in the tool text: the graph's two SQL functions were
-// named to the model in the sql text, first described and then as rules
-// with the seed statement written out, and measured across three drives of
-// the demo's eight cross-table questions on the SWE corpus (2026-10-03,
-// Opus, 24 runs with the platform tools in use): not one call. That is how
-// every graph retrieval system works too - GraphRAG, LightRAG, the Neo4j
-// patterns find the seeds themselves, expand a hop or two, and hand the
-// model the assembled context; none expects the model to ask. The owner,
-// from the first day: optimizer-built, hidden, used by retrieval.
+// Why here and not in the tool text: the graph's two SQL functions are named
+// to the model in the sql text, with the seed statement written out, and a
+// model answering cross-table questions still does not call them. That is
+// how graph retrieval systems generally work too - GraphRAG, LightRAG, the
+// Neo4j patterns find the seeds themselves, expand a hop or two, and hand
+// the model the assembled context; none expects the model to ask. The graph
+// is built by the platform's optimizer, kept out of sight, and used by
+// retrieval.
 //
 // What stays on this side: which rows of a session have been walked and
 // shown already, and how much of a result the section may add.
@@ -74,9 +73,8 @@ export interface GraphExpansion {
 }
 
 /** How the platform's answer begins when its graph covers nothing from the
- * table asked about: the deployment builds no graph (`worker/expand.rs`), or
- * its `optimizer_settings.graph.tables` leaves the table out
- * (`worker/graph.rs`). Either holds for the whole session, so a caller stops
+ * table asked about: the deployment builds no graph, or its
+ * `optimizer_settings.graph.tables` leaves the table out. Either holds for the whole session, so a caller stops
  * asking for that table - an expansion is a gateway and a worker round trip
  * on every retrieval. */
 export const UNCOVERED_NOTES = ["this deployment builds no knowledge graph", "the graph does not cover table"] as const;
@@ -161,9 +159,9 @@ function holdAll(seen: Map<string, Set<bigint>>, table: string, rows: readonly R
 /** `row` as the graph route takes it: a bigint `_id` written as its decimal
  * text. The route reads a JSON number past 2^64 as a float, so an engine id
  * sent as a number lost its digits there and seeded nothing - every result
- * of a table without a place or key column went unexpanded (2026-10-09, the
- * data-room table, "no seeds" for rows that carried their ids). The route
- * reads an id's text exactly. */
+ * of a table without a place or key column went unexpanded, reported as "no
+ * seeds" for rows that carried their ids. The route reads an id's text
+ * exactly. */
 export function withIdAsText(row: RowRecord): RowRecord {
   const id = row[ENGINE_ID_COLUMN];
   return typeof id === "bigint" ? { ...row, [ENGINE_ID_COLUMN]: id.toString() } : row;

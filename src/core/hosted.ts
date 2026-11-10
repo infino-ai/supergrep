@@ -215,6 +215,21 @@ export interface CheckedRows {
 }
 
 /** The fields `checks` adds to a read's body: none for a check not asked. */
+/** A 400 that says the deployment does not offer validation on a read: the
+ * statement is fine, the check is not available here. */
+export function validationUnavailable(err: unknown): boolean {
+  return err instanceof HostedError && err.status === HTTP_BAD_REQUEST && /\bvalidat(e|ion)\b/i.test(err.message) && /not (available|supported|enabled)|unknown field|unsupported/i.test(err.message);
+}
+
+/** A refusal that is about the statement itself - a 4xx other than
+ * validation being unavailable, a capacity answer or a missing key - and so
+ * the same with or without the check. */
+function statementRefused(err: unknown): boolean {
+  if (!(err instanceof HostedError)) return false;
+  if (validationUnavailable(err) || err.atCapacity || err.pastDeadline) return false;
+  return err.status >= 400 && err.status < 500;
+}
+
 function readChecks(checks: ReadChecks): RowRecord {
   return {
     ...(checks.validate ? { validate: checks.validate } : {}),
@@ -407,6 +422,9 @@ interface CallSpec {
   /** Whether the response is rows/JSON we want as JSON rather than Arrow. */
   acceptJson: boolean;
   timeoutMs: number;
+  /** The cold-start budget for this call in place of the client's: 0 for an
+   * attempt that has somewhere cheaper to fall back to. */
+  coldStartMs?: number;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -472,6 +490,13 @@ export class HostedDb {
    * it, whose read requests take no field they do not know. Set by the
    * first refusal; from then on a read goes out without it. */
   private rerankUnsupported = false;
+  /** Set once this deployment refuses `validate` on a read: no later read
+   * asks for it. */
+  private validateUnsupported = false;
+  /** Whether this deployment has said it does not validate on a read. */
+  get validatesOnRead(): boolean {
+    return !this.validateUnsupported;
+  }
 
   readonly target: HostedTarget;
   private readonly fetchImpl: typeof fetch;
@@ -896,9 +921,23 @@ export class HostedDb {
    * the question (`validate`) and ordered by its grader (`rerank`) where
    * they lie, so no row travels back up to be checked or ranked. */
   async querySqlChecked(sql: string, checks: ReadChecks): Promise<CheckedRows> {
-    return this.withRerank(checks, (asked) =>
-      this.postJson("query_sql", { query: sql, ...readChecks(asked) }, true).then((exchange) => this.checkedRows(exchange, "query_sql")),
-    );
+    const plain = (asked: ReadChecks, coldStartMs?: number) =>
+      this.withRerank(asked, (c) =>
+        this.postJson("query_sql", { query: sql, ...readChecks(c) }, true, coldStartMs).then((exchange) => this.checkedRows(exchange, "query_sql")),
+      );
+    if (!checks.validate || this.validateUnsupported) return plain({ ...checks, validate: undefined });
+    try {
+      // The checked attempt waits out no cold start: a database coming up is
+      // waited on by the plain statement below, which has the rows to give.
+      return await plain(checks, 0);
+    } catch (err) {
+      // A statement the platform refused is the statement's, checked or not.
+      if (statementRefused(err)) throw err;
+      // A deployment without validation says so; no later statement asks.
+      if (validationUnavailable(err)) this.validateUnsupported = true;
+      // Whatever kept the check from answering, the rows still come.
+      return plain({ ...checks, validate: undefined });
+    }
   }
 
   /** `read` with `checks`, and - when the platform refuses the `rerank`
@@ -1001,7 +1040,7 @@ export class HostedDb {
   /** A JSON request body. Through jsonify, as every body here: a value the
    * caller took from a platform answer may carry a bigint
    * (`keepBigIntegers`), which JSON.stringify refuses and Number() rounds. */
-  private postJson(op: string, body: RowRecord, acceptJson: boolean): Promise<Exchange> {
+  private postJson(op: string, body: RowRecord, acceptJson: boolean, coldStartMs?: number): Promise<Exchange> {
     return this.call({
       op,
       method: "POST",
@@ -1009,6 +1048,7 @@ export class HostedDb {
       contentType: JSON_CONTENT_TYPE,
       acceptJson,
       timeoutMs: this.timeoutMs,
+      ...(coldStartMs !== undefined ? { coldStartMs } : {}),
     });
   }
 
@@ -1076,7 +1116,8 @@ export class HostedDb {
     if (spec.contentType) headers["content-type"] = spec.contentType;
     const url = this.url(spec.op, spec.query, spec.suffix);
     const started = Date.now();
-    const coldStartDeadline = Math.min(started + this.coldStartMs, this.deadlineMs);
+    const coldStartMs = spec.coldStartMs ?? this.coldStartMs;
+    const coldStartDeadline = Math.min(started + coldStartMs, this.deadlineMs);
     const capacityDeadline = Math.min(started + spec.timeoutMs, this.deadlineMs);
     let retries = 0;
 
@@ -1146,13 +1187,13 @@ export class HostedDb {
       const message = serverMessage(response.status, text);
       // Whether it was the client's deadline, earlier than the call's own
       // budget, that left no room for another try.
-      const ownBudgetEnd = atCapacity ? started + spec.timeoutMs : started + this.coldStartMs;
+      const ownBudgetEnd = atCapacity ? started + spec.timeoutMs : started + coldStartMs;
       const pastDeadline = (atCapacity || notReady) && this.deadlineMs < ownBudgetEnd;
       const budget = pastDeadline
         ? "this client's deadline"
         : atCapacity
         ? `the call's ${spec.timeoutMs / MS_PER_SEC} s budget`
-        : `the ${this.coldStartMs / MS_PER_SEC} s cold-start budget`;
+        : `the ${coldStartMs / MS_PER_SEC} s cold-start budget`;
       const gaveUp = atCapacity || notReady ? ` (gave up after ${retries} retr${retries === 1 ? "y" : "ies"} within ${budget})` : "";
       throw new HostedError(spec.op, response.status, `${message}${gaveUp}`, {
         ...(retryAfter !== null ? { retryAfterSecs: retryAfterMs(retryAfter) / MS_PER_SEC } : {}),

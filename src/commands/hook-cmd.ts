@@ -7,8 +7,8 @@
 // `cx hook answer-figures` - Stop. When the model retrieved through this
 // server and its final answer holds a figure that no tool result of the turn
 // holds, it is sent back once to compute that figure with `sql` (see
-// core/answer-figures.ts for the measured case: an average computed by hand,
-// six cents off).
+// core/answer-figures.ts: a figure computed by hand can be off by a little
+// and still read as right).
 //
 // `cx hook memory` - Stop. Writes the turn to the database's memory (see
 // core/memory.ts): the person's question with the final answer, and the text
@@ -28,6 +28,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { figuresReason, namesUncomputedReading, toolValues, UNCOMPUTED_READING_REASON, unbackedFigures } from "../core/answer-figures.js";
 import { shouldIndexFile } from "../core/chunker.js";
 import { DEFAULT_CAPS, hostedTarget, indexDir } from "../core/config.js";
+import { accountFeatures } from "../core/account-api.js";
 import { hostedDbFor } from "../core/context.js";
 import type { HostedDb } from "../core/hosted.js";
 import { MEMORY_KIND_ANSWER, MEMORY_KIND_FILE, type MemoryRow, rememberRows } from "../core/memory.js";
@@ -167,8 +168,12 @@ function toolResultTexts(block: { content?: unknown }): string[] {
  * session transcript: every `tool_use` block of its own messages after the
  * last user prompt, in order, with its input; a subagent's are not its own. */
 export function transcriptToolUses(jsonl: string): Array<{ name: string; input: Record<string, unknown> }> {
-  const turn = turnEntries(jsonl);
-  if (turn === null) return [];
+  return toolUsesOf(turnEntries(jsonl) ?? []);
+}
+
+/** The tool calls of a turn's entries (`transcriptToolUses`), for a caller
+ * that has already read the transcript. */
+function toolUsesOf(turn: readonly TranscriptEntry[]): Array<{ name: string; input: Record<string, unknown> }> {
   const uses: Array<{ name: string; input: Record<string, unknown> }> = [];
   for (const e of turn) {
     if (e.type !== "assistant" || e.isSidechain) continue;
@@ -221,7 +226,12 @@ function retrievedThrough(calls: string[], server?: string): boolean {
  * `tool_result` block's text (a string, or its text blocks). A subagent's
  * lines are neither. */
 export function transcriptReplyAndResults(jsonl: string): { reply: string; results: string[] } {
-  const turn = turnEntries(jsonl) ?? [];
+  return replyAndResultsOf(turnEntries(jsonl) ?? []);
+}
+
+/** The reply and results of a turn's entries (`transcriptReplyAndResults`),
+ * for a caller that has already read the transcript. */
+function replyAndResultsOf(turn: readonly TranscriptEntry[]): { reply: string; results: string[] } {
   const results: string[] = [];
   let reply: string[] = [];
   for (const e of turn) {
@@ -257,15 +267,18 @@ export function hookFiguresOutput(input: string, readFile: (path: string) => str
   if (event.stop_hook_active === true) return null;
   const transcript = readFile(event.transcript_path);
   if (transcript === null) return null;
-  if (!retrievedThrough(transcriptToolCalls(transcript), server)) return null;
-  const { reply, results } = transcriptReplyAndResults(transcript);
+  const reasons = figureReasons(lastTurn(transcript)?.entries ?? [], server);
+  return reasons.length ? JSON.stringify({ decision: "block", reason: reasons.join(" ") }) : null;
+}
+
+/** Why the figures hook sends a turn back, from the turn's entries: empty
+ * when it did not retrieve through `server`, or when every figure of its
+ * reply is in a tool result and it names no reading it did not compute. */
+function figureReasons(turn: readonly TranscriptEntry[], server?: string): string[] {
+  if (!retrievedThrough(toolUsesOf(turn).map((u) => u.name), server)) return [];
+  const { reply, results } = replyAndResultsOf(turn);
   const unbacked = unbackedFigures(reply, results.flatMap(toolValues));
-  const reasons = [
-    ...(unbacked.length ? [figuresReason(unbacked)] : []),
-    ...(namesUncomputedReading(reply) ? [UNCOMPUTED_READING_REASON] : []),
-  ];
-  if (!reasons.length) return null;
-  return JSON.stringify({ decision: "block", reason: reasons.join(" ") });
+  return [...(unbacked.length ? [figuresReason(unbacked)] : []), ...(namesUncomputedReading(reply) ? [UNCOMPUTED_READING_REASON] : [])];
 }
 
 /** `file` relative to `dir`, or null when it is not under it. */
@@ -331,12 +344,14 @@ const sha256 = (text: string) => createHash("sha256").update(text).digest("hex")
  * project every path is judged against (`projectRoot`), `server` the server
  * the memory entry belongs to (`--server`).
  *
- * A turn this server's own Stop entry is about to send back - a figure it
- * did not compute - is not written now: it is written when the model stops
- * for good (`stop_hook_active`), with the answer it ended on. Only that
- * entry is waited on: it is written with the memory entry, so its block
- * comes, where a turn that used another server's `search` would wait for a
- * block nothing sends. The answer is the model's final reply. Each file the model wrote is
+ * Only a turn that retrieved through this server (`retrievedThrough`, its
+ * search, find or sql) is written: a turn that never used it - "fix the
+ * failing test", a prompt with a pasted secret - is not this server's to
+ * keep, and is never sent. A turn this server's own Stop entry is about to
+ * send back - a figure it did not compute - is not written now: it is
+ * written when the model stops for good (`stop_hook_active`), with the
+ * answer it ended on. The answer is the model's final reply. The transcript
+ * is read and parsed once for all of it. Each file the model wrote is
  * kept as it stands now (`rememberablePath`), and neither it nor the answer
  * file past the index's own per-file cap. With no root known, only the
  * reply is kept. Thinking is never read (see the header). */
@@ -356,24 +371,24 @@ export function memoryRows(
   }
   const event = parsed as { transcript_path?: unknown; session_id?: unknown; stop_hook_active?: unknown } | null;
   if (!event || typeof event !== "object" || typeof event.transcript_path !== "string") return null;
-  if (event.stop_hook_active !== true && hookFiguresOutput(input, readFile, server) !== null) {
-    return null;
-  }
   const transcript = readFile(event.transcript_path);
   if (transcript === null) return null;
   const turn = lastTurn(transcript);
   if (turn === null) return null;
+  const uses = toolUsesOf(turn.entries);
+  if (!retrievedThrough(uses.map((u) => u.name), server)) return null;
+  if (event.stop_hook_active !== true && figureReasons(turn.entries, server).length > 0) return null;
   const question = promptText(turn.prompt);
   if (!question) return null;
   const at = now();
   const sessionId = typeof event.session_id === "string" ? event.session_id : null;
   const withinCap = (text: string | null) => (text !== null && Buffer.byteLength(text, "utf8") <= DEFAULT_CAPS.maxFileBytes ? text : null);
   const rows: MemoryRow[] = [];
-  const answer = transcriptReplyAndResults(transcript).reply.trim();
+  const answer = replyAndResultsOf(turn.entries).reply.trim();
   if (answer) rows.push({ kind: MEMORY_KIND_ANSWER, question, content: answer, path: null, session_id: sessionId, created_at: at });
   if (root !== null) {
     const written = new Set<string>();
-    for (const use of transcriptToolUses(transcript)) {
+    for (const use of uses) {
       const key = FILE_WRITE_TOOLS[use.name];
       const file = key ? use.input[key] : undefined;
       if (typeof file !== "string") continue;
@@ -514,6 +529,13 @@ export async function hookCmd(event: string, opts: HookCmdOptions): Promise<void
     const target = hostedTarget();
     if (target === null || !opts.rowsFile) return;
     try {
+      // `remember` is an agent route: an account without them answers 403,
+      // so the rows are not sent there at all.
+      const { agentApis } = await accountFeatures({ baseUrl: target.baseUrl, apiKey: target.apiKey });
+      if (!agentApis) {
+        removeRowsFile(opts.rowsFile);
+        return;
+      }
       await sendRememberedRows(opts.rowsFile, hostedDbFor(target));
     } catch (err) {
       console.error(`${new Date().toISOString()} code-context: memory not written: ${(err as Error).message}`);

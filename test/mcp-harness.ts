@@ -49,6 +49,9 @@ export type Answer = [number, unknown] | [number, unknown, string];
  * client gives up on it. */
 export type Routes = Record<string, (body: Record<string, unknown> | undefined, request: Request) => Answer | Promise<Answer>>;
 
+/** What an account with the agent routes answers `GET /v1/account/features`. */
+export const ACCOUNT_WITH_AGENT_APIS: Answer = [200, { agent_apis: true }];
+
 /** The read tokens a route's answer carries when it names none. */
 const DEFAULT_READ_TOKENS = "0.010";
 
@@ -100,7 +103,10 @@ export function scriptPlatform(routes: Routes): Platform {
         : undefined;
     sent.push({ op, body, method, path });
     const request: Request = { method, path, headers: (init?.headers ?? {}) as Record<string, string>, ...(init?.signal ? { signal: init.signal } : {}) };
-    let [status, payload, readTokens] = (await routes[op]?.(body, request)) ?? [500, { error: `unexpected ${op}` }];
+    // The account plane's feature read: a deployment whose account has the
+    // agent routes, unless the script says otherwise (`account`).
+    const route = routes[op] ?? (path === "account/features" ? () => ACCOUNT_WITH_AGENT_APIS : undefined);
+    let [status, payload, readTokens] = (await route?.(body, request)) ?? [500, { error: `unexpected ${op}` }];
     // A `query_sql` that asks for validation is answered as the platform
     // answers it: the rows beside the verdict on them, in one call - the
     // script's own `validate` route judging, with the statement and the
@@ -125,6 +131,8 @@ export interface Started {
   sent: Sent[];
   /** What the server asked the platform at startup, before any call. */
   startup: string[];
+  /** How many times the server read the account's features at startup. */
+  features: number;
   /** How long the server took to come up and connect its transport. */
   startupMs: number;
 }
@@ -139,10 +147,13 @@ export async function start(platform: Platform, prefix: string, options: { start
   const t0 = performance.now();
   await serveMcp(root, { transport: serverSide, hostedOptions: { fetch: platform.fetch }, ...options });
   const startupMs = performance.now() - t0;
-  const startup = platform.sent.map((s) => s.op);
+  // The data plane's startup reads: the account plane's feature read is
+  // checked on its own (`features`).
+  const startup = platform.sent.filter((s) => s.op !== "account").map((s) => s.op);
+  const features = platform.sent.filter((s) => s.op === "account").length;
   const client = new Client({ name: "server-test", version: "0" });
   await client.connect(clientSide);
-  return { client, root, sent: platform.sent, startup, startupMs };
+  return { client, root, sent: platform.sent, startup, startupMs, features };
 }
 
 export async function stop(started: Started): Promise<void> {

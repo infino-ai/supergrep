@@ -140,7 +140,7 @@ describe("a table with no full-text column, with siblings of the same kind", () 
     // once, so which table each of those calls names is fixed in count, not
     // in order: each table's schema once, the primary's cards before its
     // siblings', and the uncarded sibling's lean card after its enriched one.
-    const asked = (op: string) => s.sent.slice(0, s.startup.length).filter((x) => x.op === op);
+    const asked = (op: string) => s.sent.filter((x) => x.op !== "account").slice(0, s.startup.length).filter((x) => x.op === op);
     expect(asked("schema").map((x) => String(x.body?.table_name)).sort()).toEqual([ACCOUNT_TABLE, LOAN_TABLE, TRANS_TABLE].sort());
     const cards = asked("table_card")
       .filter((x) => x.body?.tables === undefined)

@@ -889,12 +889,17 @@ export async function installCmd(
   // whose hooks would apply to every project.
   const settingsPath = join(root, PROJECT_SETTINGS);
   const hooksHere = !opts.config;
-  if (hooksHere && !opts.uninstall && !SERVER_NAME.test(name)) {
-    throw new InstallError(
+  // A name Claude Code rewrites in its tools' names leaves the hooks
+  // matching tools that never exist, so it is refused - only where hooks
+  // will be written. With `--db` that is known now, before anything is
+  // asked of the platform; otherwise it is known once the platform half
+  // has resolved (`withHooks` below). A local-only entry writes none.
+  const refuseHookName = () =>
+    new InstallError(
       `--name ${JSON.stringify(name)} holds a character Claude Code rewrites in the server's tool names, so its hooks would ` +
         `never see its tools. Use letters, digits, "-" and "_" only.`,
     );
-  }
+  if (hooksHere && !opts.uninstall && !opts.localOnly && opts.db && !SERVER_NAME.test(name)) throw refuseHookName();
   // Another server's own figures entry, written when this install takes the
   // shared ones an earlier version left (`withAnswerHooks`).
   const heirs = (server: string) => [answerFiguresHookEntry(opts, version, server)];
@@ -923,6 +928,7 @@ export async function installCmd(
   // With a platform database the Stop hooks are written beside the entry,
   // and the entry tells the server to recall the memory one of them writes.
   const withHooks = hooksHere && Boolean(setup.db);
+  if (withHooks && !SERVER_NAME.test(name)) throw refuseHookName();
   const entry = serverEntry({ ...opts, db: setup.db, withHooks }, version);
   const existed = name in servers;
   const next: Config = { ...config, mcpServers: { ...servers, [name]: entry } };

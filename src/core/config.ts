@@ -29,8 +29,8 @@ export const INDEX_DIR_NAME = ".infino";
 // machine's own stored account (keystore.ts), in that order.
 
 /** The environment variable holding the bearer key when --api-key-file is not
- * given. The engine's remote binding, the bench harness and the platform all
- * read this one name, so code-context does too. It is only ever read into a
+ * given. The engine's remote binding and the platform read this one name,
+ * so code-context does too. It is only ever read into a
  * HostedTarget - never logged or echoed. */
 export const API_KEY_ENV = "INFINO_API_KEY";
 
@@ -313,9 +313,9 @@ export const MEMORY_ON = "1";
 
 /** Whether the MCP server recalls the database's memory beside the
  * platform's searches (CX_MEMORY, default off). On only where `cx install`
- * wrote the memory hook: the bench and demo configurations load no settings and set
- * none, so a measurement never reads what an earlier run left, and a demo
- * database shared by its visitors never shows one visitor another's turns. */
+ * wrote the memory hook, so a server that never wrote memory never reads
+ * any: a database shared by several people never shows one person
+ * another's turns unless it was set up to. */
 export function memoryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return ON_VALUES.includes((env[MEMORY_ENV] ?? "").toLowerCase());
 }
@@ -326,9 +326,8 @@ export function memoryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
  * verdict on its result - so the model reads the table's shape, checks a
  * result against the question, and checks its answer's citations by
  * choosing to, the way a caller driving its own retrieval against the
- * platform would. Off is the measured default: the card and the verdict
- * ride inside `sql`, because a check the model may call is a check it
- * declined when it was offered (the card tool, 2026-09-11). */
+ * platform would. Off by default: the card and the verdict ride inside
+ * `sql`, because a check the model may call is a check it often declines. */
 export function apiToolsEnabled(): boolean {
   return ON_VALUES.includes((process.env.CX_API_TOOLS ?? "").toLowerCase());
 }
@@ -369,8 +368,8 @@ const WEB_FETCH_ENV = "CX_WEB_FETCH";
 /** Whether the MCP server offers `web_fetch` (CX_WEB_FETCH, default off): the
  * platform reads a web page a search named - a published series the database
  * does not hold - and hands back its text. On where the deployment gives a
- * run the web, as the demo does for a run that asks for it; the read itself
- * runs on the platform, which reads only the public internet. */
+ * run the web; the read itself runs on the platform, which reads only the
+ * public internet. */
 export function webFetchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return ON_VALUES.includes((env[WEB_FETCH_ENV] ?? "").toLowerCase());
 }

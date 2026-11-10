@@ -463,6 +463,22 @@ describe("read", () => {
     expect(rest.more).toBeUndefined();
   });
 
+  it("keeps the end a range named when it pages past the line cap, so following more stops there", async () => {
+    // long.txt is written by the test above: READ_LINES_CAP + 50 lines, so
+    // this end is 30 lines short of the file's.
+    const end = READ_LINES_CAP + 20;
+    const [page] = (await readFiles(handle, ["long.txt"], { ranges: readRanges(10, end), budget })) as Array<{ from: number; to: number; more?: { from: number; to?: number } }>;
+    expect(page.from).toBe(10);
+    expect(page.to).toBe(READ_LINES_CAP + 9);
+    expect(page.more).toEqual({ from: READ_LINES_CAP + 10, to: end });
+    const [rest] = (await readFiles(handle, ["long.txt"], { ranges: readRanges(page.more!.from, page.more!.to), budget })) as Array<{ to: number; more?: unknown }>;
+    expect(rest.to).toBe(end);
+    expect(rest.more).toBeUndefined();
+    // An open end stays open.
+    const [open] = (await readFiles(handle, ["long.txt"], { ranges: readRanges(10, undefined), budget })) as Array<{ more?: { from: number; to?: number } }>;
+    expect(open.more).toEqual({ from: READ_LINES_CAP + 10 });
+  });
+
   it("pages several ranges past the line cap and names the ranges still to come", async () => {
     const long = Array.from({ length: READ_LINES_CAP + 100 }, (_, i) => `row ${i + 1}`);
     writeFileSync(join(root, "long2.txt"), long.join("\n") + "\n");

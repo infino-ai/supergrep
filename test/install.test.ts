@@ -726,9 +726,19 @@ describe("cx install: the Stop hooks", () => {
     expect(stopTails()).toEqual([" hook answer-figures --server code-context", " hook memory --server code-context --db https://host/db"]);
   });
 
-  it("refuses a server name Claude Code would rewrite in its tools' names", async () => {
+  it("refuses a server name Claude Code would rewrite in its tools' names where hooks would be written", async () => {
     await expect(installCmd({ path: root, name: "code.context", db: "https://host/db" }, VERSION)).rejects.toThrow(/letters, digits/);
     expect(existsSync(settingsIn(root))).toBe(false);
+    expect(existsSync(configIn(root))).toBe(false);
+  });
+
+  it("takes such a name for an entry that writes no hooks", async () => {
+    await installCmd({ path: root, name: "my.server", localOnly: true }, VERSION);
+    expect(read(configIn(root)).mcpServers["my.server"]).toBeDefined();
+    expect(existsSync(settingsIn(root))).toBe(false);
+    const other = join(root, "cursor.json");
+    await installCmd({ path: root, name: "my.server", config: other, db: "https://host/db" }, VERSION);
+    expect(read(other).mcpServers["my.server"]).toBeDefined();
   });
 
   it("writes no hooks and no env for a local-only entry", async () => {

@@ -6,11 +6,10 @@
 // (CX_STARTUP_CACHE_SECS), so a server started again within them describes
 // the database from the file instead of the platform. Every question starts a
 // fresh server, and on a database of seventy tables the description is about
-// a hundred and fifty requests at over a second each (a database of over a hundred tables, 2026-11-06):
-// most of the seconds before the model can start.
+// a hundred and fifty requests at over a second each: most of the seconds
+// before the model can start.
 //
-// Off unless the variable is set: a measured run starts cold, as it always
-// did. The file expires and is not refreshed in the background: the first
+// Off unless the variable is set: a server starts cold by default. The file expires and is not refreshed in the background: the first
 // server after it expires describes the database from the platform and writes
 // a new one, so a reading is at most the window old and no server adds load
 // to the platform while it answers. A call that failed (a table with no card

@@ -80,7 +80,7 @@ const FORBIDDEN_OPS = ["drop_table", "create_table", "append", "delete", "update
  * which the server describes as the tables a statement may join. */
 const platform = () =>
   scriptPlatform({
-    list_tables: () => [200, ["chunks", "chunks_lab", ROOM_TABLE]],
+    list_tables: () => [200, ["chunks", "chunks_docs", ROOM_TABLE]],
     schema: () => [200, ROOM_SCHEMA],
     table_card: () => [404, { error: `no lean card for table ${ROOM_TABLE}` }],
     hydrate: () => [404, { error: `no load recorded for ${ROOM_TABLE}` }],
@@ -123,7 +123,7 @@ describe("a chunks-shaped hosted table the local index does not hold", () => {
     expect(byName.get("find")).toContain(`Every row of ${ROOM_TABLE}`);
     expect(byName.has("read")).toBe(true);
     // The room first, the database's other tables the platform listed beside it.
-    expect(s.client.getInstructions()).toContain(`an index of the tables ${ROOM_TABLE}, chunks, chunks_lab, one database`);
+    expect(s.client.getInstructions()).toContain(`an index of the tables ${ROOM_TABLE}, chunks, chunks_docs, one database`);
   });
 
   it("search reads the hosted index by the table's own text and vector columns", async () => {
