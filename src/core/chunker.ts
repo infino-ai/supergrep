@@ -443,13 +443,14 @@ function collectDefs(
 }
 
 /** Best-effort definition name: the grammar's `name` field, else the first
- * identifier-ish named child (covers declarator-wrapped names like C++). */
+ * identifier-ish named child (covers declarator-wrapped names like C++).
+ * Kept whole, a name over several lines (a CSS selector list) on one. */
 function nameOf(node: TSNode): string {
-  const clip = (s: string) => s.split("\n")[0].trim().slice(0, 80);
+  const whole = (s: string) => s.split(/\s+/).filter(Boolean).join(" ");
   const named = node.childForFieldName?.("name");
-  if (named?.text) return clip(named.text);
+  if (named?.text) return whole(named.text);
   for (const c of node.namedChildren) {
-    if (/identifier|name|selectors/.test(c.type)) return clip(c.text);
+    if (/identifier|name|selectors/.test(c.type)) return whole(c.text);
   }
   return "";
 }
@@ -541,7 +542,7 @@ function markdownDefs(lines: string[]): DefSite[] {
     const m = lines[i].match(/^(#{1,3})\s+(.*)/);
     if (!m) continue;
     const level = m[1].length;
-    const name = m[2].trim().slice(0, 80);
+    const name = m[2].trim();
     while (stack.length && stack[stack.length - 1].level >= level) stack.pop();
     sites.push({ row: i, name, kind: "section", scope: stack.map((s) => s.name).join(" › ") });
     stack.push({ level, name });
@@ -616,7 +617,7 @@ function spanMeta(defs: DefSite[], startLine: number, endLine: number): Partial<
       ),
     ];
     return {
-      symbol: names.join(", ").slice(0, 120) || undefined,
+      symbol: names.join(", ") || undefined,
       kind: inSpan[0].kind,
       scope: inSpan[0].scope || undefined,
     };
@@ -630,7 +631,7 @@ function spanMeta(defs: DefSite[], startLine: number, endLine: number): Partial<
     .at(-1);
   if (!enclosing) return undefined;
   return {
-    symbol: partOf(enclosing.name, enclosing).slice(0, 120),
+    symbol: partOf(enclosing.name, enclosing),
     kind: enclosing.kind,
     scope: enclosing.scope || undefined,
   };

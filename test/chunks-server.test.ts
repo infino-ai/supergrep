@@ -5,8 +5,8 @@
 // on an in-memory transport against a scripted platform: the path the live
 // demo runs. The default table is never probed for its shape - it is the
 // table this client builds, so its mode is chunks without asking - and
-// startup reads the one card the sql description folds in, with no
-// cold-start retries, so the MCP handshake is never held behind a platform
+// startup lists the database's tables once and reads the one card the sql
+// description folds in, with no cold-start retries, so the MCP handshake is never held behind a platform
 // that is cold or answering 503 at spawn (the third server below). After
 // that find and plain sql are local tools that make NO platform request -
 // not before their answer, not for it - while search reads the hosted index
@@ -24,7 +24,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { call, scriptPlatform, start, stop, type Started } from "./mcp-harness.js";
+import { NO_GRAPH, call, scriptPlatform, start, stop, type Started } from "./mcp-harness.js";
 
 // The environment the server reads at module load (TABLE is a constant of
 // config.ts) and at startup, set before either module is imported - which is
@@ -36,7 +36,7 @@ process.env.CX_AUTO_INDEX = "0";
 delete process.env.CX_NO_RECEIPT;
 delete process.env.CX_INDEX_DIR;
 
-const { SQL_DESCRIPTION, PREFER_SEVERAL_ASKS, TARGETED_ASKS, FIND_BY_BARE_NAME, indexFirst, findHint, isLogIndex, logIndexInstructions } = await import("../src/mcp/server.js");
+const { SQL_DESCRIPTION, FIND_BY_BARE_NAME, indexFirst, findHint, isLogIndex, logIndexInstructions } = await import("../src/mcp/server.js");
 const { API_KEY_ENV, MANIFEST_NAME, TABLE, DEFAULT_TABLE, configureHosted, hostedSettingsFromFlags } = await import("../src/core/config.js");
 
 /** One chunk as the hosted search returns it. */
@@ -64,6 +64,7 @@ const up = () =>
     hybrid_search: () => [200, [CHUNK]],
     query_sql: (body) => (String(body?.query).includes("hybrid_search") ? [200, [{ ...CHUNK }]] : [200, [{ n: 7 }]]),
     validate: () => [200, { valid: true, check: "unchecked" }],
+    graph_expand: () => NO_GRAPH,
   });
 
 /** The platform cold, or its worker dying, at the moment the server spawns:
@@ -89,40 +90,29 @@ async function expectChunksText(s: Started): Promise<void> {
   // The files the index named, read from it several at once - registered
   // on a chunks table, where paths are files.
   expect(byName.get("read")).toContain("several files in one call");
-  expect(byName.get("ask")).toContain("Ask the repository index");
-  // The opening says what one call does and covers, before what comes back.
-  expect(byName.get("ask")).toContain(
-    "a read-only retrieval subagent chooses and runs the searches itself - keyword, hybrid, vector and SQL, as the question needs - over the whole repository",
-  );
+  // No ask and no answer: the retrieval loop is not a tool of this server.
+  expect(byName.has("ask")).toBe(false);
+  expect(byName.has("answer")).toBe(false);
   // No explore: the tool that had the platform write the answer is gone (see
   // the note on `retrieve` in src/mcp/server.ts), and a line in the
   // instructions for a tool that is not there costs the caller a turn.
   expect(byName.has("explore")).toBe(false);
+  // The files the index named, read from it several at a time, and routed to
+  // from the instructions once the others have named them.
+  expect(byName.get("read")).toContain("several files in one call, from the index");
   const instructions = s.client.getInstructions() ?? "";
+  expect(instructions).toContain("- read - the numbered lines of the files the index named, several paths in one call");
+  expect(instructions).toContain("Read the files the index named with read, every path in one call");
   expect(instructions).toContain("code-context is a local index of this repository");
   expect(instructions).not.toContain("- explore -");
-  expect(instructions).toContain("- ask - a question or task in plain language");
-  // The written answer's tool, and its routing line: without the install's
-  // hook the model is told to relay the text exactly.
-  expect(byName.get("answer")).toContain("Reply with that text exactly as returned, in full, and nothing else");
-  expect(instructions).toContain(
-    "- answer - REQUIRED after retrieving: never write the answer yourself. Once you have what the question needs, call answer with the question alone - the writer already has every row this server returned to you: it writes the answer from the rows; reply with its text exactly as returned",
-  );
-  expect(instructions).not.toContain("shows it to the user itself");
+  expect(instructions).not.toContain("- ask -");
+  expect(instructions).not.toContain("- answer -");
+  expect(instructions).toContain("- search - how does X work, where is Y handled, code by meaning.");
   expectSharedSentences(instructions);
-  // The fan-out is a preference, told once in the instructions and once in
-  // the tool's own text; "spawn several in parallel" only said it was allowed.
-  expect(instructions).toContain(PREFER_SEVERAL_ASKS);
-  expect(byName.get("ask")).toContain(PREFER_SEVERAL_ASKS);
-  // Beside it, wherever it is said: an ask is a targeted question, never the
-  // caller's own passed on.
-  expect(instructions).toContain(`${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS}`);
-  expect(byName.get("ask")).toContain(`${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS}`);
-  expect(instructions).not.toContain("Spawn several in parallel");
   // The index ranks ahead of the model's own file tools, and the sentence
-  // names the four tools this server registers.
-  expect(instructions).toContain(indexFirst(true));
-  expect(instructions).toContain("find, search, sql and ask cover every file in one call");
+  // names the tools this server registers.
+  expect(instructions).toContain(indexFirst());
+  expect(instructions).toContain("find, search and sql cover every file in one call");
   expectListedNames(instructions);
 }
 
@@ -148,7 +138,7 @@ function expectListedNames(instructions: string): void {
     instructions
       .trimEnd()
       .endsWith(
-        "Call each tool by the name your client lists for it - in Claude Code that is mcp__code-context__ask, mcp__code-context__sql, mcp__code-context__find and so on - never by the bare name written here, which the client refuses as no such tool.",
+        "Call each tool by the name your client lists for it - in Claude Code that is mcp__code-context__search, mcp__code-context__sql, mcp__code-context__find and so on - never by the bare name written here, which the client refuses as no such tool.",
       ),
   ).toBe(true);
 }
@@ -162,16 +152,16 @@ describe("an index of logs is told apart and gets its instructions in log words"
     expect(isLogIndex(undefined)).toBe(false);
   });
 
-  it("names the logs, puts find and sql first, ask for the questions that span them, and says not to grep the files", () => {
-    const text = logIndexInstructions(true, 35, 4903);
+  it("names the logs, puts find and sql first, and says not to grep the files", () => {
+    const text = logIndexInstructions(35, 4903);
     expect(text).toContain("an index of the 35 log files in this directory");
     expect(text).toContain("4903 windows");
     expect(text).not.toContain("repository");
     expect(text).toContain("- find - every line in every log containing an exact string");
     expect(text).toContain("- sql - counts and rankings across the logs");
-    expect(text).toContain("- ask - a question or task in plain language over all the logs");
+    expect(text).not.toContain("- ask -");
+    expect(text).not.toContain("use ask");
     expect(text).toContain("Start with find or sql");
-    expect(text).toContain("use ask for a question that spans the logs");
     expect(text).toContain("Do not open, read or grep the log files with Bash, Grep or Read");
     // The looking around is named as not needed, the lines are sql's too,
     // and a cut find is a flood to narrow, never a file for the shell.
@@ -180,11 +170,6 @@ describe("an index of logs is told apart and gets its instructions in log words"
     expect(text).toContain("A find that lists places without their text is a flood: every place is listed");
     expect(text).not.toContain("Read a file only");
     expectSharedSentences(text);
-    // Without the agent tools there is no ask line and no ask in the order.
-    const alone = logIndexInstructions(false, 35, 4903);
-    expect(alone).not.toContain("- ask -");
-    expect(alone).not.toContain("use ask");
-    expect(alone).toContain("Start with find or sql");
   });
 });
 
@@ -224,22 +209,21 @@ afterAll(() => {
   configureHosted(null);
 });
 
-describe("the chunks table with the platform up, and answer switched on", () => {
+describe("the chunks table with the platform up", () => {
   let s: Started;
   beforeAll(async () => {
-    process.env.CX_ANSWER_TOOL = "1";
     s = await start(up(), "cx-chunks-");
   });
   afterAll(async () => {
-    delete process.env.CX_ANSWER_TOOL;
     await stop(s);
   });
 
-  it("read the one card at startup and nothing else: the default table is not probed for its shape", () => {
+  it("listed the database's tables once and read the one card at startup, and nothing else: the default table is not probed for its shape", () => {
     expect(TABLE).toBe(DEFAULT_TABLE);
-    // The enriched card first (the default tier), then, since the platform
-    // has none, the lean one it falls back to - one card, two asks.
-    expect(s.startup).toEqual(["table_card", "table_card"]);
+    // The database's tables, once - the platform lists no other here - then
+    // the enriched card (the default tier) and, since the platform has none,
+    // the lean one it falls back to - one card, two asks.
+    expect(s.startup).toEqual(["list_tables", "table_card", "table_card"]);
     expect(s.sent.filter((x) => x.op === "table_card").slice(0, 2).map((x) => x.body?.tier)).toEqual(["enriched", "lean"]);
   });
 
@@ -258,11 +242,17 @@ describe("the chunks table with the platform up, and answer switched on", () => 
     const statement = `SELECT path, start_line, content FROM hybrid_search('${TABLE}','content','body','embedding', {{q}}, 30)`;
     const { ok, value, ops } = await call(s, "sql", { query: statement, embed: { q: "body" }, question: "where is body?" });
     expect(ok, String(value)).toBe(true);
-    // The readiness memo, the statement, the verdict - and no local index:
-    // there is none here, and the call did not need one.
-    expect(ops).toEqual(["list_tables", "query_sql", "validate"]);
+    // The readiness memo, the statement - its verdict and its rerank asked
+    // for on it, answered in the same call - and the graph's expansion (this
+    // session's first retrieval: the deployment builds no graph, so no later
+    // one asks), and no local index: there is none here, and the call did
+    // not need one.
+    expect(ops).toEqual(["list_tables", "query_sql", "graph_expand"]);
+    // The statement runs as written, its placeholder folded into the platform's.
     const sent = s.sent.find((x) => x.op === "query_sql")?.body;
     expect(sent?.query).toBe(statement.replace("{{q}}", HOSTED_PLACEHOLDER));
+    expect(sent?.validate).toMatchObject({ table_name: TABLE, field_name: "content", question: "where is body?" });
+    expect(sent?.rerank).toEqual({ question: "where is body?" });
     const result = value as { rows: Array<Record<string, unknown>>; index: string; validation?: Record<string, unknown>; usage?: string };
     expect(result.index).toBe("platform");
     expect(result.rows[0]).toMatchObject({ path: "src/a.ts", start_line: 1 });
@@ -307,69 +297,6 @@ describe("the chunks table with the platform up, and answer switched on", () => 
   });
 });
 
-describe("the chunks table with CX_AGENT_TOOLS=0: the lane that hides ask", () => {
-  let s: Started;
-  beforeAll(async () => {
-    // The env is read when the server starts, so it is set here and not at
-    // the top of the file, where it would reach the other two servers.
-    process.env.CX_AGENT_TOOLS = "0";
-    s = await start(up(), "cx-chunks-noagent-");
-  });
-  afterAll(async () => {
-    delete process.env.CX_AGENT_TOOLS;
-    await stop(s);
-  });
-
-  it("does not register ask and does not name it in the instructions, while sql keeps its validation note", async () => {
-    const { tools } = await s.client.listTools();
-    const names = tools.map((t) => t.name);
-    expect(names).toContain("find");
-    expect(names).toContain("search");
-    expect(names).toContain("sql");
-    expect(names).not.toContain("ask");
-    expect(names).not.toContain("answer");
-    expect(names).not.toContain("explore");
-    const instructions = s.client.getInstructions() ?? "";
-    expect(instructions).toContain("code-context is a local index of this repository");
-    expect(instructions).not.toContain("- ask -");
-    expect(instructions).not.toContain("- answer -");
-    expect(instructions).not.toContain("- explore -");
-    expectSharedSentences(instructions);
-    // The index-first sentence names the three tools this lane has, not ask.
-    expect(instructions).toContain(indexFirst(false));
-    expect(instructions).toContain("find, search and sql cover every file in one call");
-    expect(instructions).not.toContain("sql and ask cover");
-    // The database is still configured: the sql text's platform-side note
-    // and the startup card read are about sql, not about the loop.
-    expect(tools.find((t) => t.name === "sql")?.description).toContain("'validation'");
-    expect(s.startup).toEqual(["table_card", "table_card"]);
-  });
-});
-
-describe("the chunks table by default: the caller's model writes the answer", () => {
-  let s: Started;
-  beforeAll(async () => {
-    s = await start(up(), "cx-chunks-noanswer-");
-  });
-  afterAll(async () => {
-    await stop(s);
-  });
-
-  it("keeps ask and drops answer, from the tool list and from the instructions alike", async () => {
-    const { tools } = await s.client.listTools();
-    const names = tools.map((t) => t.name);
-    expect(names).toContain("ask");
-    expect(names).not.toContain("answer");
-    const instructions = s.client.getInstructions() ?? "";
-    expect(instructions).toContain("- ask -");
-    expect(instructions).not.toContain("- answer -");
-    expect(instructions).not.toContain("never write the answer yourself");
-    // The four retrieval tools are still the four; the index-first sentence
-    // names ask among them.
-    expect(instructions).toContain(indexFirst(true));
-  });
-});
-
 /** The platform with its routes as tools: a card computed for the table, the
  * check and the citation pass answering. */
 const CARD = { schema: [{ name: "path", index: "key" }, { name: "content", index: "fts" }], rows: 12, samples: [] };
@@ -411,9 +338,10 @@ describe("the chunks table with CX_API_TOOLS=1 and no agent tools: the platform'
     expect(instructions).toContain("- validate -");
     expect(instructions).toContain("- cite -");
     expect(instructions).not.toContain("- ask -");
-    // The card was still read at startup for the sql text; under the tools
-    // it is the model's to ask for, so nothing folds it in.
-    expect(s.startup).toEqual(["table_card"]);
+    // The tables were listed and the card was still read at startup for the
+    // sql text; under the tools it is the model's to ask for, so nothing
+    // folds it in.
+    expect(s.startup).toEqual(["list_tables", "table_card"]);
   });
 
   it("table_card returns the card, validate sends the question with the statement and rows, cite sends the draft", async () => {
@@ -448,7 +376,8 @@ describe("the chunks table with CX_API_TOOLS=1 and no agent tools: the platform'
   });
 });
 
-/** The platform with two sibling tables the primary may join: their schemas
+/** The platform with two sibling tables the primary may join, listed beside
+ * it in the database: their schemas
  * and cards answered by name (the primary has no card), the cards saying
  * nothing about keys, join_keys answering with them, and query_sql
  * answering any statement. */
@@ -486,39 +415,36 @@ const withSiblings = () =>
     validate: () => [200, { valid: true, check: "unchecked" }],
   });
 
-describe("the chunks table with CX_SIBLING_TABLES: the tables a statement may join", () => {
+describe("the chunks table with other tables in its database: the tables a statement may join", () => {
   let s: Started;
   beforeAll(async () => {
-    process.env.CX_SIBLING_TABLES = "swe_issues,chunks_swelogs";
-    // What a deployment may say about the siblings: what a value means. Never
-    // a key - the keys are join_keys's to return.
-    process.env.CX_SIBLING_NOTES = "chunks_swelogs.resolved is 'true' or 'false' per run.";
     s = await start(withSiblings(), "cx-chunks-siblings-");
   });
   afterAll(async () => {
-    delete process.env.CX_SIBLING_TABLES;
-    delete process.env.CX_SIBLING_NOTES;
     await stop(s);
   });
 
   it("describes the siblings' columns and the join keys in the sql text and names them in the instructions", async () => {
-    // Startup read each sibling's schema (and asked for its card), nothing more.
+    // Startup listed the database's tables once, then read each sibling's
+    // schema (and asked for its card), nothing more.
+    expect(s.startup.filter((op) => op === "list_tables").length).toBe(1);
     expect(s.startup.filter((op) => op === "schema").length).toBe(2);
+    expect(s.sent.filter((sent) => sent.op === "schema").map((sent) => sent.body?.table_name).sort()).toEqual(["chunks_swelogs", "swe_issues"]);
     const { tools } = await s.client.listTools();
     const sql = tools.find((t) => t.name === "sql")?.description ?? "";
     expect(sql).toContain("joinable with chunks in one statement");
     expect(sql).toContain("swe_issues(instance_id utf8, project utf8, problem_statement large_utf8)");
     expect(sql).toContain("chunks_swelogs(path utf8, start_line i64, content large_utf8, instance_id utf8, resolved utf8)");
-    expect(sql).toContain("chunks_swelogs.resolved is 'true' or 'false' per run.");
-    // No key reaches the tool text. Each card is asked for by table and
-    // tier alone (a card route parameter that handed joins back with the
-    // card is gone); no join_keys call is made at startup; the worked JOIN
-    // carries a placeholder and says to call join_keys first (2026-09-24,
-    // after the corpus's keys had been written into this text by hand and
-    // then by a startup call: the owner, "you doctored the demo?").
+    // No key reaches the tool text. Each card is asked for by table, tier
+    // and its share of the card budget alone (a card route parameter that
+    // handed joins back with the card is gone); no join_keys call is made
+    // at startup; the worked JOIN carries a placeholder and says to call
+    // join_keys first (2026-09-24, after the corpus's keys had been written
+    // into this text by hand and then by a startup call: the owner, "you
+    // doctored the demo?").
     const cardAsks = s.sent.filter((sent) => sent.op === "table_card").map((sent) => [sent.body?.table, Object.keys(sent.body ?? {}).sort()]);
-    expect(cardAsks).toContainEqual(["swe_issues", ["table", "tier"]]);
-    expect(cardAsks).toContainEqual(["chunks_swelogs", ["table", "tier"]]);
+    expect(cardAsks).toContainEqual(["swe_issues", ["families", "table", "tier", "whole"]]);
+    expect(cardAsks).toContainEqual(["chunks_swelogs", ["families", "table", "tier", "whole"]]);
     expect(s.sent.filter((sent) => sent.op === "join_keys")).toEqual([]);
     expect(sql).not.toContain("Keys found on the tables' values");
     expect(sql).not.toContain("instance_id = swe_issues.instance_id");
@@ -543,15 +469,13 @@ describe("the chunks table with CX_SIBLING_TABLES: the tables a statement may jo
     expect(((r.value as Record<string, unknown>).joins as unknown[]).length).toBe(2);
     expect(r.ops).toEqual(["join_keys"]);
     const instructions = s.client.getInstructions() ?? "";
-    // Ask first across the tables: the loop writes the joins itself, several
-    // at once; the model's own sql is for one statement it already knows.
-    expect(instructions).toContain(`- ${rule} A question that touches two of these tables - chunks, swe_issues, chunks_swelogs - is an ask first`);
-    expect(instructions).toContain("- sql - one statement you already know");
+    // A question across the tables is one JOIN, written once join_keys has
+    // returned the keys.
+    expect(instructions).toContain(`- ${rule} sql also joins chunks with swe_issues, chunks_swelogs in one statement`);
+    expect(instructions).toContain("call join_keys with the tables for the keys, then write the JOIN");
     // The siblings come second in the sql text, before the recipes and the
-    // card, and the ask text says its search spans them.
+    // card.
     expect(sql.indexOf("joinable with chunks in one statement")).toBeLessThan(sql.indexOf("The search functions are table-valued"));
-    const ask = tools.find((t) => t.name === "ask")?.description ?? "";
-    expect(ask).toContain("It searches chunks and, in the same database, swe_issues, chunks_swelogs, and joins them");
     expect(instructions).toContain("beside it in the same database the tables swe_issues, chunks_swelogs");
   });
 
@@ -619,31 +543,6 @@ describe("the chunks table with CX_SIBLING_TABLES: the tables a statement may jo
   });
 });
 
-describe("the chunks table with CX_ANSWER_DISPLAY=hook: the install wrote the hook", () => {
-  let s: Started;
-  beforeAll(async () => {
-    process.env.CX_ANSWER_TOOL = "1";
-    process.env.CX_ANSWER_DISPLAY = "hook";
-    s = await start(up(), "cx-chunks-hook-");
-  });
-  afterAll(async () => {
-    delete process.env.CX_ANSWER_TOOL;
-    delete process.env.CX_ANSWER_DISPLAY;
-    await stop(s);
-  });
-
-  it("tells the model the answer is shown to the user by the tool, and to say one sentence", async () => {
-    const { tools } = await s.client.listTools();
-    const answer = tools.find((t) => t.name === "answer")?.description ?? "";
-    expect(answer).toContain("shown to the user directly by this tool");
-    expect(answer).toContain("one short sentence");
-    expect(answer).not.toContain("exactly as returned");
-    const instructions = s.client.getInstructions() ?? "";
-    expect(instructions).toContain("it writes the answer from the rows and shows it to the user itself; then reply with one short sentence and nothing else.");
-    expect(instructions).not.toContain("exactly as returned");
-  });
-});
-
 describe("the chunks table with the platform answering 503 at spawn", () => {
   let s: Started;
   beforeAll(async () => {
@@ -655,12 +554,13 @@ describe("the chunks table with the platform answering 503 at spawn", () => {
     await stop(s);
   });
 
-  it("came up at once: one card attempt, no retry, and the handshake never waited on the platform", () => {
-    // The card is best-effort and fetched with no cold-start retries, and
-    // the default table is not probed; a startup that retried either would
-    // hold the MCP handshake for the cold-start budget - two minutes, past a
-    // client's startup timeout - and the session would lose the local tools.
-    expect(s.startup).toEqual(["table_card"]);
+  it("came up at once: one listing attempt, one card attempt, no retry, and the handshake never waited on the platform", () => {
+    // The listing and the card are best-effort and asked for with no
+    // cold-start retries, and the default table is not probed; a startup
+    // that retried any would hold the MCP handshake for the cold-start
+    // budget - two minutes, past a client's startup timeout - and the
+    // session would lose the local tools.
+    expect(s.startup).toEqual(["list_tables", "table_card"]);
     expect(s.startupMs).toBeLessThan(STARTUP_MS_MAX);
   });
 
@@ -705,7 +605,9 @@ describe("the chunks table without CX_REMOTE_SEARCH: only a statement that embed
     const statement = `SELECT path FROM hybrid_search('${TABLE}','content','body','embedding', {{q}}, 30)`;
     const { ok, value, ops } = await call(s, "sql", { query: statement, embed: { q: "body" } });
     expect(ok, String(value)).toBe(true);
-    expect(ops).toEqual(["list_tables", "query_sql", "validate"]);
+    // The verdict rides on the statement; with no question, no rerank.
+    expect(ops).toEqual(["list_tables", "query_sql", "graph_expand"]);
+    expect(s.sent.find((x) => x.op === "query_sql")?.body?.rerank).toBeUndefined();
     expect(s.sent.find((x) => x.op === "query_sql")?.body?.query).toBe(statement.replace("{{q}}", HOSTED_PLACEHOLDER));
     expect((value as { index: string }).index).toBe("platform");
   });
@@ -717,7 +619,9 @@ describe("the chunks table without CX_REMOTE_SEARCH: only a statement that embed
       const { ok, value, ops } = await call(s, "sql", { query: statement });
       expect(ok, String(value)).toBe(true);
       expect(ops, written).toContain("query_sql");
-      expect(s.sent.slice(before).find((x) => x.op === "query_sql")?.body?.query, written).toBe(statement.replace(written, HOSTED_PLACEHOLDER));
+      expect(s.sent.slice(before).find((x) => x.op === "query_sql")?.body?.query, written).toBe(
+        statement.replace(written, HOSTED_PLACEHOLDER),
+      );
       expect((value as { index: string }).index).toBe("platform");
     }
   });

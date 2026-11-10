@@ -9,8 +9,8 @@
 //   search   - find code: exact terms AND meaning in one ranked pass
 //   sql      - the power door: relevance-ranked aggregation over the search
 //              table functions (bm25_search / hybrid_search + GROUP BY)
-//   ask      - with --db: a question handed to the platform's retrieval
-//              loop, answered with the rows it retrieved
+//   read     - the numbered lines of the files the others named - or, over
+//              a hosted table of documents, of its documents - several at once
 //
 // Each tool is a different question: where does this exact text occur, what
 // is most relevant to this, how much of what is where, what do the rows say.
@@ -47,7 +47,7 @@
 // client builds - so its startup is what it always was, and the chunks
 // table keeps every path and every word of tool text it had.
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -70,23 +70,18 @@ import {
   embedProvider,
   autoIndexEnabled as autoIndexSetting,
   autoSyncEnabled as autoSyncSetting,
-  agentToolsEnabled,
-  answerToolEnabled,
   apiToolsEnabled,
   readOnlyEnabled,
   configuredCardTier,
-  configuredTextColumn,
   LEAN_CARD_TIER,
-  siblingNotes,
-  siblingTables,
-  subagentK,
-  subagentMaxTurns,
-  subagentMaxWallSecs,
+  memoryEnabled,
+  webFetchEnabled,
 } from "../core/config.js";
+import { StartupCache, startupCachePath, startupCacheSecs } from "../core/startup-cache.js";
 import { keyFilePath, readStoredAccount } from "../core/keystore.js";
 import { createDatabase } from "../core/account-api.js";
-import { completeTruncated, runRetrievalAgent } from "../core/retrieval-agent.js";
-import { answerDisplayMode, hookDeliveryText, relayDeliveryText, type AnswerDisplay } from "../core/answer-display.js";
+import { configuredPlaybook, withPlaybook } from "../core/playbook.js";
+import { MEMORY_RECALL_TIMEOUT_MS, recallMemory, type Recalled } from "../core/memory.js";
 import { readManifest, readPlatformManifest, type Manifest } from "../core/manifest.js";
 
 /** The one refusal whose fix is a person rather than a retry: the account has
@@ -97,8 +92,8 @@ import { readManifest, readPlatformManifest, type Manifest } from "../core/manif
 export function outOfCreditSteps(): string {
   const where = readStoredAccount()?.consoleUrl ?? "the Infino console";
   return (
-    `this Infino account has no credit left. find, search and sql keep working - they run on the ` +
-    `local index and cost nothing - but ask needs a balance. To restore it, the ` +
+    `this Infino account has no credit left. find, sql and read keep working - they run on the ` +
+    `local index and cost nothing - but search needs a balance. To restore it, the ` +
     `account's owner adds their billing details and a card to this same account at ${where} ` +
     `(the key on this machine keeps working and nothing needs reinstalling), then retries`
   );
@@ -121,11 +116,11 @@ const PLATFORM_URL_ENV = "CX_PLATFORM_URL";
 export function noAccountSteps(): string {
   const platform = process.env[PLATFORM_URL_ENV]?.trim() || "<the platform's URL>";
   return (
-    "search and ask are off on this server: this machine has no Infino account, or has not agreed to uploads. " +
-    "find, sql and read run on the local index and need nothing. To turn search and ask on, the person - not " +
+    "search is off on this server: this machine has no Infino account, or has not agreed to uploads. " +
+    "find, sql and read run on the local index and need nothing. To turn search on, the person - not " +
     `you - runs once, in a terminal: \`npx -y @infino-ai/code-context login --platform ${platform}\`. It asks ` +
     "them first, creates a free account (no email, no card), stores its key on this machine, and every " +
-    "directory they open after that has all four tools once the session restarts. Do not run that command " +
+    "directory they open after that has search too once the session restarts. Do not run that command " +
     "yourself, and never ask for or paste a key"
   );
 }
@@ -159,11 +154,16 @@ export function refusalHint(err: unknown): string {
   if (err.unauthenticated) return ` - ${keyRefusedSteps()}`;
   return "";
 }
+
+/** Whether a platform call ended at its client's deadline rather than on
+ * its own (`HostedError.pastDeadline`): the platform said nothing; the
+ * start-up ran out of the time it gives the database's other tables. */
+export function pastDeadline(err: unknown): boolean {
+  return err instanceof HostedError && err.pastDeadline;
+}
 import { hostedDbFor, localDb, newHostedMemo, platformLabel, platformTableReady, type IndexHandle } from "../core/context.js";
-import { devContext, devContextEnabled } from "../core/dev-context.js";
 import { budgetSqlRows, foldValidationFacts, rankRows, sqlBudgetHint } from "../core/facts.js";
-import { HostedError, type HostedDb, type HostedOptions, type RowRecord } from "../core/hosted.js";
-import { RetrievalRecord } from "../core/retrieval-record.js";
+import { HostedError, type HostedDb, type HostedOptions, type PromptCards, type ReadChecks, type RowRecord } from "../core/hosted.js";
 import {
   analyzerOf,
   find,
@@ -171,8 +171,6 @@ import {
   search,
   searchHosted,
   searchRows,
-  readFiles,
-  READ_LINES_CAP,
   runSql,
   runSqlRows,
   embedsAQuery,
@@ -181,7 +179,17 @@ import {
   normalizeQueryPlaceholders,
   numberRowLines,
   partialIndex,
+  readFiles,
+  readHits,
+  readNextCalls,
+  readRanges,
+  readRows,
+  READ_LINES_CAP,
+  READ_PATHS_MAX,
   withoutComments,
+  callTelemetry,
+  hostedTelemetry,
+  type CallTelemetry,
   CONTENT_COLUMN,
   FIND_RESULT_CHAR_BUDGET,
   MAX_FIND_CONTEXT,
@@ -197,13 +205,30 @@ import {
   searchEntry,
   rowSearchEntry,
   sqlEntry,
-  subagentEntry,
   withPlatform,
+  withCalls,
+  withMemoryTokens,
   formatReceipt,
   recordUsage,
 } from "../core/usage.js";
-import { chunkingNote, ENGINE_ID_COLUMN, fetchCard, resolveTableShape, SNIPPET_CHARS, type TableShape } from "../core/table-shape.js";
-import { joinGate, joinRefusal, tablesNamed, type PlatformJoin } from "../core/join-gate.js";
+import {
+  cardLayouts,
+  chunkingNote,
+  databaseTables,
+  ENGINE_ID_COLUMN,
+  fetchCard,
+  isMapEntry,
+  resolveTableShape,
+  rowHit,
+  SNIPPET_CHARS,
+  sqlIdentifier,
+  type CardColumn,
+  type CardLayout,
+  type ResolveOptions,
+  type TableShape,
+} from "../core/table-shape.js";
+import { joinGate, joinRefusal, tablesNamed, withoutGraphCalls, type PlatformJoin } from "../core/join-gate.js";
+import { expandAcrossGraph, newExpansionMemory, type GraphExpansion, type Searched } from "../core/graph-expand.js";
 import { DataPlane, type HydrateToolSource } from "./data.js";
 import { topKAggregateRefusal } from "../core/topk-aggregate.js";
 import {
@@ -218,6 +243,9 @@ import {
 import { createEmbedder, createIndexingEmbedder, embedderInfo, platformEmbedderInfo, type Embedder } from "../core/embedder.js";
 import { RepoRegistry, type RepoCtx } from "./repos.js";
 import { ensureIndexed, type EnsureResult } from "./ensure.js";
+import { ARITHMETIC_SENTENCE, READING_HABITS, SEARCH_RULE_SENTENCE, TASK_CHECKLIST_SENTENCE } from "./wording.js";
+
+export { ARITHMETIC_SENTENCE, READING_HABITS, SEARCH_RULE_SENTENCE, TASK_CHECKLIST_SENTENCE } from "./wording.js";
 
 /** The `sql` tool's description, named because it is the one description whose
  * every clause was put there by a measurement and can be regressed by an edit
@@ -255,6 +283,14 @@ import { ensureIndexed, type EnsureResult } from "./ensure.js";
  * within 3% on cost. That was the other mechanism on a code corpus; the code
  * corpora have not been measured on this one. */
 const CARD_TIER = configuredCardTier((line) => console.error(line));
+/** A keyword search called in a statement: its terms are words the
+ * platform's graph searches its facts by, whatever table the rows are of. */
+const KEYWORD_SEARCH_CALL = /\b(?:hybrid|bm25)_search\s*\(/i;
+/** The playbook this server was started with (CX_PLAYBOOK, `cx mcp
+ * --playbook`), or null: its outer bullets join the instructions. Read once; a file that does not load stops the server before it
+ * serves a tool, since a server measured with half a playbook would be
+ * measured as something it is not. */
+const PLAYBOOK = configuredPlaybook((line) => console.error(line));
 /** Whether the text carries the semantic layer: on the enriched tier only, so
  * the lean text stays what it was measured as. */
 const WITH_SEMANTICS = CARD_TIER !== LEAN_CARD_TIER;
@@ -262,11 +298,64 @@ const WITH_SEMANTICS = CARD_TIER !== LEAN_CARD_TIER;
 /** Every tool here reads the index; none writes. Said out loud because a
  * caller that runs a message's tool calls concurrently only when each one is
  * read-only - Claude Code does exactly that - otherwise runs them one at a
- * time. Without this, four `ask`s issued together were announced at once and
- * executed serially (measured 2026-09-12: 31s where the slowest alone was 15s),
- * so every fan-out sentence in the descriptions below (`PREFER_SEVERAL_ASKS`)
- * was a promise the harness could not keep. */
+ * time. Without this, four platform calls issued together were announced at
+ * once and executed serially (measured 2026-09-12: 31s where the slowest alone
+ * was 15s), so every sentence below that asks for calls side by side was a
+ * promise the harness could not keep. */
 const READ_ONLY = { readOnlyHint: true } as const;
+
+/** The largest `read` result, in bytes as sent, that Claude Code shows the
+ * model inline. Past its limit it writes the result to a file and the model
+ * sees only a preview: on the demo (2026-10-08, a legal-document benchmark task) a read
+ * of six documents filling 60,000 characters went out as 64 KB and came back
+ * as `<persisted-output>`, while a 49,484-character read came back whole. */
+export const READ_INLINE_MAX_BYTES = 49_000;
+
+/** The largest result, in characters, the `page` tool declares to Claude
+ * Code (`anthropic/maxResultSizeChars`, whose ceiling this is). A page's
+ * image travels as base64, and on OfficeQA's scans 94% of pages pass the
+ * default 50,000 characters, where Claude Code would write the result to a
+ * file the model never sees; at this size 98.4% go through whole. */
+export const PAGE_RESULT_MAX_CHARS = 500_000;
+
+/** The bytes a `read` result's numbered lines may take as sent, JSON-escaped
+ * and UTF-8 encoded, before each path's share (`readBudget`):
+ * READ_INLINE_MAX_BYTES less room for what every result carries besides -
+ * `index`, `took_ms`, the usage line. Measured as sent rather than as text,
+ * since escaping inflates it. */
+export const READ_BUDGET_BYTES = 45_000;
+
+/** What one file of a `read` result carries besides its lines and its path,
+ * as sent: its span and total, its `more`, the note on a file the budget
+ * left out, and its entry in `next` - about 300 bytes of pretty JSON, with
+ * room over. */
+const READ_FILE_FIELDS_BYTES = 320;
+
+/** The bytes the numbered lines of a read of `paths` may take: the budget
+ * less each path's share - its fields, and the path itself twice, in its file
+ * and in `next` - so a read naming sixteen long paths stays under
+ * READ_INLINE_MAX_BYTES as one naming two does. */
+export function readBudget(paths: readonly string[]): number {
+  return paths.reduce((left, path) => left - READ_FILE_FIELDS_BYTES - 2 * Buffer.byteLength(JSON.stringify(path)), READ_BUDGET_BYTES);
+}
+
+/** A value sent as the JSON text of itself, read as the value: `"[559, 592]"`
+ * as the list, `"12"` as the number. Anything else passes through for the
+ * schema to judge. */
+function jsonOrAsIs(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+/** A line number or a list of them, for read's from and to. A list sent as
+ * its JSON text is read as the list: the demo's Haiku (2026-09-28) sent
+ * `from: "[559, 592, 623]"` in six of fifteen reads, and a schema that
+ * refused it cost each one a turn. */
+export const lineOrLines = z.preprocess(jsonOrAsIs, z.union([z.number().int().positive(), z.array(z.number().int().positive()).min(1)]));
 
 /** How long `sql` waits for the platform's verdict on its rows before
  * returning them without one. Short on purpose: the rows are the answer and
@@ -280,6 +369,24 @@ const READ_ONLY = { readOnlyHint: true } as const;
  * hand - sat for 116 s waiting on a best-effort check. That is a regression
  * against the tool as it was, and a platform outage must not become one. */
 const VERDICT_TIMEOUT_MS = 3_000;
+
+/** How long a server's start-up waits on the database's tables other than
+ * its own, from the moment the server starts, before the handshake goes
+ * ahead without the ones it has not described. Claude Code gives an MCP
+ * server 30 s to start and then runs the session without any of its tools.
+ * The other tables are a help to the sql text, not a precondition of any
+ * tool, so they get a third of that; the process's own start and its own
+ * table's reads, which decide what the tools are, fit in the rest. The table
+ * the server is for is never cut by it.
+ *
+ * Measured 2026-10-30 on the public demo's database, 213 tables behind the
+ * platform's per-account rate limit: describing every other table before the
+ * handshake took 20-71 s and 1,500-2,100 requests a start (1,100-1,600 of
+ * them 429s), with a few cards answering nothing for their whole 60 s; the
+ * 41 tables of the database the listing was written for took 3.9 s
+ * (2026-10-20). A table not described within it is named in the text as
+ * one that could not be (`siblingsNote`). */
+const STARTUP_BUDGET_MS = 10_000;
 
 /** What `sql` says about its verdict when a platform is there to give one.
  * It names the parameter and the field, and says what the verdict is NOT,
@@ -316,16 +423,134 @@ const VALIDATION_NOTE =
   "never the file's size, and a file whose term_lines are all zero was ranked by meaning alone, so " +
   "say so or leave it out rather than renumber the rest.";
 
-/** What introduces the card in the `sql` description. Stated as the table's
- * own measured shape, because that is what it is: the optimizer computed it
- * from the table after optimizing it, so the distinct counts and ranges are
- * the table's, not an estimate. */
+/** What introduces the cards in the `sql` description. Stated as each
+ * table's own measured shape, because that is what it is: the optimizer
+ * computed it from the table after optimizing it, so the distinct counts and
+ * ranges are the table's, not an estimate. A wide table's card is laid out
+ * within the budget the platform's own loop lays it out within (core/
+ * table-shape.ts, `cardLayouts`): its densest columns whole and the rest as
+ * a map, whose entries the preamble explains once. */
 const CARD_PREAMBLE =
+  ` Each table's own measured shape, computed from it - use it to choose columns and write the ` +
+  `statement without discovering the shape first. A wide table's card lists its columns whole only as far ` +
+  "as its budget reaches: a `<head>_*` entry stands for a family of columns named by that prefix, " +
+  "`(other columns)` for the rest, and `(empty columns)` for the columns with no value in any row; " +
+  "describe_columns lists what an entry stands for, whole:\n";
+
+/** What introduces the one card of a table none of whose columns the card
+ * maps - every column listed whole, no sibling beside it: the words the text
+ * carried before wide tables were laid out. The wide-table sentences, the
+ * table's name in front of its card and the describe_columns tool are for a
+ * card that maps columns; on a narrow table they are text about nothing the
+ * model can see, and on OfficeQA (2026-10-19) the 90 questions with them went
+ * 62 against 66 without, losing two questions every earlier run had right. */
+const NARROW_CARD_PREAMBLE =
   ` The table's own measured shape, computed from it - use it to choose columns and write the ` +
   `statement without discovering the shape first:\n`;
 
+/** Whether a card lays out any column as a map entry (`<head>_*`,
+ * `(other columns)`, `(empty columns)`) rather than listing it whole. */
+export function cardMapsColumns(card: RowRecord | undefined): boolean {
+  const schema = card?.schema;
+  return Array.isArray(schema) && schema.some((c) => typeof (c as RowRecord)?.name === "string" && isMapEntry(c as { name: string }));
+}
+
+/** The tables the platform says it knows where the documents their rows
+ * were made from lie (`pages` beside their cards, from the platform's
+ * `gateway_settings.pages`), in the order given: the tables the page tool
+ * reads a row's page for. */
+export function pagedTables(tables: ReadonlyArray<{ table: string; pages?: boolean }>): string[] {
+  return tables.filter((t) => t.pages === true).map((t) => t.table);
+}
+
+/** Whether a card names the table's kind column (`kind_column`): the
+ * column saying what kind of record each row is, by which the platform
+ * counts every sparse column's rows (an entry's `kinds`). The laid-out card
+ * leaves the counts out and describe_columns serves them, so the tool is
+ * offered for such a table however narrow its card. */
+export function cardNamesKinds(card: RowRecord | undefined): boolean {
+  return typeof card?.kind_column === "string" && card.kind_column !== "";
+}
+
+/** What a text over several tables says about choosing among them: the
+ * loop's words, word for word (the platform loop's text,
+ * SEVERAL_TABLES_SENTENCE, held to it by test/loop-sentences.test.ts). Shown
+ * two tables of events, a model took the one named first and the column
+ * named like the question's words and told the reader the data held no tool
+ * calls, while the other table's card said where they were. */
+export const SEVERAL_TABLES_SENTENCE =
+  " The question may be about any of the tables described: read every table's description before " +
+  "choosing, and take the table whose columns hold what the question asks about by what their " +
+  "descriptions and values say, never by a column named like the question's words; the notes under " +
+  "the question say which table holds what. A column described as holding no value, or whose rows " +
+  "come back empty, is not the one: go to the other table.";
+
+/** Text columns a tool's text names before counting the rest - the loop's
+ * TEXT_COLUMNS_LISTED, the same figure: a table of events carries hundreds
+ * of indexed text columns, and naming every one in every tool put tens of
+ * thousands of characters into each. */
+export const TEXT_COLUMNS_LISTED = 24;
+
+/** How the lookup is told to be called with the question, the loop's words
+ * word for word (the platform loop's text, DESCRIBE_COLUMNS_QUESTION_RULE,
+ * held to it by test/loop-sentences.test.ts): the question first, the
+ * table when the caller knows it. */
+export const DESCRIBE_COLUMNS_QUESTION_RULE =
+  " Pass the question you are answering as `question`: without `table` it returns the cards of the " +
+  "tables that question needs, best first, with the columns it needs listed whole; with `table`, that " +
+  "table's columns the question needs first. A `pattern` narrows the columns to names you already know.";
+
+/** The `describe_columns` tool's text, the loop's own tool's words
+ * (the platform loop's text, describe_columns_tool): the model outside the
+ * loop reads a wide table's laid-out card as the loop does and reaches a
+ * mapped column the same way. */
+export const DESCRIBE_COLUMNS_DESCRIPTION =
+  "List a table's column entries from its card, whole: type, index role, rows with a value, distinct " +
+  "count, range, most frequent values, and, where the card names a `kind_column`, `kinds`: which kinds " +
+  "of record hold a value in the column and how many of each. The sql tool's text lists a wide table's " +
+  "columns only as far as its budget reaches and stands in for the rest with one `<head>_*` entry per " +
+  "name family, and lists no column's kinds; call this with the family's prefix (`property_*`) or a " +
+  "column's name before a statement names one of them, and before counting a column of a table with a " +
+  "`kind_column`. Returns how many columns matched and the first 40 by rows with a value, or `limit` " +
+  "of them." +
+  DESCRIBE_COLUMNS_QUESTION_RULE;
+
+/** The `question` a search or a find takes: with it the platform's grader
+ * orders the hits for the question before they come back - the triage pass
+ * the platform's own retrieval loop ranks its results by - over a hosted table. */
+export const RERANK_QUESTION_PARAM =
+  "The question you are answering, in the words it was asked. With it, over a hosted table, the " +
+  "platform's grader orders the hits for that question - a search takes a wider pool and returns the " +
+  "k it puts first - before they come back.";
+
+/** What introduces the start-up overview in the `sql` description: every
+ * table in a line, no card, when the cards do not fit as they are. */
+const OVERVIEW_PREAMBLE =
+  " The database's tables, one line each - no card is shown until a question needs one: call " +
+  "describe_columns with your question for the cards of the tables it needs, then with a table for its " +
+  "columns:\n";
+
+/** The lookup's `question` parameter, the loop's words word for word
+ * (the platform loop's text, DESCRIBE_COLUMNS_QUESTION_PARAM, held to it by
+ * test/loop-sentences.test.ts): one ranking for a lookup inside the loop
+ * and out. */
+export const DESCRIBE_COLUMNS_QUESTION_PARAM =
+  "What you need the columns for, in a sentence: the matching columns that question needs come first, " +
+  "best first, the rest after by rows with a value.";
+
+/** Whether the platform's rendering of the cards (`PromptCards`) leaves
+ * anything to describe_columns: a table it lists without its card, or a
+ * map entry (`<head>_*`, `(other columns)`, `(empty columns)`) standing in
+ * for columns it does not list whole. */
+export function promptCardsMap(rendered: PromptCards): boolean {
+  return (
+    rendered.listed.length > 0 ||
+    /"name": "(?:[^"]*_\*|\((?:other|empty) columns\))"/.test(rendered.cards)
+  );
+}
+
 /** Three rules the platform's retrieval loop writes its statements under
- * (ask/src/ask/surface.rs, `retrieval_system_prompt`), given to the caller
+ * (the platform loop's text, `retrieval_system_prompt`), given to the caller
  * too, because both write statements over the same tables (the owner,
  * 2026-09-30: "both inner and outer loops whenever you are changing the
  * prompts"). The first two are the loop's words, word for word.
@@ -342,6 +567,17 @@ export const KEEP_CONDITIONS_SENTENCE =
 export const RELATED_TO_SENTENCE =
   "A question asking what is related to something is a join or a question of meaning: include hybrid_search or " +
   "vector_search in the statement or the search. ";
+/** A question about a kind of language is one of meaning, whatever words it
+ * lists (2026-10-07): asked for rage over a product's poll answers, the caller
+ * listed "rage", "angry", "furious" and matched them as words, and missed the
+ * complaints that use none of them ("stop polling me"). Said beside
+ * `RELATED_TO_SENTENCE` in the rows' sql text, where a table has a vector;
+ * the loop carries the same sentence (the platform loop's text,
+ * `LANGUAGE_KIND_SENTENCE`). */
+export const LANGUAGE_KIND_SENTENCE =
+  "A question about a kind of language - angry, frustrated, praising, confused - is a question of meaning however " +
+  "many example words it names: rank with hybrid_search or vector_search, the examples as its terms, never a keyword " +
+  "match alone. ";
 /** A question asking how many is answered with the counts: asked which
  * threats to species come up most, the Infino arm's answer had no numbers,
  * where the index-only and Snowflake arms gave a count per threat
@@ -350,6 +586,13 @@ export const RELATED_TO_SENTENCE =
 export const COUNTS_IN_THE_ANSWER =
   "A question that asks how many (a count, a total, which have the most) is answered with the aggregated values " +
   "themselves: a statement that returns each count beside the column naming its group, and an answer that states them.";
+
+/** The instructions with `TASK_CHECKLIST_SENTENCE` after them, whatever the
+ * table: a habit of finishing a task, not of reading any one shape. */
+export function withTaskChecklist(instructions: string): string {
+  return `${instructions}\n${TASK_CHECKLIST_SENTENCE}`;
+}
+
 /** The whole question in one statement (the owner, 2026-10-01: "put as
  * much as it can into a single query"). Asked which news organisations the
  * Wikipedia articles cite most and which subjects cite them, the Infino arm
@@ -359,7 +602,7 @@ export const COUNTS_IN_THE_ANSWER =
  * and ranked per outlet with ROW_NUMBER(), answered both parts in 0.28 s on
  * the platform. Worded with no search function's name, since a table with no
  * full-text column is told none. The loop's text carries the same sentence
- * (ask/src/ask/surface.rs, `SQL_ONE_STATEMENT`). */
+ * (the platform loop's text, `SQL_ONE_STATEMENT`). */
 export const ONE_STATEMENT_SENTENCE =
   "Put as much of the question as you can into one statement: WITH, UNION ALL, joins, CASE, GROUP BY and window " +
   "functions such as ROW_NUMBER() OVER (PARTITION BY ...) compose in one, so a question in several parts - several " +
@@ -379,21 +622,8 @@ export function severalTermsSentence(table: string, column: string): string {
     `token_match('${table}','${column}','b','and') - so a row holding two of them counts for both. `
   );
 }
-/** What an ask is: a targeted question, never the caller's own passed on
- * (the owner, 2026-10-01: "its questions should be targeted and not just a
- * repeat of its task question it needs to think clearly about what it wants
- * the subagent to answer"). Measured on the demo the same day: asked for
- * "articles about brexit by indian authors", Sonnet's ask was "articles
- * about Brexit written by Indian authors or editors" - the question back -
- * and the loop found no statement that answered it in four turns; the run
- * before, its asks named what to fetch ("Find articles about Brexit ... For
- * each article, return the url, name, editor name ... the top 20") and came
- * back with rows. Said beside PREFER_SEVERAL_ASKS wherever that is said. */
-export const TARGETED_ASKS =
-  "Each ask is a targeted question, never your own question passed on: decide first what you need back to answer - " +
-  "which rows, which counts, which columns, over which part of the data - and ask for exactly that.";
 /** The regex functions of the platform's dialect, for a table of rows; the
- * loop's dialect note (ask/src/ask/surface.rs, `SQL_DIALECT_NOTE`) carries
+ * loop's dialect note (the platform loop's text, `SQL_DIALECT_NOTE`) carries
  * the same sentence. Models write regexp_extract, which Snowflake, Spark and
  * BigQuery have and DataFusion does not: it appeared in the demo's Wikipedia
  * statements on every host since 2026-09-25, and on 2026-10-01 a caller lost
@@ -405,6 +635,16 @@ export const ROWS_REGEX_SENTENCE =
   "The dialect is Apache DataFusion, which has no regexp_extract: regexp_match(text, 'pattern')[1] is the first " +
   "capture group of the first match alone (NULL where nothing matches), so a pattern of alternatives yields one of " +
   "them per row and never counts several, regexp_like(text, 'pattern') tests and regexp_replace rewrites. ";
+/** A row's `_id` in a statement, for a table of rows; the loop's dialect note
+ * (the platform loop's text, `SQL_DIALECT_NOTE`) carries the same sentence,
+ * word for word. The id is 32 digits, a DECIMAL(38, 0): written bare, the
+ * engine reads it as a float and the statement fails with "Cannot cast to
+ * Decimal128(38, 15). Overflowing" - on the OfficeQA benchmark (2026-10-06)
+ * the caller wrote `WHERE _id = 3299...` to reread a row it had found and
+ * lost the turn. Quoted, it compares exactly. */
+export const ROWS_ID_SENTENCE =
+  "A row id is too wide for a number: compare it as a string, _id = '32995980872922260363525666898294', or the " +
+  "query fails on overflow. ";
 
 /** A `card` TOOL was built and measured first and is deliberately not here.
  * Registered, offered and working, it was simply not called: asked a real
@@ -444,6 +684,7 @@ export const SQL_DESCRIPTION =
   RELATED_TO_SENTENCE +
   KEEP_CONDITIONS_SENTENCE +
   ONE_STATEMENT_SENTENCE +
+  SEARCH_RULE_SENTENCE +
   `bm25_search('${TABLE}','content','terms', k) is keyword only: reach for it when the topic ` +
   "is itself a literal string you know appears in the source and you want counts a reader can " +
   `check as occurrences. vector_search('${TABLE}','embedding', {{q}}, k) is meaning alone - for a ` +
@@ -465,7 +706,7 @@ export const SQL_DESCRIPTION =
   // question like this as an example for the inner and outer models in our
   // tool descriptions? ... do it"). Run on the platform before it was
   // written here; the inner loop's sql text carries the same shape in its
-  // table's names (ask/src/ask/surface.rs `worked_example`).
+  // table's names (the platform loop's text `worked_example`).
   "The whole question as one statement, each clause one job - filter, keyword and meaning search, " +
   "group, count - with your own words in place of the example's: SELECT path, SUM(end_line - start_line + 1) " +
   `AS ranked_lines, COUNT(*) AS chunks FROM hybrid_search('${TABLE}','content','merge small superfiles','embedding', {{q}}, 300) WHERE ` +
@@ -501,7 +742,8 @@ export const SQL_DESCRIPTION =
   // platform before it was written here.
   "sql is also how you READ here, and never the shell, Grep or Read - with the search functions doing " +
   `the finding: the lines of a file, SELECT start_line, content FROM ${TABLE} WHERE path = 'src/x.rs' ORDER BY ` +
-  "start_line (a stretch: AND start_line BETWEEN 380 AND 440); every place a phrase occurs, complete and " +
+  "start_line (a stretch: AND start_line BETWEEN 380 AND 440), and whole files the index named with read, " +
+  "several in one call; every place a phrase occurs, complete and " +
   `unranked, token_match('${TABLE}', 'content', 'the terms', 'and') - how often, SELECT count(*) FROM ` +
   `token_match('${TABLE}', 'content', 'the terms', 'and') WHERE path LIKE 'x/%'; the lines about something, ` +
   "ranked, bm25_search or hybrid_search as above; what a long file or log is made of, the shell's " +
@@ -541,9 +783,73 @@ export const SQL_DESCRIPTION =
 // scan discouraged by every predicate that reaches for it. Measure before
 // polishing, as with the text above.
 
-/** The columns of a shape as `name type` pairs. */
-function columnList(shape: TableShape): string {
-  return shape.columns.map((c) => `${c.name} ${c.type}`).join(", ");
+/** The card's entries when the card was laid out within a budget (fewer
+ * entries than the table has columns): the columns it names whole, and the
+ * entries standing for the rest. Null when there is no card or the card
+ * lists every column, where the schema is the list. */
+function cardEntries(shape: TableShape): CardColumn[] | null {
+  const schema = shape.card?.schema;
+  if (!Array.isArray(schema) || schema.length === 0 || schema.length >= shape.columns.length) return null;
+  return (schema as CardColumn[]).filter((c) => typeof c?.name === "string");
+}
+
+/** The columns of a shape as `name type` pairs - of a card laid out within
+ * a budget, the columns it names whole and each map entry with what it
+ * says, so a wide table's text is as long as its budget, not its width. */
+export function columnList(shape: TableShape): string {
+  const entries = cardEntries(shape);
+  if (!entries) return shape.columns.map((c) => `${c.name} ${c.type}`).join(", ");
+  const types = new Map(shape.columns.map((c) => [c.name, c.type]));
+  return entries
+    .map((c) => (isMapEntry(c) ? `${c.name}: ${c.description ?? ""}`.trimEnd() : `${c.name} ${types.get(c.name) ?? c.type ?? ""}`.trimEnd()))
+    .join(", ");
+}
+
+/** How many columns the sql text names of another table whose card does not
+ * lay its columns out. Every column of every such table went in whole, and
+ * on a database of over a hundred tables (2026-11-05) the newly loaded tables with no card yet, a few
+ * thousand columns each, made the sql text 16.8 MB: past the 16 MB Claude
+ * Code takes in one message from a server, so every session started with no
+ * tools at all. */
+export const SIBLING_COLUMNS_SHOWN = 100;
+
+/** A sibling table's columns for the sql text: `columnList`, but a table
+ * the card does not lay out names its first `max` columns and counts the
+ * rest. */
+export function siblingColumnList(shape: TableShape, max: number = SIBLING_COLUMNS_SHOWN): string {
+  if (cardEntries(shape) || shape.columns.length <= max) return columnList(shape);
+  const shown = shape.columns.slice(0, max).map((c) => `${c.name} ${c.type}`).join(", ");
+  return `${shown}, and ${shape.columns.length - max} more columns not listed here (SELECT * FROM ${shape.table} LIMIT 1 names them)`;
+}
+
+/** The scalar columns a tool's text names: of a card laid out within a
+ * budget, the ones it names whole. */
+function scalarsShown(shape: TableShape): string[] {
+  const entries = cardEntries(shape);
+  if (!entries) return shape.scalarColumns;
+  const named = new Set(entries.filter((c) => !isMapEntry(c)).map((c) => c.name));
+  return shape.scalarColumns.filter((name) => named.has(name));
+}
+
+/** The list columns the sql text names: of a card laid out within a budget,
+ * the ones it names whole - a list column with no value in any row sits in
+ * the card's empty entry, and naming it as a list to unnest drew a question
+ * about tools to it. */
+function listColumnsShown(shape: TableShape): string[] {
+  const entries = cardEntries(shape);
+  if (!entries) return shape.listColumns;
+  const named = new Set(entries.filter((c) => !isMapEntry(c)).map((c) => c.name));
+  return shape.listColumns.filter((name) => named.has(name));
+}
+
+/** The full-text columns a tool's text names: the first TEXT_COLUMNS_LISTED
+ * in the table's order, and how many more describe_columns lists. */
+export function textColumnsPhrase(shape: TableShape): string {
+  const ordered = shape.textColumns;
+  if (ordered.length === 0) return "none";
+  const named = ordered.slice(0, TEXT_COLUMNS_LISTED);
+  const more = ordered.length - named.length;
+  return more > 0 ? `${named.join(", ")} and ${more} more (describe_columns("${shape.table}", "*") lists them)` : named.join(", ");
 }
 
 /** A scalar column to write the examples with - not the key, so a filter or
@@ -590,21 +896,8 @@ export const CALLS_TOGETHER =
   "call with queries, or side by side; and once the index has named the files, read them with read, " +
   "every path in one call, never one Read per file.";
 
-/** The fan-out as a preference, not a permission. "Spawn several in
- * parallel for independent questions" said the parallel call was allowed;
- * the outer model kept asking one broad question and waiting, or walking
- * the files itself between asks. Several asks in one reply are the cheaper
- * shape on every axis - the wait is the slowest of them, not the sum, and
- * every ask replaces a turn of the outer model's own searching, which
- * re-sends the whole transcript. One sentence, shared by the instructions
- * and the ask tool's own text on both table shapes. */
-export const PREFER_SEVERAL_ASKS =
-  "Prefer several asks in one reply, one per part of the question, over one broad ask or a chain of " +
-  "your own searches. Ask narrow: one named thing, one mechanism, one file's role per ask - a narrow " +
-  "ask comes back in seconds with the lines, a broad one comes back thin and sends you looking yourself.";
-
 /** The tools' names as a client lists them, not as these instructions write
- * them. The instructions and every tool text say "ask", "sql", "find" - the
+ * them. The instructions and every tool text say "search", "sql", "find" - the
  * bare names - and Claude Code registers each tool as `mcp__code-context__<name>`;
  * a model that copies the bare name is refused ("No such tool available:
  * sql"), spends the turn, and calls again under the full name. Measured on
@@ -614,7 +907,7 @@ export const PREFER_SEVERAL_ASKS =
  * variant of the instructions (`withListedNames`), since the instructions are
  * fixed before the client has named itself. */
 export const CALL_BY_LISTED_NAME =
-  "Call each tool by the name your client lists for it - in Claude Code that is mcp__code-context__ask, " +
+  "Call each tool by the name your client lists for it - in Claude Code that is mcp__code-context__search, " +
   "mcp__code-context__sql, mcp__code-context__find and so on - never by the bare name written here, which " +
   "the client refuses as no such tool.";
 
@@ -627,7 +920,7 @@ export function withListedNames(instructions: string): string {
  * first. Claude Code's own prompt prefers dedicated file and search tools
  * over shell commands, and Grep and Glob are as dedicated as ours, so
  * nothing the model read ranked them - a code question still went to Bash
- * again and again beside its asks. One sentence sets the order and names
+ * again and again beside its index calls. One sentence sets the order and names
  * the tools this server actually registers; Read keeps its place, the tool
  * for a hit marked truncated. A rows table has no files behind it and does
  * not carry the sentence. */
@@ -685,54 +978,6 @@ export function findHint(query: string, total: number, defines: boolean, withTex
   return null;
 }
 
-/** Where an `answer` call's text is kept, under the index directory. */
-const ANSWERS_DIR = "answers";
-/** Heads the model's narration in the writer's context, when the installed
- * hook supplied it. */
-const NARRATION_HEADING = "What the model said while it gathered the rows:";
-
-/** The routing line for `answer`, by how the answer reaches the person. */
-export function answerInstruction(display: AnswerDisplay): string {
-  const tail =
-    display === "hook"
-      ? "it writes the answer from the rows and shows it to the user itself; then reply with one short sentence and nothing else."
-      : "it writes the answer from the rows; reply with its text exactly as returned, in full, and nothing else.";
-  // Imperative, because a model that has the rows in front of it is tempted
-  // to write: Haiku did on one question in three on the demo (2026-09-21),
-  // where Sonnet and Opus called the tool every time.
-  return (
-    `- answer - REQUIRED after retrieving: never write the answer yourself. Once you have what the question needs, ` +
-    `call answer with the question alone - the writer already has every row this server returned to you: ${tail}\n`
-  );
-}
-
-/** The `answer` tool's description, by display mode and table shape. The
- * model is asked for the question and nothing else: the rows it was shown
- * are on this server's record, and what it said as it worked reaches the
- * writer through the installed hook (commands/hook-cmd.ts). A model asked to
- * restate what it found typed 4,000 characters of notes, 26 s of a 45 s run
- * (measured 2026-09-21), for the writer to read what the server already had.
- *
- * Nothing here, or in the tool's inputs, says how the hook works or names
- * the model's thinking: Opus 5's safeguards refused a whole session at its
- * first request, before any tool call, over an input described as "what you
- * said and thought while gathering" (`reasoning_extraction`, 2026-09-21).
- * The hook is the installer's business; the model is told what to do. */
-export function answerDescription(display: AnswerDisplay, rows: boolean): string {
-  const from = rows
-    ? "the rows this server returned to you in this session"
-    : "the rows this server returned to you in this session, read back from the index with their lines";
-  const delivery =
-    display === "hook"
-      ? "The finished answer is shown to the user directly by this tool, and returned to you so you have it for what the user asks next. After it returns, reply with one short sentence such as 'The answer is shown above.' and nothing else - do not repeat, summarize or rewrite the answer."
-      : "It returns the finished answer. Reply with that text exactly as returned, in full, and nothing else - do not summarize or rewrite it.";
-  return (
-    `Write the final answer to the question, by the platform's own writer, from ${from} - every ask, search, find and sql - with checked citations. ` +
-    "This is how a question is answered here: never write the answer yourself. Once you have what the question needs, " +
-    `call this tool with the question. Do not restate what you found: the writer has the rows. ${delivery}`
-  );
-}
-
 /** What `sql` says about itself when the card and the verdict are tools
  * rather than parts of it (CX_API_TOOLS). */
 const API_TOOLS_SQL_NOTE =
@@ -767,55 +1012,182 @@ export function isLogIndex(manifest: { languages?: Record<string, number>; chunk
   return logs > 0 && logs * 2 > total;
 }
 
-/** The instructions for an index of log files, in the words of the thing
+/** What the instructions say for one shape of index - a code checkout, a
+ * directory of logs, a hosted table of another shape, a table the platform
+ * could not describe: the opening frame, the tool lines in the order the
+ * shape wants them read, what comes before the sweep sentence, what a hit
+ * is and how it is cited, and the closing clauses. One builder,
+ * `instructionsFor`, lays every shape out the same way, so a sentence every
+ * shape needs - the sweep, the counts, the choosing among several tables,
+ * the describe_columns line - is added once and
+ * reaches them all. The texts were four, each edited where a failure
+ * showed, and they drifted: the rows text had one sql handoff from
+ * 2026-09-11 and the code text another from 2026-09-24; the code text with
+ * sibling tables never
+ * said the question may be about any of them. Each shape's own measured
+ * sentences are kept as they were; what the shapes share is said once. */
+export interface InstructionSurface {
+  /** The opening, ending in a period: what code-context is an index of and
+   * what the first move is. The builder follows it with the choosing
+   * sentence when the index spans several tables, then the tool lines. */
+  frame: string;
+  /** The tool lines, each `- name - ...` ending in a newline, in the order
+   * the shape wants them read; empty for a shape with nothing to route. */
+  doors: string[];
+  /** What is said between the tool lines and the sweep sentence: the
+   * index-first sentence of a checkout, the start-with paragraph of the
+   * logs; ends in a newline, or is empty. */
+  beforeSweep: string;
+  /** What a hit is and how a place is cited, ending in a period; empty for
+   * a shape with no hits. */
+  hits: string;
+  /** The closing sentences, each ending in a period. */
+  tail: string[];
+  /** Said after the sweep sentence, on its line: how independent calls are
+   * made together (`CALLS_TOGETHER`), where the shape's tools batch. */
+  afterSweep?: string;
+}
+
+/** What a surface is built with beyond its shape: whether describe_columns
+ * is registered. */
+export interface SurfaceOptions {
+  describeColumns?: boolean;
+}
+
+/** The instructions for `surface`, the one layout every shape takes: the
+ * frame, the choosing sentence when the index spans several tables, "Which
+ * tool for which question", the tool lines, what comes before the sweep,
+ * the sweep sentence, the hits sentence and the closing clauses. A surface
+ * with no tool lines is its frame alone. */
+export function instructionsFor(surface: InstructionSurface, siblings: readonly string[] = [], hostFiles = true): string {
+  // A server that reads no files on its host (`hostFiles`, false over
+  // HTTP) offers no 'path', so its text names none.
+  const offersPath = (sentence: string): boolean => sentence === PATH_OPTION_CODE || sentence === PATH_OPTION_ROWS;
+  const frame = hostFiles ? surface.frame : surface.frame.replace(` ${PATH_OPTION_ROWS}`, "");
+  if (surface.doors.length === 0) return frame;
+  const several = siblings.length > 0 ? SEVERAL_TABLES_SENTENCE : "";
+  const closing = [surface.hits, ...surface.tail.filter((sentence) => hostFiles || !offersPath(sentence))]
+    .filter((sentence) => sentence !== "")
+    .join(" ");
+  return (
+    `${frame}${several} Which tool for which question:\n` +
+    surface.doors.join("") +
+    surface.beforeSweep +
+    `${SWEEP_TO_A_TOOL}${surface.afterSweep ? ` ${surface.afterSweep}` : ""}\n` +
+    closing
+  );
+}
+
+/** The optional root every tool takes, as a checkout's text says it. */
+const PATH_OPTION_CODE = "Every tool takes an optional 'path' (an absolute repo root) to target another repository.";
+/** The same option as a hosted table's text says it: a repository's local
+ * index stands in for the table. */
+const PATH_OPTION_ROWS =
+  "Every tool takes an optional 'path' (an absolute repo root) to target a repository instead, whose local " +
+  "code index it then reads.";
+/** What a `partial` marker on a result means, over an index with a file cap. */
+const PARTIAL_MARKER_SENTENCE =
+  "A 'partial' marker means files over the index cap were left out, so a missing match is not proof of absence.";
+/** The describe_columns line, one wording over every shape whose sql text
+ * folds a laid-out card in. */
+export const DESCRIBE_COLUMNS_LINE =
+  "- describe_columns - the entries of a wide table's columns the sql text maps rather than lists, whole, " +
+  "and on a table whose card names a `kind_column` which kinds of record hold a value in each column: by a " +
+  "family's prefix (`property_*`), a column's name, or `*`; call it before a statement names a mapped " +
+  "column, and before counting a column of a table with a `kind_column`.\n";
+
+/** The surface of a code checkout. The first move was ls and cat CLAUDE.md,
+ * every run, before any of these tools (the demo, 2026-09-24): the model
+ * looks around a checkout it has been told nothing about. It has been
+ * told: the table's columns, what is in it and how to read it are in the
+ * sql tool's text, so the looking around is named as not needed. */
+export function codeSurface(table: string, siblings: readonly string[], options: SurfaceOptions = {}): InstructionSurface {
+  const { describeColumns = false } = options;
+  return {
+    frame:
+      "code-context is a local index of this repository: every file's lines are in it" +
+      (siblings.length > 0
+        ? `, and beside it in the same database the tables ${siblings.join(", ")}, which one sql statement joins with it`
+        : "") +
+      ", and what the repository holds is in the sql tool's text, so begin with these tools, not with ls, " +
+      "cat or a look at CLAUDE.md.",
+    doors: [
+      "- find - every line containing an exact string, where you would grep.\n",
+      "- search - how does X work, where is Y handled, code by meaning.\n",
+      "- sql - counts, rankings, and aggregates across the repo, " +
+        "Ranking files by how much of them is about a topic goes through hybrid_search, not bm25, when the " +
+        "topic is a concept; a total over a search relation is the top k's matched lines, never a file's " +
+        "length - sizes and whole-repo counts come from the chunks table with no search function.\n",
+      "- read - the numbered lines of the files the index named, several paths in one call; a range with from and to.\n",
+      ...(describeColumns ? [DESCRIBE_COLUMNS_LINE] : []),
+    ],
+    beforeSweep: `${indexFirst(table)}\n`,
+    hits:
+      "Hits carry the code: when a hit answers the question, answer from it. A hit's content shows " +
+      "each line with its own number in the file, so cite a place as path:line or path:start-end " +
+      "from those numbers and only where the thing you name sits - never the hit's whole line " +
+      "range, which spans the chunk.",
+    tail: [
+      CITE_EXACTLY,
+      CITE_FROM_HIT.trim(),
+      COUNTS_IN_THE_ANSWER,
+      "Read the files the index named with read, every path in one call; Claude's own Read only for a hit marked truncated.",
+      PATH_OPTION_CODE,
+      PARTIAL_MARKER_SENTENCE,
+    ],
+    afterSweep: CALLS_TOGETHER,
+  };
+}
+
+/** The instructions of a code checkout (`codeSurface`). */
+export function codeInstructions(table: string, siblings: readonly string[], options: SurfaceOptions = {}): string {
+  return instructionsFor(codeSurface(table, siblings, options), siblings);
+}
+
+/** The surface of an index of log files, in the words of the thing
  * indexed. The code instructions say "this repository" and "code", and on
  * the demo's CI-logs corpus (2026-09-23) Opus read a folder of `.log` files
  * as not that: three arms, three Bash-only runs, zero calls to find,
- * search, sql or ask, with "Look with the index first" in front of it. The
- * owner: "we need to somehow tell claude to use our tools even for logs";
- * and, on the order, "maybe it should try find or sql first and then try
- * ask etc for broader questions. but just going to bash is not what i
- * meant." So: the tools named for logs, find and sql first, ask for the
- * questions that span the logs, and the one thing not to do said plainly. */
-export function logIndexInstructions(agentTools: boolean, files: number, chunks: number): string {
-  return (
-    `code-context is an index of the ${files} log files in this directory - every line of every log, in ` +
-    // The first move on the demo (2026-09-24) was `ls -S` of the directory,
-    // then grep, and twelve Bash calls with none of these tools; it was
-    // never told the looking around was not needed.
-    `${chunks} windows. Begin with these tools, not with ls or a look at the directory: what the logs hold ` +
-    "is here. Which tool for which question:\n" +
-    "- find - every line in every log containing an exact string (an error text, a test name, a step name), " +
-    "with the count per log, and with context the lines around each - what grep -B/-A shows. Where you would " +
-    "grep, use this.\n" +
-    "- search - which log windows are about X: exact terms and meaning in one ranked pass over every log.\n" +
-    "- sql - counts and rankings across the logs in one statement: which logs mention X and how many lines " +
-    "each (rank through bm25_search or hybrid_search over the chunks table and GROUP BY path) - and the lines " +
-    "themselves: what fills a log, how often a pattern occurs, the kinds of error. The statements are in the " +
-    "sql tool's text; they replace the shell's grep, cut, sort and uniq.\n" +
-    (agentTools
-      ? "- ask - a question or task in plain language over all the logs; returns the log lines it retrieved " +
-        "(facts with path:line and the text), not an answer: compose from them. Spawn several in parallel for " +
-        "independent questions, and use it for any question that is not one literal or one count you can " +
-        "already write.\n"
-      : "") +
-    "Start with find or sql - a literal, a count, a ranking across the logs" +
-    (agentTools ? " - and use ask for a question that spans the logs. " : ". ") +
-    "Do not open, read or grep the log files with Bash, Grep or Read: the index holds every line of every log " +
-    "and answers in one call, and a single log here can run to tens of thousands of lines. A hit marked " +
-    "truncated is its window, one sql statement away. A find that lists places without their text is a flood: every place is " +
-    "listed, the text of any line is one sql statement away, and the next move is narrower terms, under, " +
-    "or a count with sql - never the shell.\n" +
-    SWEEP_TO_A_TOOL +
-    "\n" +
-    "Hits carry the lines: when a hit answers the question, answer from it. A hit's content shows each line " +
-    "with its own number in the file, so cite a place as path:line or path:start-end from those numbers and " +
-    "only where the thing you name sits - never the hit's whole line range, which spans the window. " +
-    CITE_EXACTLY +
-    CITE_FROM_HIT +
-    ` ${COUNTS_IN_THE_ANSWER}` +
-    " A 'partial' marker means files over the index cap were left out, so a missing match is not proof of absence."
-  );
+ * search or sql, with "Look with the index first" in front of it. So: the
+ * tools named for logs, find and sql first, and the one thing not to do
+ * said plainly. */
+export function logSurface(files: number, chunks: number): InstructionSurface {
+  return {
+    frame:
+      `code-context is an index of the ${files} log files in this directory - every line of every log, in ` +
+      // The first move on the demo (2026-09-24) was `ls -S` of the directory,
+      // then grep, and twelve Bash calls with none of these tools; it was
+      // never told the looking around was not needed.
+      `${chunks} windows. Begin with these tools, not with ls or a look at the directory: what the logs hold ` +
+      "is here.",
+    doors: [
+      "- find - every line in every log containing an exact string (an error text, a test name, a step name), " +
+        "with the count per log, and with context the lines around each - what grep -B/-A shows. Where you would " +
+        "grep, use this.\n",
+      "- search - which log windows are about X: exact terms and meaning in one ranked pass over every log.\n",
+      "- sql - counts and rankings across the logs in one statement: which logs mention X and how many lines " +
+        "each (rank through bm25_search or hybrid_search over the chunks table and GROUP BY path) - and the lines " +
+        "themselves: what fills a log, how often a pattern occurs, the kinds of error. The statements are in the " +
+        "sql tool's text; they replace the shell's grep, cut, sort and uniq.\n",
+    ],
+    beforeSweep:
+      "Start with find or sql - a literal, a count, a ranking across the logs. " +
+      "Do not open, read or grep the log files with Bash, Grep or Read: the index holds every line of every log " +
+      "and answers in one call, and a single log here can run to tens of thousands of lines. A hit marked " +
+      "truncated is its window, one sql statement away. A find that lists places without their text is a flood: every place is " +
+      "listed, the text of any line is one sql statement away, and the next move is narrower terms, under, " +
+      "or a count with sql - never the shell.\n",
+    hits:
+      "Hits carry the lines: when a hit answers the question, answer from it. A hit's content shows each line " +
+      "with its own number in the file, so cite a place as path:line or path:start-end from those numbers and " +
+      "only where the thing you name sits - never the hit's whole line range, which spans the window.",
+    tail: [CITE_EXACTLY, CITE_FROM_HIT.trim(), COUNTS_IN_THE_ANSWER, PARTIAL_MARKER_SENTENCE],
+  };
+}
+
+/** The instructions of an index of logs (`logSurface`). */
+export function logIndexInstructions(files: number, chunks: number): string {
+  return instructionsFor(logSurface(files, chunks));
 }
 
 /** What `sql` says about the sibling tables: each one's columns as the
@@ -830,6 +1202,30 @@ export function logIndexInstructions(agentTools: boolean, files: number, chunks:
  * it (2026-09-24). Stated as a rule, in the sql text and the instructions,
  * because the softer "call join_keys first" was measured skipped. */
 export const JOIN_KEYS_RULE = "YOU MUST CALL join_keys BEFORE ANY sql CALL IF THE QUERY INVOLVES MORE THAN ONE TABLE.";
+
+/** The graph the platform keeps over these tables - every row linked to
+ * the rows it shares a verified key value with, and to what its text names
+ * - and the two functions that walk it, said in the sibling text as rules
+ * for WHEN each is the move, with the seed statement written out. The
+ * first wording described the functions and was measured unused: eight
+ * cross-table questions on the SWE corpus, Opus, zero walk calls, the
+ * model writing the same joins it wrote without the graph (2026-10-03).
+ * The same text is the inner loop's `SQL_GRAPH_WALK`. */
+export const GRAPH_WALK_SENTENCE =
+  " The platform also keeps a graph over these tables: each row is linked to the rows it shares a " +
+  "key value with and, where a text column was read, to the names its text mentions (a test, a " +
+  "module, an error type), so rows that mention the same thing are linked through it. USE " +
+  "graph_walk, NOT A JOIN, WHEN THE QUESTION STARTS FROM PARTICULAR ROWS AND ASKS WHAT IS " +
+  "CONNECTED TO THEM across more than one table or more than one link: the log of an issue and " +
+  "the code that log names, the issues that mention the same failing test or module as these, " +
+  "the code behind these failures. First get the seeds - SELECT _id, ... FROM <table> WHERE ... - " +
+  "then SELECT * FROM graph_walk('<table to return>', '<table of the seeds>', [<_id>, ...], hops, " +
+  "k): the rows of that table within `hops` links of the seeds, with their columns and a score, " +
+  "the hop count; two hops is one shared key or one shared mention, four is two. USE graph_rank " +
+  "WITH THE SAME ARGUMENTS WHEN THE QUESTION ASKS WHICH ROWS MATTER MOST FOR THOSE SEEDS - the " +
+  "files or tests behind the most of these issues: the same rows ordered by how strongly the " +
+  "seeds point at them. Neither needs a join_keys call, and WHERE, GROUP BY and a JOIN compose " +
+  "with both like with a search.";
 
 /** Whether a statement over `primary` and its siblings can have a search in
  * it: some table among them has a full-text column, or could not be
@@ -863,18 +1259,7 @@ export function cardMeanings(card: RowRecord | undefined): string {
       const structure = typeof col.structure === "string" ? col.structure : "";
       const values = col.values && typeof col.values === "object" ? Object.entries(col.values as Record<string, unknown>) : [];
       const codes = values.map(([code, meaning]) => `${JSON.stringify(code)} = ${String(meaning)}`).join("; ");
-      // The JSON field the column was measured to hold, and the one named
-      // like it that it does not: what its name alone gets wrong - a
-      // `lastvisit` column that holds `metadata.auto.lastupdated`.
-      const equals = typeof col.equals_field === "string" ? col.equals_field : "";
-      const differs = typeof col.differs_from_field === "string" ? col.differs_from_field : "";
-      const said = [
-        description,
-        structure ? `structure: ${structure}` : "",
-        codes ? `codes: ${codes}` : "",
-        equals ? `equals_field: ${equals}` : "",
-        differs ? `differs_from_field: ${differs}` : "",
-      ]
+      const said = [description, structure ? `structure: ${structure}` : "", codes ? `codes: ${codes}` : ""]
         .filter(Boolean)
         .join(", ");
       return said ? `${String(col.name)}${synonyms.length ? ` (${synonyms.join(", ")})` : ""}: ${said}` : "";
@@ -893,10 +1278,10 @@ export function carriesSemantics(card: RowRecord | undefined): boolean {
   return schema.some((col: Record<string, unknown>) => typeof col?.description === "string" && col.description !== "");
 }
 
-export function siblingsNote(table: string, siblings: TableShape[], unresolved: string[], notes: string, searchable = true, semantics = false): string {
+export function siblingsNote(table: string, siblings: TableShape[], unresolved: string[], searchable = true, semantics = false): string {
   const described = siblings.map(
     (s) =>
-      `${s.table}(${columnList(s)})` +
+      `${s.table}(${siblingColumnList(s)})` +
       (s.textColumns.length ? `, full-text indexed on ${s.textColumns.join(", ")}` : "") +
       (s.vectorColumn ? `, vector column ${s.vectorColumn}` : ""),
   );
@@ -915,6 +1300,10 @@ export function siblingsNote(table: string, siblings: TableShape[], unresolved: 
     // call: "it's not forceful enough").
     ` ${JOIN_KEYS_RULE}` +
     ` Also in this database, and joinable with ${table} in one statement: ${described.join("; ")}.` +
+    // The same sentence the loop reads over several tables: a question may
+    // be about any one of them, and a statement over that table alone is
+    // the answer when it is.
+    SEVERAL_TABLES_SENTENCE +
     (unresolved.length ? ` (${unresolved.join(", ")} could not be described when this server started; name them by their columns as you know them.)` : "") +
     ` Every statement here runs on the platform, so a JOIN, a subquery or a UNION across these tables is one call, ` +
     (searchable
@@ -933,7 +1322,8 @@ export function siblingsNote(table: string, siblings: TableShape[], unresolved: 
     (semantics
       ? "Call join_keys with the tables first and paste its predicate into ON."
       : "The keys are not written here: call join_keys with the tables first and paste its predicate into ON.") +
-    (notes ? ` ${notes}` : "") +
+    GRAPH_WALK_SENTENCE +
+    CONNECTED_SENTENCE +
     (meanings.length ? ` What the other tables hold, from their cards: ${meanings.join(" ")}` : "")
   );
 }
@@ -941,42 +1331,56 @@ export function siblingsNote(table: string, siblings: TableShape[], unresolved: 
 /** The routing line for a server with sibling tables. `searchable` is
  * `siblingsSearchable`'s answer: without a full-text column among the
  * tables, the JOIN has no search functions to hold. */
-export function siblingsInstruction(table: string, siblings: string[], agentTools: boolean, searchable = true): string {
+export function siblingsInstruction(table: string, siblings: string[], searchable = true): string {
   const names = siblings.join(", ");
-  // Ask first across the tables: the loop sees their cards and writes the
-  // joins itself, several statements at once; the model's own sql is for
-  // one statement it already knows (the owner, 2026-09-24).
   // The keys are join_keys's to return, never written here or in the sql
   // text, so a statement across tables never guesses a key from a column
   // name and never reads one we typed.
   // "Sees every one of them": it said "all three", the count of the corpus
   // it was written on, and the Berka corpus has eight tables.
-  return agentTools
-    ? `\n- ${JOIN_KEYS_RULE} A question that touches two of these tables - ${table}, ${names} - is an ask first: the loop sees every ` +
-        "one of them, writes the joins itself, several statements at once, and returns the rows. sql joins them too, " +
-        "for one statement you already know: call join_keys with the tables for the keys, then write the JOIN; " +
-        "their columns and the statement's shape are in the sql tool's text. Never one query per table, never a " +
-        "walk through files.\n"
-    : `\n- ${JOIN_KEYS_RULE} sql also joins ${table} with ${names} in one statement - a question that touches two of these tables ` +
+  // A question about one of the tables alone is a statement over that table
+  // alone, whichever it is: the text describes every one of them, and a
+  // reader who asks about the second table is not sent through the first.
+  const anyOne =
+    ` A question about one of these tables alone is answered over that table alone, whichever of ${table}, ${names} ` +
+    "it is: every one of them is described in the sql tool's text, and a wide one's mapped columns are one " +
+    "describe_columns away.";
+  return (
+    `\n- ${JOIN_KEYS_RULE} sql also joins ${table} with ${names} in one statement - a question that touches two of these tables ` +
         `is one JOIN, ${searchable ? "with the search functions inside it, " : ""}not one query per table and not a walk through ` +
         "files: call join_keys with the tables for the keys, then write the JOIN; their columns and the " +
-        "statement's shape are in the sql tool's text.\n";
+        `statement's shape are in the sql tool's text.${anyOne}${GRAPH_ROUTING_LINE}\n`
+  );
 }
 
-export function indexFirst(agentTools: boolean, table = "chunks"): string {
-  const tools = agentTools ? "find, search, sql and ask" : "find, search and sql";
+/** What a result carries that the model never asked for: the graph's
+ * addition (core/graph-expand.ts), named so the model reads it before
+ * writing another statement to reach the same rows. */
+export const CONNECTED_SENTENCE =
+  " A search's or a statement's result over one of these tables also carries `connected`: the rows of the " +
+  "other tables the platform's graph links to the result's rows, strongest first, each named by its table. " +
+  "Read them before writing another statement to reach them.";
+
+/** The routing form of `GRAPH_WALK_SENTENCE`, beside the join rule in the
+ * instructions as that rule is: which questions are a walk or a rank in
+ * sql rather than a chain of joins. The sql tool's text has the how. */
+export const GRAPH_ROUTING_LINE =
+  " A question that starts from particular rows and asks what is connected to them across these tables - " +
+  "the log of an issue and the code it names, the rows that mention the same thing - is graph_walk in sql, " +
+  "not a chain of joins; which rows matter most for those rows is graph_rank. The sql tool's text says how.";
+
+export function indexFirst(table = "chunks"): string {
+  const tools = "find, search and sql";
   // "only for what the index could not give you" left the model the judge
   // of what the index gives, and it judged reading a file's lines as not
   // that: on the demo's 64-project corpus (2026-09-24) a run ranked the
   // longest test logs with one sql JOIN and then read the logs with ten
   // Bash calls, wc, grep, tail and sed, when their lines were one statement
   // away. So the statement is written out, and the file tools are named as
-  // not the way to read (the owner: "instruction sentence only"). With ask
-  // on the surface it is the first of these: it runs the searches and the
-  // statements itself, several at once (the owner, 2026-09-24: "the outer
-  // model should be primed to use ask as much as possible").
+  // not the way to read (the owner: "instruction sentence only").
   return (
-    `Look with the index first${agentTools ? ", and ask first among these: it runs the searches and the statements itself, several at once, and returns the lines" : ""}: ${tools} cover every file in one call and return the lines themselves, ` +
+    `Look with the index first: ${tools} cover every file in one call and return the lines themselves, ` +
+    "the files they name are one read away, every path in one call, " +
     `and the lines of any file or row are one sql statement away (SELECT start_line, content FROM ${table} ` +
     "WHERE path = '...' ORDER BY start_line), and ranked when you want the lines about something rather " +
     `than all of them - hybrid_search, bm25_search or vector_search inside the statement (SELECT path, ` +
@@ -1013,7 +1417,7 @@ export function rowCitation(shape: TableShape): string {
 
 /** The `projection` the platform's loop is asked for over a table of rows:
  * the columns every search and find fact it returns carries in place of the
- * table's own keys (the worker's ask route sets them as the keys). The
+ * table's own keys (the platform's worker sets them as the keys). The
  * table's key, so a fact can be looked up by it; and where the table has a
  * link column, the link and the row's name, so a fact can be cited as its
  * link (`rowCitation`). Without them the loop's search and find facts on the
@@ -1030,7 +1434,7 @@ export function rowsProjection(shape: TableShape): string[] {
 }
 
 /** How an answer names a row and where the rest of the row is: the sentence
- * the instructions and the search and ask texts share. `from` is what the
+ * the instructions and the search text share. `from` is what the
  * caller holds - a search's hits, or the rows of a table that has none. */
 function citeRows(shape: TableShape, from = "hits"): string {
   return (
@@ -1057,55 +1461,60 @@ function noFullTextSentence(shape: TableShape): string {
   );
 }
 
-/** The sentence that offers `path`, where it is offered: a server that
- * reads this machine's other repositories (`hostFiles`). */
-const OTHER_REPO_SENTENCE = (hostFiles: boolean): string =>
-  hostFiles ? " Every tool takes an optional 'path' (an absolute repo root) to target a repository instead, whose local code index it then reads." : "";
-
-export function rowsInstructions(shape: TableShape, platformTools: boolean, hostFiles = true): string {
-  const { table, keyColumn: key, primaryText: text } = shape;
+/** The surface of a hosted table of another shape, built from the shape:
+ * the doors named with the table's own columns. */
+export function rowsSurface(shape: TableShape, siblings: readonly string[], options: SurfaceOptions = {}): InstructionSurface {
+  const { describeColumns = false } = options;
+  const { table, keyColumn: key, primaryText: text, vectorColumn } = shape;
   const rowIs = shape.chunking ? `one row per passage of a record's ${shape.chunking.column}` : "one row per record";
-  return (
-    `code-context is an index of the ${table} table, ${rowIs}. Which tool for which question:\n` +
-    // A table with no full-text column is offered neither door (see
-    // `searchDoors` in serveMcp), so the routing names neither.
-    (text
-      ? `- find - every row whose ${text} holds every word of an exact phrase, where you would grep: complete ` +
-    "and unranked, with the table-wide count.\n" +
-        `- search - which rows are about X: exact terms and meaning in one ranked pass over ${text}.\n`
-      : "") +
-    // On a table every question reads as counts and rankings, so the code
-    // text's sql line ("counts, rankings, filters") claimed all of them and
-    // the caller never delegated (zero ask on the first day's jobs runs,
-    // against a platform call every hour on the code corpora). The question
-    // shapes a table gets - who has the most X and where, what the rows
-    // about X ask for - are named on ask here, and sql is the tool for one
-    // statement the caller already knows.
-    "- sql - one statement you already know: a count, a filter, a lookup by " +
-    `${key}, a ranking in one SELECT. ` +
-    (text
-      ? "Ranking rows by how much they are about a topic goes through " +
-    "hybrid_search, not bm25, when the topic is a concept; a total over a search relation counts the top " +
-    `k, never the table - a complete count comes from token_match, a WHERE, or the ${table} table with no ` +
-        "search function.\n"
-      : `${noFullTextSentence(shape)}\n`) +
-    (platformTools
-      ? "- ask - a question or task in plain language about the rows - which rows are about X, how many and " +
-        `where, who has the most and where - it runs the ${text ? "searches and statements" : "statements"} itself and returns the rows ` +
-        `it retrieved (facts as rows, with their columns${text ? " and the text cut to snippets" : ""}), not an answer: compose ` +
-        `from them. ${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS}\n` +
-        "  A question that spans the table - who is hiring for X and what those roles ask for, how two groups " +
-        "of rows compare - is one ask per part: they run at the same time, and you compose from the rows " +
-        "they return.\n"
-      : "") +
-    `${SWEEP_TO_A_TOOL}\n` +
-    (text
+  // With tables beside it the index is of all of them, said so: an index
+  // "of the X table" with the others as its joinable siblings sent every
+  // question through X, and a question about the table beside it was
+  // answered from X's empty columns. The sentence on choosing among them
+  // is the builder's, after the frame.
+  const indexOf =
+    siblings.length > 0
+      ? `code-context is an index of the tables ${[table, ...siblings].join(", ")}, one database, ${rowIs} in each.`
+      : `code-context is an index of the ${table} table, ${rowIs}.`;
+  return {
+    frame: indexOf,
+    doors: [
+      // A table with no full-text column is offered neither door (see
+      // `searchDoors` in serveMcp), so the routing names neither.
+      ...(text
+        ? [
+            `- find - every row whose ${text} holds every word of an exact phrase, where you would grep: complete ` +
+              "and unranked, with the table-wide count.\n",
+            `- search - which rows are about X: exact terms and meaning in one ranked pass over ${text}.\n`,
+          ]
+        : []),
+      "- sql - one statement you already know: a count, a filter, a lookup by " +
+        `${key}, a ranking in one SELECT. ` +
+        // The rule for hybrid against keyword, where there is a vector to rank
+        // by; the terms-only wording stands where there is not.
+        (text && vectorColumn
+          ? `${SEARCH_RULE_SENTENCE.trimEnd()}\n`
+          : text
+          ? "Ranking rows by how much they are about a topic goes through " +
+            "hybrid_search, not bm25, when the topic is a concept; a total over a search relation counts the top " +
+            `k, never the table - a complete count comes from token_match, a WHERE, or the ${table} table with no ` +
+            "search function.\n"
+          : `${noFullTextSentence(shape)}\n`),
+      ...(shape.document ? [`- read - ${readDocumentsSentence(shape).trimEnd()}\n`] : []),
+      ...(describeColumns ? [DESCRIBE_COLUMNS_LINE] : []),
+    ],
+    beforeSweep: "",
+    hits: text
       ? `Hits are rows: a score, the row's ${key}, its scalar columns, and its text columns cut to a snippet of ` +
         `${SNIPPET_CHARS} characters. ${citeRows(shape)}`
-      : `Rows come back with the columns their statement selected. ${citeRows(shape, "rows")}`) +
-    ` ${COUNTS_IN_THE_ANSWER}` +
-    OTHER_REPO_SENTENCE(hostFiles)
-  );
+      : `Rows come back with the columns their statement selected. ${citeRows(shape, "rows")}`,
+    tail: [COUNTS_IN_THE_ANSWER, READING_HABITS, ARITHMETIC_SENTENCE, PATH_OPTION_ROWS],
+  };
+}
+
+/** The instructions of a hosted table of another shape (`rowsSurface`). */
+export function rowsInstructions(shape: TableShape, siblings: readonly string[] = []): string {
+  return instructionsFor(rowsSurface(shape, siblings), siblings);
 }
 
 export function rowsSearchDescription(shape: TableShape): string {
@@ -1118,10 +1527,10 @@ export function rowsSearchDescription(shape: TableShape): string {
   return (
     `Ranked search over the rows of ${table}, ${ranking}. Use it for which rows are about X, rows like ` +
     `this one, the best matches for a description. Each hit is a row: score, ${key}, the scalar columns ` +
-    `(${shape.scalarColumns.join(", ")}), and ${shape.textColumns.join(", ")} as snippets of at most ` +
+    `(${scalarsShown(shape).join(", ")}), and ${textColumnsPhrase(shape)} as snippets of at most ` +
     `${SNIPPET_CHARS} characters. ${citeRows(shape)} When one search is not enough, refine the query and ` +
     "search again. For every row holding an exact phrase use find; for counts, rankings and filters use " +
-    "sql. The result includes a 'usage' field, a one-line receipt of tokens returned and rows."
+    `sql. ${readDocumentsSentence(shape)}The result includes a 'usage' field, a one-line receipt of tokens returned and rows.`
   );
 }
 
@@ -1134,8 +1543,51 @@ export function rowsFindDescription(shape: TableShape): string {
     "the literal is not checked character by character as it is over a code index. Use it where you would " +
     `grep: a name, a product, a phrase that must appear. Each match is a row: ${key}, the scalar columns, and ` +
     "the text columns as snippets. ignoreCase, defines and under describe a code index and do nothing here. " +
-    "For meaning or 'which rows are about X' use search; for counts and rankings use sql. The result includes " +
-    "a 'usage' field, a one-line receipt of tokens returned and rows."
+    `For meaning or 'which rows are about X' use search; for counts and rankings use sql. ${readDocumentsSentence(shape)}` +
+    "The result includes a 'usage' field, a one-line receipt of tokens returned and rows."
+  );
+}
+
+/** Where a whole document is read, said in every rows text of a table of
+ * documents (`TableShape.document`); empty for a table of records. A legal-document
+ * benchmark run (2026-10-07) had no such door: across 176 tasks the caller paged
+ * each document through sql, `chunk BETWEEN 1 AND 10` a statement, some 18
+ * calls a task. */
+export function readDocumentsSentence(shape: TableShape): string {
+  const document = shape.document;
+  if (!document) return "";
+  const { pathColumn: path, orderColumn: order } = document;
+  return (
+    `A whole document - every row sharing a ${path}${order ? `, in ${order} order` : ""} - is one read away, several ` +
+    `documents in one call: once a search, find or sql has named the documents, read them with read, never page ` +
+    `one through sql${order ? ` by ${order}` : ""}. `
+  );
+}
+
+/** The `read` tool's description: the numbered lines of the files of a code
+ * index, or - over a table of documents - of its documents, each the rows
+ * sharing a path joined in order. */
+export function readDescription(shape: TableShape | null): string {
+  const document = shape?.document;
+  const [one, many] = document ? ["document", "documents"] : ["file", "files"];
+  const what = document
+    ? `The whole text of the documents named - several in one call: a document of ${shape!.table} is every row sharing ` +
+      `its ${document.pathColumn}${document.orderColumn ? `, put in ${document.orderColumn} order` : ""} and joined, ` +
+      "each row starting a line, and comes back numbered by line, each line as path:line. Use it after find, search " +
+      `or sql have named the documents you want, by their ${document.pathColumn}, for every document at once, in ` +
+      `place of paging one through sql${document.orderColumn ? ` by ${document.orderColumn}` : ""}. `
+    : "The numbered lines of the files named - several files in one call, from the index, each line " +
+      "as path:line. Use it after find, search or sql have named the files you want, for every " +
+      "file at once, in place of one Read per file. ";
+  return (
+    what +
+    `from and to cut every ${one} to a line range; lists in both name several ranges in one call, paired in order ` +
+    "(from [559, 1938], to [610, 1975] reads 559-610 and 1938-1975), for the windows around several places in a " +
+    `${one} - never one read per range. A ${one} over ${READ_LINES_CAP} lines, or past the result's budget, comes ` +
+    `back a page at a time, with more saying where its next page starts, and the result's next lists the read ` +
+    `calls that fetch the rest of every ${one} cut short - make them, all in one reply. A path the ${document ? "table" : "index"} ` +
+    `does not hold comes back as a miss beside the others. The result includes a 'usage' field, a one-line receipt ` +
+    `of tokens returned and ${many}.`
   );
 }
 
@@ -1153,7 +1605,7 @@ export function rowsSqlDescription(shape: TableShape): string {
   // A card that names no full-text column is a table with no full-text
   // index (the optimizer probed every text column), so the search functions
   // are left out of the text rather than shown with an empty column name.
-  const textColumns = shape.textColumns.join(", ") || "none";
+  const textColumns = textColumnsPhrase(shape);
   const ranked = vectorColumn
     ? `hybrid_search('${table}','${text}','terms','${vectorColumn}', {{q:"..."}}, 300)`
     : `bm25_search('${table}','${text}','terms', 300)`;
@@ -1169,22 +1621,27 @@ export function rowsSqlDescription(shape: TableShape): string {
         "to: it fuses exact terms with meaning, so it reaches the rows whether or not the question's words are " +
         "the rows' words, and they rarely are. That covers a concept, a subject, 'rows about X' - the shape of " +
         "almost every ranking question. " +
-        RELATED_TO_SENTENCE
+        RELATED_TO_SENTENCE +
+        LANGUAGE_KIND_SENTENCE
       : "") +
-    `bm25_search('${table}','${text}','terms', k) is keyword only: reach for it when the topic is a literal ` +
-    `phrase you know appears in ${text} and you want counts a reader can check as occurrences. ` +
+    // The one rule for hybrid against keyword (`SEARCH_RULE_SENTENCE`); the
+    // sentences after it describe the keyword functions as what the rule
+    // leaves them: counting.
+    (vectorColumn ? SEARCH_RULE_SENTENCE : "") +
+    `bm25_search('${table}','${text}','terms', k) is keyword only: use it only when the user gives an exact ` +
+    `phrase and asks how often it occurs in ${text}. ` +
     (vectorColumn ? `vector_search('${table}','${vectorColumn}', {{q:"..."}}, k) is meaning alone. ` : "") +
-    `token_match('${table}','${text}','terms','and') is unranked and complete: every row holding every term, ` +
-    "with no k, so a COUNT over it is the table's count and not a share of the top k. " +
+    `token_match('${table}','${text}','terms','and') is for counting exact words, never for finding rows: ` +
+    "every row holding every term, unranked, with no k, so a COUNT over it is the table's count. " +
     severalTermsSentence(table, text) +
     // One sentence, no more: on 2026-09-11 a caller wrote ILIKE '%...%' over
-    // the jobs table's 6.7 GB description column three times at 38-45 s each,
-    // where token_match on the same words runs in under a second. A longer
-    // version of this warning made the caller write many small statements
-    // instead; the text around it is otherwise the measured wording. Its
-    // figure is the jobs table's, and it had stated it as every table's.
-    `Match words on ${textColumns} with these functions, never with LIKE '%word%', which scans the stored text ` +
-    "(38-45 s per query on the jobs table's description column against under a second through token_match). " +
+    // the jobs table's 6.7 GB description column three times at 38-45 s each.
+    // A longer version of this warning made the caller write many small
+    // statements instead. The engine pushes a LIKE on an indexed column
+    // into the index, so the fault is not the cost: a letter match finds
+    // "eventcoverage" for "rage" and ranks nothing.
+    `Never find rows by filtering ${textColumns} with LIKE '%word%' or regexp_like: it matches letters, not ` +
+    "meaning, and ranks nothing. " +
     (vectorColumn
       ? 'The {{q:"..."}} placeholder is embedded on the platform with the table\'s own model, so it costs you ' +
         "nothing but the text (a bare {{q}} with the embed map is folded into it). "
@@ -1198,11 +1655,11 @@ export function rowsSqlDescription(shape: TableShape): string {
     `group, count - with your own words in place of the example's: SELECT ${scalar}, COUNT(*) AS ranked_rows FROM ` +
     `${ranked} AS ${table} WHERE ${table}.<another scalar column> = '...' GROUP BY ${scalar} ORDER BY ranked_rows DESC LIMIT 15; ` +
     `a second table joins into the same statement (JOIN <other> ON <the predicate join_keys returned>) where the ` +
-    "database has one - one call, not a search, then a filter, then a count. What such a total means: a search " +
-    "relation holds only the top k rows of that query, so a COUNT over it is the rows that ranked within the " +
-    "top k - a share of the table about the topic - and never the table's count; report it as 'rows ranked " +
-    "in the top 300 for <topic>', and expect values outside the top k, including common ones, to be missing " +
-    "from it. A question with no topic in it - how many rows, the largest values, a count over the whole " +
+    "database has one - one call, not a search, then a filter, then a count. When you COUNT over a search: " +
+    "the relation holds the top k rows, so the count is the rows that ranked within the top k - report it as " +
+    "'rows ranked in the top 300 for <topic>', never the table's count. That limits counting only; finding the " +
+    "rows that hold a figure or are about a topic is still the ranked search. A question with no topic in " +
+    "it - how many rows, the largest values, a count over the whole " +
     `table - comes from ${table} with no search function: SELECT ${scalar}, COUNT(*) AS rows FROM ${table} ` +
     `GROUP BY ${scalar} ORDER BY rows DESC LIMIT 15. `
     : // With no full-text column the functions that need one - bm25_search,
@@ -1245,42 +1702,15 @@ export function rowsSqlDescription(shape: TableShape): string {
       : "No vector column. ") +
     searchGuide +
     ROWS_REGEX_SENTENCE +
-    (shape.listColumns.length > 0
-      ? `A list column (${shape.listColumns.join(", ")}) holds several values per row: filter it with ` +
-        `array_has(${shape.listColumns[0]}, '...') or unnest it, not with equality. `
+    ROWS_ID_SENTENCE +
+    `${ARITHMETIC_SENTENCE} ` +
+    (listColumnsShown(shape).length > 0
+      ? `A list column (${listColumnsShown(shape).join(", ")}) holds several values per row: filter it with ` +
+        `array_has(${listColumnsShown(shape)[0]}, '...') or unnest it, not with equality. `
       : "") +
+    readDocumentsSentence(shape) +
     textGuide +
     "The result includes a 'usage' field, a one-line receipt of tokens returned and rows."
-  );
-}
-
-export function rowsAskDescription(shape: TableShape, devContextNote: string): string {
-  const { table, keyColumn: key, primaryText: text } = shape;
-  // What a fact carries is what the loop selected, not the whole row: it
-  // said "the row's key, its scalar and list columns", and a search or find
-  // fact carries the columns the projection names (`rowsProjection`) and the
-  // text it matched - `_id` alone where the projection names none. The row
-  // is looked up by the first of those, the one every such fact holds.
-  const places = rowsProjection(shape);
-  const lookup = places[0] ?? key;
-  // A table with no full-text column has no searches to run, no text to cut
-  // and no find to hand a phrase to, so the text names none of them.
-  return (
-    `Ask the ${table} table's index a question or task in plain language: a read-only retrieval subagent ` +
-    `chooses and runs the ${text ? "searches and statements" : "statements"} itself over the whole table and returns the rows it ` +
-    "found, never hits - " +
-    (text
-      ? `each with the columns its statement selected, a search's or a find's with the row's ` +
-        `${(places.length > 0 ? places : [ENGINE_ID_COLUMN]).join(", ")} and the text it matched, cut to a snippet of ` +
-        `${SNIPPET_CHARS} characters`
-      : "each with the columns its statement selected") +
-    " - plus aggregate rows (counts, rankings) and the SQL whose rows answer the " +
-    "question - never a summary. Use it for which rows are about X, how many and where, what the rows about X have in common. " +
-    `${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS} ` +
-    (text ? "For every row holding an exact phrase use find; for a row you already know, " : "For a row you already know, ") +
-    `sql by its ${lookup}. Answer from the rows. ${rowCitation(shape)} ` +
-    devContextNote +
-    "The result includes a 'usage' field, a one-line receipt of what the call cost."
   );
 }
 
@@ -1312,15 +1742,25 @@ export type TableMode = { kind: "chunks" } | { kind: "rows"; shape: TableShape }
  * `unresolved`): the doors are registered for its rows, say what the table
  * is, and say that every call reports the cause - so a model reading the
  * text is not sent to write chunks-shaped SQL against it. */
-export function unresolvedInstructions(table: string, cause: string, platformTools: boolean, hostFiles = true): string {
-  return (
-    `code-context is an index of the ${table} table on the platform, one row per record. The table could not be ` +
-    `described from the platform when this server started (${cause}), so ` +
-    (platformTools ? "find, search, sql and ask" : "find, search and sql") +
-    " each return that error until the server is restarted with the platform reachable; nothing runs against a " +
-    "local index in its place." +
-    OTHER_REPO_SENTENCE(hostFiles)
-  );
+/** The surface of a table the platform could not describe at startup: the
+ * notice alone, no tool lines - every door reports the cause. */
+export function unresolvedSurface(table: string, cause: string): InstructionSurface {
+  return {
+    frame:
+      `code-context is an index of the ${table} table on the platform, one row per record. The table could not be ` +
+      `described from the platform when this server started (${cause}), so ` +
+      "find, search and sql each return that error until the server is restarted with the platform reachable; nothing runs against a " +
+      `local index in its place. ${PATH_OPTION_ROWS}`,
+    doors: [],
+    beforeSweep: "",
+    hits: "",
+    tail: [],
+  };
+}
+
+/** The instructions of a table the platform could not describe (`unresolvedSurface`). */
+export function unresolvedInstructions(table: string, cause: string): string {
+  return instructionsFor(unresolvedSurface(table, cause));
 }
 
 export function unresolvedDescription(door: string, table: string): string {
@@ -1331,8 +1771,9 @@ export function unresolvedDescription(door: string, table: string): string {
   );
 }
 
-/** What a test injects: a transport in place of stdio, and the platform
- * client's options (a scripted fetch) for every client the server builds. */
+/** What a test injects: a transport in place of stdio, the platform
+ * client's options (a scripted fetch) for every client the server builds,
+ * and a shorter wait on the database's other tables (`STARTUP_BUDGET_MS`). */
 export interface ServeOptions {
   transport?: Transport;
   hostedOptions?: HostedOptions;
@@ -1347,6 +1788,7 @@ export interface ServeOptions {
    * directory but the one the server was started for. False over HTTP,
    * where that machine is not the caller's: its files are the server's own. */
   hostFiles?: boolean;
+  startupBudgetMs?: number;
 }
 
 /** What a signed-in caller is told when a tool would read the repository
@@ -1355,10 +1797,18 @@ export interface ServeOptions {
 const SIGNED_IN_ROOT =
   "this server's own repository is not served to a signed-in account; name a database of your account (tables lists them)";
 
+/** The version the server reports to a client: the package's own, read from
+ * the package.json npm ships beside dist/ (src/mcp and dist/mcp are both two
+ * levels down), so a release never leaves it behind. */
+const PACKAGE_VERSION: string = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version;
+
 export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {}): Promise<void> {
   const { hostedOptions } = serveOptions;
   const readOnly = serveOptions.readOnly ?? readOnlyEnabled();
   const hostFiles = serveOptions.hostFiles ?? true;
+  // When the start-up stops waiting on the database's other tables: counted
+  // from here, the server's start, as the client counts its own wait.
+  const othersDeadline = Date.now() + (serveOptions.startupBudgetMs ?? STARTUP_BUDGET_MS);
   const defaultRoot = resolveRoot(rootPath);
   // With sign-in, every call runs on the caller's account, which holds no
   // copy of this server's repository: the default root carries no platform
@@ -1369,7 +1819,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
 
   // The platform database (--db <url>), when one is configured: the default
   // root's chunks table also lives there, written by every build and sync
-  // beside the local index and read by the `ask` tool.
+  // beside the local index and read by `search`.
   // Resolved once here - a bad URL or a missing key fails the server at
   // startup, not on the first tool call. The key stays inside the target;
   // only `hostedLabel` ever reaches a log line.
@@ -1379,6 +1829,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // every repository a session opens gets its own database on it (see
   // RepoRegistry), registered here before its first build.
   const account = serveOptions.apiKey !== undefined ? null : hostedAccount();
+  // With an account every search runs on the platform's copy, and a hosted
+  // table of another shape is read there too: the local index is always
+  // lexical (no local vectors), so there is no local search to choose.
+  const remoteSearch = hosted !== null;
 
   const noEmbed = Boolean(process.env.CX_NO_EMBED);
   // The local model exists for exactly one job now: `--embed-provider local`
@@ -1413,6 +1867,22 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     const manifest = readManifest(ctx.dir);
     if (!manifest) return null;
     return { root: ctx.root, dir: ctx.dir, target: ctx.target, db: ctx.db, manifest };
+  };
+
+  /** Whether a root's local index holds `table`. The chunks mode runs find,
+   * read and a plain sql on the local index under the table's name, so a
+   * table it does not hold is served from the platform's rows instead (see
+   * the mode below). A root with no index dir holds nothing. A listing that
+   * fails is said on stderr and read as holding the table: the path a built
+   * index always took, rather than a mode decided by a passing fault. */
+  const localIndexHolds = (ctx: RepoCtx, table: string): boolean => {
+    if (!existsSync(ctx.dir)) return false;
+    try {
+      return ctx.db.listTables().includes(table);
+    } catch (err) {
+      console.error(`could not list the local index at ${ctx.dir}: ${(err as Error).message}`);
+      return true;
+    }
   };
 
   /** The indexer options a build or sync of `ctx` shares: the local index
@@ -1451,27 +1921,6 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // it with CX_NO_RECEIPT. One accumulator per session (this long-lived process).
   const receiptOn = receiptEnabled();
   const session = newSession();
-  // What this server returned to the model, per repository, for the `answer`
-  // tool to hand the platform's writer as the rows to write from
-  // (core/retrieval-record.ts). Cleared once an answer is written from it,
-  // so the next question starts its own.
-  const records = new Map<string, RetrievalRecord>();
-  const recordOf = (ctx: RepoCtx): RetrievalRecord => {
-    let record = records.get(ctx.root);
-    if (!record) {
-      record = new RetrievalRecord();
-      records.set(ctx.root, record);
-    }
-    return record;
-  };
-  // Said in the ask tool text only when it is true: with the dev
-  // context off (the default) the loop's model sees the question alone, and
-  // telling the caller otherwise would have it leave out what the loop needs.
-  const DEV_CONTEXT_NOTE = devContextEnabled()
-    ? "The subagent is handed this repository's own instructions (CLAUDE.md, AGENTS.md, skills) with " +
-      "the question, so it knows the layout you know; do not restate them. "
-    : "";
-
   /** Run an index mutation on a repo exclusively; null if one is in flight. */
   const exclusive = <T,>(ctx: RepoCtx, fn: () => Promise<T>): Promise<T> | null => {
     if (ctx.mutation) return null;
@@ -1589,6 +2038,53 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * a minute-long stall on a local query (see VERDICT_TIMEOUT_MS). */
   const verdictDb = hosted ? hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0, timeoutMs: VERDICT_TIMEOUT_MS }) : null;
 
+  /** The client memory is recalled through (core/memory.ts), when memory is
+   * on (`memoryEnabled`): no cold-start retries and a short budget
+   * (`MEMORY_RECALL_TIMEOUT_MS`), like the verdict's, since a platform search
+   * answering in milliseconds must not wait seconds on it. */
+  const memoryDb =
+    hosted && memoryEnabled() ? hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0, timeoutMs: MEMORY_RECALL_TIMEOUT_MS }) : null;
+
+  /** The memory nearest a question, with the call it made for the ledger:
+   * started beside a platform call and awaited after it. Only the tools that
+   * already wait on the platform recall - the platform's searches -
+   * since a local tool never waits on it. */
+  const recallFor = (question: string): Promise<Recalled> =>
+    memoryDb ? recallMemory(memoryDb, question) : Promise.resolve({ block: null, call: null });
+
+  /** `call`'s result with the telemetry of the platform call that answered
+   * it, read the moment it resolves: a tool that then waits on a recall or a
+   * verdict must not read the client's last call afterwards, by when a
+   * concurrent tool call may have replaced it. */
+  const answeredBy = <T>(call: Promise<T>, ctx: RepoCtx): Promise<{ value: T; own: CallTelemetry | undefined }> =>
+    call.then((value) => ({ value, own: hostedTelemetry(ctx) }));
+
+  /** The platform's verdict on a `sql` result as the model reads it.
+   * `anchors` and `rows` are the check's own working, not news to the
+   * caller, and on a valid result the whole verdict is one word; the reason
+   * is the part worth prompt space - with the terms the corpus does not hold
+   * and the rewrite to run, when the platform found them. A ranked
+   * aggregate's verdict also carries the facts about its groups (each
+   * file's whole length, its lines holding each search term) and the note
+   * saying what they measure; the caller folds the facts into the rows
+   * (foldValidationFacts) and shows the note. One shaping for a verdict the
+   * platform gave in the query's own answer (`validate` on `query_sql`) and
+   * one it gave on rows posted back (`platformVerdict`). */
+  const verdictForModel = (verdict: Record<string, unknown>): Record<string, unknown> => {
+    const facts = {
+      ...(typeof verdict.group_column === "string" && Array.isArray(verdict.groups) && verdict.groups.length > 0
+        ? { group_column: verdict.group_column, groups: verdict.groups }
+        : {}),
+      // The note travels on its own: a ranking whose groups the table does
+      // not name still has totals that read as sizes.
+      ...(typeof verdict.note === "string" ? { note: verdict.note } : {}),
+    };
+    if (verdict.valid === true) return { valid: true, check: verdict.check, ...facts };
+    const absent = Array.isArray(verdict.absent) && verdict.absent.length > 0 ? { absent: verdict.absent } : {};
+    const suggestion = typeof verdict.suggestion === "string" ? { suggestion: verdict.suggestion } : {};
+    return { valid: false, check: verdict.check, reason: verdict.reason, ...absent, ...suggestion };
+  };
+
   /** The platform's verdict on a `sql` result, or undefined when there is no
    * platform to ask or it could not answer within VERDICT_TIMEOUT_MS.
    *
@@ -1644,37 +2140,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // `lastCall` before the caller reads it. It goes through its own client,
       // which is why `withPlatform(entry, ctx)` (reading ctx.hosted) would
       // miss it.
-      const info = judge.lastCall();
-      const telemetry = info
-        ? {
-            rttMs: info.rttMs,
-            ...(info.readTokens !== undefined ? { readTokens: info.readTokens } : {}),
-            ...(info.resultBytes !== undefined ? { resultBytes: info.resultBytes } : {}),
-          }
-        : undefined;
-      // `anchors` and `rows` are the check's own working, not news to the
-      // caller, and on a valid result the whole verdict is one word; the
-      // reason is the part worth prompt space - with the terms the corpus
-      // does not hold and the rewrite to run, when the platform found them.
-      // A ranked aggregate's verdict also carries the facts about its
-      // groups (each file's whole length, its lines holding each search
-      // term) and the note saying what they measure; the caller folds the
-      // facts into the rows (foldValidationFacts) and shows the note.
-      const facts = {
-        ...(typeof verdict.group_column === "string" && Array.isArray(verdict.groups) && verdict.groups.length > 0
-          ? { group_column: verdict.group_column, groups: verdict.groups }
-          : {}),
-        // The note travels on its own: a ranking whose groups the table does
-        // not name still has totals that read as sizes.
-        ...(typeof verdict.note === "string" ? { note: verdict.note } : {}),
-      };
-      if (verdict.valid === true) return { verdict: { valid: true, check: verdict.check, ...facts }, telemetry };
-      const absent = Array.isArray(verdict.absent) && verdict.absent.length > 0 ? { absent: verdict.absent } : {};
-      const suggestion = typeof verdict.suggestion === "string" ? { suggestion: verdict.suggestion } : {};
-      return {
-        verdict: { valid: false, check: verdict.check, reason: verdict.reason, ...absent, ...suggestion },
-        telemetry,
-      };
+      // `judge`, not `verdictDb`: a statement over a database named on the
+      // call was judged through that database's own client.
+      const telemetry = callTelemetry(judge.lastCall());
+      return { verdict: verdictForModel(verdict), telemetry };
     } catch (err) {
       console.error(`validation unavailable: ${(err as Error).message}`);
       return {};
@@ -1811,23 +2280,16 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     );
   };
 
-  // The platform tool (`ask`) is registered whenever a platform database is
-  // configured and CX_AGENT_TOOLS does not say otherwise. Its routing line
-  // joins the instructions only then: the instructions are prompt text on
-  // every turn, and a line for a tool that is not there would cost tokens
-  // and steer toward nothing - measured: a lane that hid the platform tools
+  // The platform tool (`search`) is registered whenever a platform database
+  // is configured. A tool's routing line joins the instructions only when
+  // the tool is registered: the instructions are prompt text on every turn,
+  // and a line for a tool that is not there would cost tokens and steer
+  // toward nothing - measured: a configuration that hid the platform tools
   // through the SDK's disallowedTools alone still carried their lines here,
   // and the caller spent a turn calling into the refusal. `platformTools`
-  // keeps what belongs to the database rather than to the loop: the sql
-  // text's card and validation note.
+  // also keeps what belongs to the database: the sql text's card and
+  // validation note.
   const platformTools = hosted !== null;
-  const agentTools = platformTools && agentToolsEnabled();
-  // Whether `answer` rides beside `ask`. Off, the default, the caller's
-  // model writes the final answer from the rows itself, and the tool and its
-  // routing line are both absent - for the same reason `ask` is taken out at
-  // the source above: a line for a tool that is not there costs a turn.
-  // CX_ANSWER_TOOL=1 puts it back for measuring the two writers side by side.
-  const answerTool = agentTools && answerToolEnabled();
   // The platform's own routes as tools the model calls (CX_API_TOOLS):
   // table_card, validate, cite. With them on, sql carries no card and no
   // verdict - the model asks for both - see apiToolsEnabled.
@@ -1863,17 +2325,13 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     ? "\n- tables - the databases of this Infino account and their tables; with database and table, a table's columns, " +
       "indexes, key and card: call it before the first query over data. Every query tool takes database to run over " +
       "a database of the account instead of this repository: sql one statement over its tables (join_keys with " +
-      "database before a JOIN), search and find with table, ask with tables or none for the whole database.\n" +
+      "database before a JOIN), search and find with table.\n" +
       (readOnly
         ? ""
         : "- hydrate - load a dataset into a database of the account, from a bucket" +
           (hostFiles ? ", from files on this machine (path) or on a machine reached by ssh" : "") +
           "; hydrate_status follows the load, hydrate_cancel stops it. Only when asked.\n")
     : "";
-  // How the `answer` tool delivers the written answer: through the hook `cx
-  // install` wrote (the entry sets CX_ANSWER_DISPLAY), or as text the model
-  // relays. Read once; the instructions and the tool text say the same thing.
-  const answerDisplay = answerDisplayMode();
 
   // What the default root's doors run against (TableMode), decided here and
   // once. With a platform database and a CX_TABLE that is not the default,
@@ -1907,14 +2365,68 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // card is fetched on its own below, as it always was.
   let mode: TableMode = { kind: "chunks" };
   let card: RowRecord | undefined;
+  /** Whether the platform answers the primary table's rows' pages. */
+  let primaryPages = false;
   const noCard = (err: unknown) => console.error(`no table card in the sql description: ${(err as Error).message}`);
-  // The sibling tables (CX_SIBLING_TABLES). Every card is asked for alone:
-  // asked beside its siblings it would come back carrying the platform's
-  // joins, and no key reaches the tool text - the model calls join_keys.
+  // The platform asked about its tables at startup with no cold-start wait:
+  // an embedding server that is starting takes longer than the handshake
+  // can wait (see above).
+  // Within the startup cache's window (CX_STARTUP_CACHE_SECS, off unless set)
+  // the description below is read from the file the last cold start wrote
+  // (core/startup-cache.ts); a read the deadline cut is an error, and never
+  // kept.
+  const cacheSecs = startupCacheSecs();
+  const startupCache =
+    hosted && cacheSecs > 0 ? new StartupCache(startupCachePath(`${hostedLabel(hosted)}#${TABLE}`), cacheSecs) : null;
+  const cached = (db: HostedDb | null): HostedDb | null => (db && startupCache ? startupCache.wrap(db) : db);
+  if (startupCache) console.error(`startup description ${startupCache.hit ? "from the cache" : "read from the platform"}`);
   // None of it under sign-in: the default root's table is this server's
   // own, and the caller's account holds no copy of it.
-  const siblingNames = hosted && !signedIn ? siblingTables() : [];
-  if (hosted && !signedIn && TABLE !== DEFAULT_TABLE) {
+  const describer = cached(hosted && !signedIn ? hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0 }) : null);
+  // The database's other tables - their listing, schemas and cards - are
+  // read through a client that stops at the start-up's deadline
+  // (STARTUP_BUDGET_MS): a read not answered by then is abandoned and one not
+  // yet made is not made, so a database of hundreds of tables, or one card
+  // that does not answer, cannot hold the handshake. The primary's own reads
+  // keep the clients they always had.
+  const othersDb = cached(hosted && !signedIn ? hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0, deadlineMs: othersDeadline }) : null);
+  // The other tables of the database, as the platform lists them (`databaseTables`):
+  // what a statement may join with the primary. Every card is asked for
+  // alone: asked beside its siblings it would come back carrying the
+  // platform's joins, and no key reaches the tool text - the model calls
+  // join_keys.
+  const siblingNames = othersDb ? await databaseTables(othersDb, TABLE) : [];
+  // Every hosted table of another shape this server describes - the primary
+  // when it is one, and the siblings - has its card asked for within the
+  // budget the platform's own loop lays the cards of one prompt out within
+  // (core/table-shape.ts, cardLayouts): the tables' schemas first, for
+  // their widths, then each card at its share. Read once, here; a table
+  // whose schema was not read is described below as it always was, from
+  // that one attempt. The chunks table this client builds is narrow and
+  // its card is folded in whole, as before. Sized per table, the UI events
+  // table's card alone put 2.4 million characters into the sql text.
+  const laidOutTables = [...(hosted && !signedIn && remoteSearch && TABLE !== DEFAULT_TABLE ? [TABLE] : []), ...siblingNames];
+  // The primary's schema through `describer`, the others' through
+  // `othersDb`: one the deadline cut is a failure like any other, and the
+  // shares are laid out over the schemas read.
+  const schemaOf: Pick<HostedDb, "schema"> | null =
+    describer && othersDb ? { schema: (table) => (table === TABLE ? describer : othersDb).schema(table) } : null;
+  const laidOut =
+    schemaOf && laidOutTables.length > 0
+      ? await cardLayouts(schemaOf, laidOutTables)
+      : { layouts: new Map<string, CardLayout>(), failures: new Map<string, Error>() };
+  const layoutOf = (table: string): Pick<ResolveOptions, "fields" | "card"> => {
+    const layout = laidOut.layouts.get(table);
+    return layout ? { fields: layout.fields, card: { whole: layout.whole, families: layout.families } } : {};
+  };
+  /** The error the one schema read of `table` raised, if it did: thrown
+   * where the table is described, so it is reported as before and the
+   * schema is not asked for twice. */
+  const notLaidOut = (table: string): void => {
+    const failed = laidOut.failures.get(table);
+    if (failed) throw failed;
+  };
+  if (hosted && !signedIn && remoteSearch && TABLE !== DEFAULT_TABLE) {
     try {
       // With the load's record: a table cut into passages says so in the
       // tool text (`chunkingNote`), and a `vector` column the load embedded
@@ -1924,19 +2436,35 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // filled the column (`platformEmbedsQueriesFor`). That check is one
       // attempt, with no cold-start retries: an embedding server that is
       // starting takes longer than the handshake can wait (see above), and
-      // the column is then not offered for the session. The text column the
-      // deployment named (CX_TEXT_COLUMN) is the one the doors search. A
-      // column the shape passed over is said on stderr, so a search that
-      // runs by keyword alone on a table with vectors, or over a column
-      // other than the one named, is visible in the log.
+      // the column is then not offered for the session. A column the shape
+      // passed over is said on stderr, so a search that runs by keyword
+      // alone on a table with vectors is visible in the log.
       const onNote = (line: string) => console.error(`${TABLE}: ${line}`);
+      notLaidOut(TABLE);
       const shape = await resolveTableShape(registry.get().hosted!, TABLE, CARD_TIER, noCard, true, {
-        textColumn: configuredTextColumn(),
         onNote,
-        checkWith: hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0 }),
+        checkWith: describer!,
+        ...layoutOf(TABLE),
       });
       card = shape.card;
+      primaryPages = shape.pages === true;
+      // The chunks shape alone does not make a table this client's. A table
+      // of passages something else loaded has the same columns - a benchmark's
+      // data rooms, one hosted table a room, named by CX_TABLE a question at a
+      // time (2026-10-11) - and the chunks mode runs find, read and a plain
+      // sql on the LOCAL index under that name, which holds the table this
+      // process built and no other. On every room task every such call
+      // failed "table not found", and search asked the hosted index for the
+      // local vector column's name (`embedding`, where the table has `emb`);
+      // the platform's own loop was the one door that reached the rooms. So the chunks
+      // mode is kept for a table the local index holds, and any other runs
+      // over its rows on the platform, driven by its own shape, exactly as a
+      // table of another shape does.
       if (!shape.isChunks) mode = { kind: "rows", shape };
+      else if (!localIndexHolds(registry.get(), TABLE)) {
+        onNote("a table of passages this process did not build: the local index does not hold it, so its rows are read on the platform");
+        mode = { kind: "rows", shape };
+      }
     } catch (err) {
       const cause = `${(err as Error).message}${refusalHint(err)}`;
       console.error(`the ${TABLE} table could not be described (${cause}); every tool call will say so`);
@@ -1958,30 +2486,88 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     // server at all. No cold-start retries (`coldStartSecs: 0`), for the
     // reason above: one attempt, and the handshake goes ahead.
     try {
-      const record = await fetchCard(hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0 }), TABLE, CARD_TIER, (line) => console.error(line));
+      const record = await fetchCard(describer!, TABLE, CARD_TIER, (line) => console.error(line), layoutOf(TABLE).card ?? {});
       card = (record.card ?? record) as RowRecord;
     } catch (err) {
       noCard(err);
     }
   }
 
-  // Sibling tables (CX_SIBLING_TABLES): the other hosted tables a statement
-  // may join with the primary. Each is described once here, best-effort as
-  // the card is - one that cannot be described is named in the text as such
-  // rather than dropped, since the join is still the model's to write. Each
-  // is asked for alone (see above), and a vector column of one is checked
-  // as the primary's is, through the same client with no cold-start wait.
+  // The database's other tables: what a statement may join with the
+  // primary. Each is described once here, best-effort as the card is - one
+  // that cannot be described is named in the text as such rather than
+  // dropped, since the join is still the model's to write. Each is asked for
+  // alone (see above). Their vector columns are not checked here
+  // (`checkVector: false`): a check is a search by meaning, which loads the
+  // table's vector index on the worker, and one per table of a 41-table
+  // database at startup filled the worker's memory and stalled every query
+  // on it (2026-10-20); the platform embeds the query when a statement first
+  // searches one. They are described at once, not one after another: read
+  // in turn, the 40 other tables of that database took 15.6 s for their
+  // schemas alone, past half the time a client gives a server to start.
+  // What the start-up's deadline cut is counted and said in one line, not a
+  // line a table: on a database of hundreds of tables that is most of them.
   const siblings: TableShape[] = [];
   const siblingsUnresolved: string[] = [];
-  if (siblingNames.length > 0) {
-    const describer = hostedDbFor(hosted!, { ...hostedOptions, coldStartSecs: 0 });
-    for (const name of siblingNames) {
-      try {
-        siblings.push(await resolveTableShape(describer, name, CARD_TIER, noCard));
-      } catch (err) {
-        siblingsUnresolved.push(name);
-        console.error(`sibling table ${name} could not be described: ${(err as Error).message}${refusalHint(err)}`);
-      }
+  /** The other tables described without their cards because the deadline
+   * came first: each card is still the platform's to serve, a call away. */
+  let cardsCut = 0;
+  if (siblingNames.length > 0 && othersDb) {
+    let tablesCut = 0;
+    const described = await Promise.all(
+      siblingNames.map(async (name) => {
+        try {
+          notLaidOut(name);
+          const onNoCard = (err: unknown) => (pastDeadline(err) ? cardsCut++ : noCard(err));
+          return await resolveTableShape(othersDb, name, CARD_TIER, onNoCard, false, { ...layoutOf(name), checkVector: false });
+        } catch (err) {
+          if (pastDeadline(err)) tablesCut++;
+          else console.error(`sibling table ${name} could not be described: ${(err as Error).message}${refusalHint(err)}`);
+          return null;
+        }
+      }),
+    );
+    described.forEach((shape, i) => {
+      if (shape) siblings.push(shape);
+      else siblingsUnresolved.push(siblingNames[i]);
+    });
+    if (cardsCut + tablesCut > 0) {
+      console.error(
+        `the database's other tables were read for ${(serveOptions.startupBudgetMs ?? STARTUP_BUDGET_MS) / 1000} s of this ` +
+          `server's start-up: of ${siblingNames.length}, ${cardsCut} are described without their cards and ${tablesCut} ` +
+          "not at all (the sql text names them as tables that could not be described)",
+      );
+    }
+  }
+  startupCache?.save();
+
+  // The cards of every described table as the platform's loop renders
+  // them for its prompt - one call for all of them, the same layout,
+  // ranking and character budget the loop reads by (core/hosted.ts,
+  // `promptCards`). Without a question at start-up there is nothing to
+  // rank for: the cards are laid out by the budget alone, and
+  // describe_columns with a question ranks a table's columns later. A
+  // platform that predates the form, or one that does not answer within
+  // the start-up's deadline, leaves the cards as read.
+  let promptCards: PromptCards | null = null;
+  const cardTables = [
+    ...(card ? [TABLE] : []),
+    ...siblings.flatMap((s) => (s.card ? [s.table] : [])),
+  ];
+  if (platformTools && !apiTools && describer && cardTables.length > 0) {
+    try {
+      const reader = othersDb ?? describer;
+      promptCards = await reader.promptCards(cardTables, CARD_TIER);
+      // Cards that do not fit as they are would be ranked for a question
+      // the start-up does not have: the text names every table in a line
+      // instead, and describe_columns with the model's question returns the
+      // cards it needs (the owner, 2026-11-07: list every table in one line
+      // and let the model call describe_columns with its question).
+      if (promptCards.ranked) promptCards = await reader.promptCards(cardTables, CARD_TIER, undefined, true);
+    } catch (err) {
+      console.error(
+        `the platform did not render the cards (${(err as Error).message}); folding in the cards as read`,
+      );
     }
   }
 
@@ -2027,6 +2613,71 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     };
   };
 
+  // --- the graph, applied by this server to every hosted retrieval ----------
+  //
+  // With sibling tables the platform keeps a graph over them (what its
+  // extraction read from the texts, what the code defines and uses) and
+  // the joins it verified, and the rows a search or a statement returns
+  // are handed to it: the platform walks from them and the rows of the
+  // other tables it reaches come back beside the result as `connected`,
+  // named by table. Never
+  // the model's to ask for - measured not asked for (core/graph-expand.ts).
+
+  /** The hosted tables the expansion may start from: the primary, alone or
+   * with each described sibling - a one-table corpus has a graph of its own
+   * rows, the documents linked by what they mention. Which of them the
+   * graph covers is the platform's to say; a table it does not cover is not
+   * asked about again this session (`graphUncovered`). */
+  const graphTables = new Set<string>([TABLE, ...siblingNames]);
+  // Off for the session after a failure: a platform whose graph store is
+  // not there yet refuses every walk the same way, and the result the
+  // walk was to add to stands without it. Said once on stderr.
+  let graphOff = false;
+  // The tables the platform said its graph does not cover (or that it
+  // builds no graph): each answered once, then not asked about again.
+  const graphUncovered = new Set<string>();
+  // What this session's expansions carried already: a seed is walked once
+  // and a row shown once (core/graph-expand.ts, ExpansionMemory).
+  const graphMemory = newExpansionMemory();
+  /** The expansion of `rows` of `source` as the result carries it: the
+   * `connected` section, or `graph`, one line saying why there is none
+   * (no seeds on the rows, nothing reached, the walk failed) - in the
+   * result rather than on stderr so a drive's records show whether the
+   * graph was reached on every call. A failure ends expansion for the
+   * session. `searched` - the search's words, or the statement - brings
+   * back the facts matching them from every document too. */
+  const connectAcrossGraph = async (
+    ctx: RepoCtx,
+    source: string,
+    rows: readonly RowRecord[],
+    searched?: Searched,
+  ): Promise<{ connected: GraphExpansion } | { graph: string } | Record<string, never>> => {
+    if (graphOff || !ctx.hosted || !graphTables.has(source) || graphUncovered.has(source)) return {};
+    const trace: string[] = [];
+    try {
+      const connected = await expandAcrossGraph(ctx.hosted, source, rows, {
+        trace: (line) => trace.push(line),
+        memory: graphMemory,
+        onUncovered: () => graphUncovered.add(source),
+        searched,
+      });
+      if (!connected) return { graph: trace.join("; ") || "nothing reached" };
+      return { connected };
+    } catch (err) {
+      graphOff = true;
+      const why = `graph expansion off for this session: ${(err as Error).message}`;
+      console.error(why);
+      return { graph: why };
+    }
+  };
+  /** The one hosted table a statement is over, or null when it names none,
+   * several (a JOIN already crossed them) or a graph function of its own. */
+  const statementSource = (code: string): string | null => {
+    if (/\bgraph_(?:walk|rank)\s*\(/i.test(code)) return null;
+    const named = tablesNamed(withoutGraphCalls(code), [TABLE, ...siblingNames]);
+    return named.length === 1 ? named[0] : null;
+  };
+
   /** A `sql` statement run on the platform, whichever table it is over: the
    * statement with its `{{name}}` placeholders folded into the platform's
    * own `{{q:"..."}}`, which it embeds with the table's model - no local
@@ -2049,37 +2700,56 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   ) => {
     try {
       const t0 = performance.now();
+      // The graph's addition comes from the rows of the one table the
+      // statement is over; an aggregate's rows seed nothing, and its words
+      // searched - the keyword terms in the statement, the texts it embeds -
+      // still find the facts holding them.
+      // A database named on the call (`over`) is read through its own
+      // client, its rows recorded under the table the statement named, and
+      // it has no graph of this database's tables to expand across.
       const db = opts.over?.db ?? ctx.hosted!;
-      const fromPlatform = await runSqlRows(db, query, embeds);
-      recordOf(ctx).addRows(opts.over?.table ?? TABLE, fromPlatform, opts.key);
+      const source = opts.over ? null : statementSource(withoutComments(query));
+      // The checks ride on the query itself: the verdict and the grader's
+      // order come back with the rows, where before the rows went back up
+      // to /validate in a second call. Validation is asked for wherever the
+      // verdict is attached (not under the API tools, where the model asks
+      // for it); the rerank when there is a question to rank for.
+      const asked = question?.trim() ? question.trim() : undefined;
+      const checks: ReadChecks = {
+        ...(!apiTools && (opts.over ? opts.over.table !== undefined : verdictDb)
+          ? { validate: { table_name: opts.over?.table ?? TABLE, field_name: opts.column ?? CONTENT_COLUMN, ...(asked ? { question: asked } : {}) } }
+          : {}),
+        ...(asked ? { rerank: { question: asked } } : {}),
+      };
+      const checked = await runSqlRows(db, query, embeds, checks);
+      const own = opts.over ? callTelemetry(db.lastCall()) : hostedTelemetry(ctx);
+      const fromPlatform = checked.rows;
+      const reranked = checked.rerank !== undefined && checked.rerank.skipped === undefined;
+      const embedded = Object.values(embeds ?? {}).join(" ");
+      const searched: Searched = { statement: query, ...(embedded.trim() ? { query: embedded } : {}) };
+      const searchesWords = embedded.trim() !== "" || KEYWORD_SEARCH_CALL.test(query);
+      const connected = opts.over
+        ? {}
+        : source
+          ? await connectAcrossGraph(ctx, source, fromPlatform, searched)
+          : searchesWords
+            ? await connectAcrossGraph(ctx, TABLE, [], searched)
+            : {};
       const placed = opts.numbered ? fromPlatform.map(numberRowLines) : fromPlatform;
-      const { verdict: judged, telemetry } =
-        opts.over && opts.over.table === undefined
-          ? {}
-          : await platformVerdict(ctx, query, placed, question, opts.column, opts.over ? { db: opts.over.verdict, table: opts.over.table! } : undefined);
+      const judged = checked.validation ? verdictForModel(checked.validation) : undefined;
       // A ranked aggregate's rows gain the platform's facts about their
       // groups - `file_lines`, `term_lines` - so a top-k total sits beside
       // the file's whole length in the row the model reads, and an ordered
       // result's rows carry their place in its order (core/facts.ts).
       const { rows: folded, verdict } = foldValidationFacts(placed, judged);
-      // Ordered by what the statement's code says, not its comments.
-      const rowsOut = rankRows(folded, withoutComments(query));
+      // Ordered by what the statement's code says, not its comments - unless
+      // the platform's grader ordered them, whose order they keep.
+      const rowsOut = reranked ? folded : rankRows(folded, withoutComments(query));
       let usage: string | undefined;
       if (receiptOn) {
-        // The statement's own metered tokens, then the verdict's: two
-        // platform reads, one ledger line, so the charge shows both.
-        const entry = withPlatform(sqlEntry(query, rowsOut), { hosted: db });
-        if (telemetry) {
-          entry.platform = {
-            rttMs: (entry.platform?.rttMs ?? 0) + telemetry.rttMs,
-            ...(entry.platform?.readTokens !== undefined || telemetry.readTokens !== undefined
-              ? { readTokens: (entry.platform?.readTokens ?? 0) + (telemetry.readTokens ?? 0) }
-              : {}),
-            ...(entry.platform?.resultBytes !== undefined || telemetry.resultBytes !== undefined
-              ? { resultBytes: (entry.platform?.resultBytes ?? 0) + (telemetry.resultBytes ?? 0) }
-              : {}),
-          };
-        }
+        // One platform read: the statement, its verdict and its rerank are
+        // metered on the one call.
+        const entry = withCalls(sqlEntry(query, rowsOut), own);
         recordUsage(ctx.dir, entry);
         usage = formatReceipt(entry, session);
       }
@@ -2088,6 +2758,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       return ok({
         rows: held.rows,
         ...(hint ? { hint } : {}),
+        ...connected,
         ...(verdict ? { validation: verdict } : {}),
         index: "platform",
         ...(opts.over ? { database: opts.over.database } : {}),
@@ -2197,7 +2868,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // the lean text stays what it was measured as.
   const semanticsServed = WITH_SEMANTICS && [card, ...siblings.map((s) => s.card)].some(carriesSemantics);
   const siblingText =
-    siblingNames.length > 0 ? siblingsNote(TABLE, siblings, siblingsUnresolved, siblingNotes(), joinSearchable, semanticsServed) : "";
+    siblingNames.length > 0 ? siblingsNote(TABLE, siblings, siblingsUnresolved, joinSearchable, semanticsServed) : "";
   let sqlDescription = rows
     ? rowsSqlDescription(rows) + siblingText
     : mode.kind === "unresolved"
@@ -2208,511 +2879,545 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     // jsonify, not JSON.stringify: a card's statistics over a 64-bit column
     // (a log table's nanosecond timestamps) are bigints, and a refusal here
     // stops the server before it serves a single tool.
-    if (card) sqlDescription += CARD_PREAMBLE + jsonify(card);
+    // Every described table's card, the primary's first: the tables beside
+    // it are described the same way, so a question about one of them is
+    // written over its own columns and not the primary's.
+    const cards = [
+      ...(card ? [{ table: TABLE, card }] : []),
+      ...siblings.flatMap((s) => (s.card ? [{ table: s.table, card: s.card }] : [])),
+    ];
+    // The platform's own rendering when it serves one (`promptCards`):
+    // what its loop's prompt carries, folded in unchanged, so the model
+    // here reads the cards the model inside the loop reads. The cards as
+    // read, laid out here, only for a platform that predates the form.
+    if (promptCards && promptCards.shown.length === 0) {
+      // The overview: no card until a question needs one.
+      sqlDescription += OVERVIEW_PREAMBLE + promptCards.cards;
+    } else if (promptCards) {
+      const narrow = cards.length === 1 && !promptCardsMap(promptCards);
+      sqlDescription +=
+        (narrow ? NARROW_CARD_PREAMBLE : CARD_PREAMBLE) +
+        promptCards.cards +
+        (promptCards.vocabulary ? `\n\n${promptCards.vocabulary}` : "");
+    } else if (cards.length === 1 && !cardMapsColumns(cards[0].card)) sqlDescription += NARROW_CARD_PREAMBLE + jsonify(cards[0].card);
+    else if (cards.length > 0) sqlDescription += CARD_PREAMBLE + cards.map((c) => `${c.table}: ${jsonify(c.card)}`).join("\n");
   }
   if (apiTools) sqlDescription += API_TOOLS_SQL_NOTE;
 
   // What the local index holds, read once here: an index of logs gets its
-  // instructions in log words (`logIndexInstructions`), a code index the
-  // text below.
+  // instructions in log words (`logSurface`), a code index the code
+  // surface's.
   const startManifest = readManifest(indexDir(defaultRoot));
   const logIndex = mode.kind === "chunks" && isLogIndex(startManifest);
 
+  // The columns a laid-out card maps rather than lists are one
+  // describe_columns away wherever a card folded into the text maps any,
+  // and every column's rows by kind wherever a card names a kind column
+  // (the tool is registered below under the same condition); a table whose
+  // card lists every column whole and names no kinds has nothing for it to
+  // describe. A table the start-up's budget described without its card
+  // (`cardsCut`) has all of its entries one describe_columns away.
+  const describeColumnsOffered = Boolean(
+    describer &&
+      (cardsCut > 0 ||
+        (promptCards !== null && promptCardsMap(promptCards)) ||
+        [card, ...siblings.map((s) => s.card as RowRecord | undefined)].some((c) => cardMapsColumns(c) || cardNamesKinds(c))),
+  );
+  // What every shape's surface is built with beyond the shape: whether
+  // describe_columns is offered.
+  const surfaceOptions: SurfaceOptions = { describeColumns: describeColumnsOffered };
+
   const server = new McpServer(
-    { name: "code-context", version: "0.1.2" },
+    { name: "code-context", version: PACKAGE_VERSION },
     {
-      instructions: withListedNames((rows
-        ? rowsInstructions(rows, agentTools, hostFiles)
-        : mode.kind === "unresolved"
-        ? unresolvedInstructions(TABLE, mode.cause, agentTools, hostFiles)
-        : logIndex
-        ? logIndexInstructions(agentTools, startManifest?.files ?? 0, startManifest?.chunks ?? 0) + (platformTools ? "" : ` ${noAccountSteps()}.`)
-        : // The first move was ls and cat CLAUDE.md, every run, before any of
-          // these tools (the demo, 2026-09-24): the model looks around a
-          // checkout it has been told nothing about. It has been told: the
-          // table's columns, what is in it and how to read it are in the
-          // sql tool's text, so the looking around is named as not needed.
-          "code-context is a local index of this repository: every file's lines are in it" +
-          (siblingNames.length > 0
-            ? `, and beside it in the same database the tables ${siblingNames.join(", ")}, which one sql statement joins with it`
-            : "") +
-          ", and what the repository holds is in the sql tool's text, so begin with " +
-          (agentTools ? "ask" : "these tools") +
-          ", not with ls, cat or a look at CLAUDE.md" +
-          // Ask leads the list and the sentence: the tool named first is the
-          // tool reached for, and the model reached for sql seven times on a
-          // question one ask would have run as one (the owner, 2026-09-24:
-          // "the outer model should be primed to use ask as much as
-          // possible. sql is great and those should stay but it should reach
-          // for ask most of the time").
-          (agentTools ? ": ask is the tool for most questions here, and find, search and sql are for the cases named" : "") +
-          ". Which tool for which question:\n" +
-        (agentTools
-          ? // The whole-mechanism question is ask's too, as several asks in one
-            // reply: a tool that had the platform write the answer in one long
-            // call (`explore`) lost to this twice on the judged passes - see the
-            // note on `retrieve` - and the routing the model reads is this list.
-            `- ask - a question or task in plain language, first for most questions; returns the rows it retrieved (facts with path:line and the code), not an answer: compose from them. It runs the searches and the statements itself, several at once, over every table in scope. ${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS} How many - files, projects, places - is an ask or one sql statement, never a walk through files; a question across projects or tables is ask's, several at once.\n` +
-            // Several asks in one reply beat a loop that waits on itself for a
-            // question that splits into independent parts (measured
-            // 2026-09-12: one exploration took longer than four asks running
-            // at once).
-            "  A mechanism that spans files - how X works end to end, what calls what - is one ask per part: they run at the same time, and you do the following-up yourself from the rows they return. " +
-            "If an ask did not bring back what you wanted, rephrase it - more specific, or broader - and ask again, or ask several at once, rather than read files yourself.\n" +
-            // The written answer is the platform's, not the caller's, and it
-            // must reach the person without the caller's model retyping it -
-            // see core/answer-display.ts for the two deliveries and what
-            // each was measured to do.
-            (answerTool ? answerInstruction(answerDisplay) : "")
-          : "") +
-        "- find - every line containing an exact string, where you would grep.\n" +
-        // With `ask` on the surface, `search` must not claim the same question.
-        // It did - "how does X work, where is Y handled" on both lines - and
-        // once a reply's searches ran together the model took six of those
-        // over one ask every time (measured 2026-09-12). So search's line names
-        // what search is: one ranked pass in the caller's own terms.
-        (agentTools
-          ? "- search - one ranked pass in your own words, when you already know roughly what the code calls the thing; a question you cannot write as one query is ask's.\n"
-          : "- search - how does X work, where is Y handled, code by meaning.\n") +
-        // With ask on the surface, sql is the statement the model already
-        // knows, and a question that needs several - or reaches across the
-        // tables - is an ask, which writes them itself, at once. The rows text
-        // took this shape on 2026-09-11 and delegation followed; the code text
-        // kept "counts, rankings, and aggregates" with no handoff, and on the
-        // three-table corpus (2026-09-24) the model wrote seven statements one
-        // after another where one ask would have run them together (the
-        // owner: "why aren't we using ask that would be better - then the ask
-        // can formulate many sql statements in parallel").
-        (agentTools
-          ? "- sql - one statement you already know: a count, a ranking, a filter, a join, in one SELECT. " +
-            "A question that needs several statements, or that reaches across the tables, is an ask: the " +
-            "loop writes them itself, several at once, and returns the rows. "
-          : "- sql - counts, rankings, and aggregates across the repo, ") +
-        "Ranking files by how much of them is about a topic goes through hybrid_search, not bm25, when the " +
-        "topic is a concept; a total over a search relation is the top k's matched lines, never a file's " +
-        "length - sizes and whole-repo counts come from the chunks table with no search function.\n" +
-        "- read - the numbered lines of the files the index named, several paths in one call; a range with from and to.\n" +
-        indexFirst(agentTools, TABLE) +
-        "\n" +
-        SWEEP_TO_A_TOOL +
-        " " +
-        CALLS_TOGETHER +
-        "\n" +
-        "Hits carry the code: when a hit answers the question, answer from it. A hit's content shows " +
-        "each line with its own number in the file, so cite a place as path:line or path:start-end " +
-        "from those numbers and only where the thing you name sits - never the hit's whole line " +
-        "range, which spans the chunk. " +
-        CITE_EXACTLY +
-        CITE_FROM_HIT +
-        ` ${COUNTS_IN_THE_ANSWER}` +
-        " Read files with read, every path in one call; Claude's own Read only for a hit marked truncated. " +
-        (hostFiles ? "Every tool takes an optional 'path' (an absolute repo root) to target another repository. " : "") +
-        "A 'partial' marker means files over the index cap were left out, so a missing match is not " +
-        "proof of absence." +
-        // Without an account the two platform tools are not registered, and
-        // a model that finds them missing needs to know why and what the
+      // The playbook's outer block comes after the instructions and before
+      // the checklist line, and with no playbook nothing is added: the
+      // server a measurement runs without one sends exactly this text. One
+      // surface per shape of index, one builder for all of them
+      // (`instructionsFor`), so what the shapes share is said once.
+      instructions: withListedNames(withTaskChecklist(withPlaybook(
+        instructionsFor(
+          rows
+            ? rowsSurface(rows, siblingNames, surfaceOptions)
+            : mode.kind === "unresolved"
+            ? unresolvedSurface(TABLE, mode.cause)
+            : logIndex
+            ? logSurface(startManifest?.files ?? 0, startManifest?.chunks ?? 0)
+            : codeSurface(TABLE, siblingNames, surfaceOptions),
+          siblingNames,
+          hostFiles,
+        ), PLAYBOOK?.outerBlock ?? "")) +
+        // Without an account the platform tools are not registered, and a
+        // model that finds them missing needs to know why and what the
         // person can do - once, from a terminal - rather than conclude the
         // server is broken or go looking for a key.
-        (platformTools ? "" : ` ${noAccountSteps()}.`)) +
+        (platformTools || rows || mode.kind === "unresolved" ? "" : ` ${noAccountSteps()}.`) +
         (apiTools ? apiToolsInstruction(Boolean(rows)) : "") +
-        (siblingNames.length > 0 ? siblingsInstruction(TABLE, siblingNames, agentTools, joinSearchable) : "") +
+        (siblingNames.length > 0 ? siblingsInstruction(TABLE, siblingNames, joinSearchable) : "") +
         DATA_INSTRUCTION),
     },
   );
+
+  // The columns a laid-out card maps rather than lists, whole, by name or
+  // family prefix - the loop's own describe_columns, served by the platform
+  // from the stored card, for the model outside the loop. Offered wherever
+  // a hosted table's card is folded into the text.
+  if (describer && describeColumnsOffered) {
+    const tablesHere = [TABLE, ...siblingNames];
+    server.registerTool(
+      "describe_columns",
+      {
+        title: "A table's column entries, whole, by name or family",
+        annotations: READ_ONLY,
+        description: DESCRIBE_COLUMNS_DESCRIPTION,
+        inputSchema: {
+          question: z.string().optional().describe(DESCRIBE_COLUMNS_QUESTION_PARAM),
+          table: z
+            .string()
+            .optional()
+            .describe(
+              `The table (one of: ${tablesHere.join(", ")}). Absent with a question: the cards of the tables the question needs; absent without one: ${TABLE}.`,
+            ),
+          pattern: z.string().min(1).optional().describe("A column name, matched whole; `*` matches any run of characters, for a prefix (`property_report*`) or a word anywhere in the name (`*monthly*`); or `*` for every column. Case does not matter. Every column when a question is given and this is absent."),
+          limit: z.number().int().positive().optional().describe("Entries to list, most rows with a value first (default 40)."),
+        },
+      },
+      async ({ table, pattern, limit, question }: { table?: string; pattern?: string; limit?: number; question?: string }) => {
+        const asked = question?.trim() ? question.trim() : undefined;
+        // A question and no table: the cards of the tables it needs, ranked
+        // and laid out by the platform as its loop's prompt carries them.
+        if (asked && table === undefined && tablesHere.length > 1) {
+          try {
+            const rendered = await describer.promptCards(tablesHere, CARD_TIER, asked);
+            let cards: unknown = rendered.cards;
+            try {
+              cards = JSON.parse(rendered.cards);
+            } catch {
+              // Not JSON: hand the text over as it came.
+            }
+            // The note the loop puts under the question, when the platform
+            // ranked the cards for it: the tables in order and the columns
+            // judged to hold what the question asks.
+            return ok({ question: asked, cards, ...(rendered.note ? { note: rendered.note } : {}) } as Record<string, unknown>);
+          } catch (err) {
+            return fail(`describe_columns failed: ${(err as Error).message}${refusalHint(err)}`);
+          }
+        }
+        const name = table ?? TABLE;
+        if (!tablesHere.includes(name)) return fail(`describe_columns: unknown table ${name}; the tables here: ${tablesHere.join(", ")}`);
+        if (!pattern && !asked) return fail("describe_columns needs `question` (what you need the columns for) or `pattern`");
+        try {
+          const record = await fetchCard(describer, name, CARD_TIER, undefined, {
+            pattern: pattern ?? "*",
+            ...(limit ? { limit } : {}),
+            ...(asked ? { question: asked } : {}),
+          });
+          const found = (record.card ?? record) as RowRecord;
+          const columns = Array.isArray(found.schema) ? found.schema : [];
+          const matched = typeof record.matched === "number" ? record.matched : columns.length;
+          const note = typeof record.note === "string" ? { note: record.note } : {};
+          return ok({ table: name, pattern: pattern ?? "*", matched, listed: columns.length, columns, ...note } as Record<string, unknown>);
+        } catch (err) {
+          return fail(`describe_columns failed: ${(err as Error).message}${refusalHint(err)}`);
+        }
+      },
+    );
+  }
 
   // find and search over a table with no full-text column are not offered
   // at all (see searchDoors): the routing and the other tools' text name
   // neither there.
   if (searchDoors) {
-  // search is registered only with an account: local vectors don't exist any
-  // more (the owner's decision, 2026-09-09 - see wantsLocalEmbed above), so a
-  // local "search" would just be a thinner bm25_search under a misleading
-  // name. Without an account, reach for sql's bm25_search/token_match instead.
-  if (platformTools) {
-  server.registerTool(
-    "search",
-    {
-      title: "Code search (exact terms + meaning)",
-      annotations: READ_ONLY,
-      description: (rows
-        ? rowsSearchDescription(rows)
-        : mode.kind === "unresolved"
-        ? unresolvedDescription("Ranked search", TABLE)
-        : "Ranked code search fusing exact keyword matching with semantic similarity, so it works " +
-        "whether or not you know the words. " +
-        // The same split as the instructions: with `ask` on the surface, search
-        // does not also claim the question - it claims the query.
-        (agentTools
-          ? "One ranked pass in your own words: use it when you can say roughly what the code calls " +
-            "the thing - context before a change, similar implementations, a name to locate. A " +
-            "question you cannot write as one query - how a mechanism works, where something is " +
-            "handled across files - is ask's, several at once. "
-          : "Use it for 'how does X work', 'where is Y handled', code by meaning, context before a " +
-            "change, similar implementations. ") +
-        "Each hit carries path, line " +
-        "range, and the chunk content: answer from the hits. The content shows each line with its " +
-        "own number in the file, so cite from those numbers - the hit's line range spans the whole " +
-        "chunk and is not the line a quoted or named thing sits on. Quote only text a hit shows, " +
-        "from the lines you cite it to." +
-        CITE_FROM_HIT +
-        " When one " +
-        "search is not enough, refine the query and search again. " +
-        // Measured on LogDx-CI (35 CI failure logs, evidence lines marked):
-        // at 200 lines returned per log, whole chunks kept 0.797 of the
-        // critical signals and the matching lines 0.853; see focusLines.
-        "Set lines to get each hit as only the lines carrying your query's words, with two lines " +
-        "of context, in place of the whole chunk - for logs, test output and other long records, " +
-        "where the matching lines are the answer; put the words you expect on those lines in the " +
-        "query. For every occurrence of an exact " +
-        "string use find; for counts and rankings use sql. Several searches at once: pass queries. " +
-        "The result includes a 'usage' field, a one-line receipt of tokens returned, chunks and files.") + DATA_NOTE,
-      inputSchema: {
-        query: z.string().optional().describe("What you're looking for - terms, a phrase, or a description."),
-        queries: z
-          .array(z.string().min(1))
-          .max(BATCH_MAX)
-          .optional()
-          .describe(
-            "Several queries in one call, run at the same time; the results come back in the same order, " +
-              "each under its query. Use it in place of one call per query.",
-          ),
-        k: z.number().int().positive().max(50).default(DEFAULT_SEARCH_K).describe("Maximum hits."),
-        lines: z
-          .boolean()
-          .optional()
-          .describe(
-            "Return each hit as only the lines of its chunk that carry one of the query's words, with " +
-              "two lines of context, each numbered with its line in the file - not the whole chunk. A " +
-              "hit reporting matchedLines 0 ranked on meaning alone and comes back whole.",
-          ),
-        path: z
-          .string()
-          .optional()
-          .describe(
-            "Absolute path to the repository root to search. Defaults to the server's configured root; " +
-              "set it to target a specific repo when a session spans more than one.",
-          ),
-        database: DATABASE_ARG,
-        table: TABLE_ARG,
-      },
-    },
-    async (args) => batched("search", args, async ({ query, k, lines, path, database, table }) => {
-      let ctx: RepoCtx;
-      try {
-        ctx = repoFor(database !== undefined ? undefined : path);
-      } catch (err) {
-        return fail((err as Error).message);
-      }
-      // Over a table of a database named on the call: the table's own text
-      // and embedding columns, through its database's client; the record
-      // and the ledger are the default root's.
-      if (database !== undefined) {
-        const settled = await dataTable("search", database, table);
-        if ("failed" in settled) return settled.failed;
-        const { shape, client } = settled;
-        if (shape.primaryText === "") {
-          return fail(`search: no column of ${database}.${table} is full-text indexed, so there is no search over it; sql filters its columns${shape.vectorColumn ? `, and vector_search('${table}','${shape.vectorColumn}', {{q:"..."}}, k) ranks them by meaning` : ""}`);
-        }
-        try {
-          const t0 = performance.now();
-          const result = await searchRows(client, shape, query, k);
-          recordOf(ctx).addKeys(shape.table, shape.keyColumn, result.hits);
-          let usage: string | undefined;
-          if (receiptOn) {
-            const entry = withPlatform(rowSearchEntry(result), { hosted: client });
-            recordUsage(ctx.dir, entry);
-            usage = formatReceipt(entry, session);
-          }
-          return ok({ ...result, index: "platform", database, took_ms: Math.round((performance.now() - t0) * 1000) / 1000, ...(usage ? { usage } : {}) });
-        } catch (err) {
-          return fail(`search failed: ${(err as Error).message}${refusalHint(err)}`);
-        }
-      }
-      // Over the rows of a hosted table of another shape: the platform
-      // fuses the table's own text and embedding columns. No local index, no
-      // readiness probe - the startup decision already said the table is
-      // there and what it is (rowsOver). A row has no lines to cut to, so
-      // `lines` has no meaning here and is left out.
-      const over = rowsOver("search", ctx);
-      if (over && "failed" in over) return over.failed;
-      if (over) {
-        try {
-          const t0 = performance.now();
-          const result = await searchRows(ctx.hosted!, over.shape, query, k);
-          recordOf(ctx).addKeys(TABLE, over.shape.keyColumn, result.hits);
-          let usage: string | undefined;
-          if (receiptOn) {
-            const entry = withPlatform(rowSearchEntry(result), ctx);
-            recordUsage(ctx.dir, entry);
-            usage = formatReceipt(entry, session);
-          }
-          return ok({
-            ...result,
-            index: "platform",
-            took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
-            ...(usage ? { usage } : {}),
-          });
-        } catch (err) {
-          return fail(`search failed: ${(err as Error).message}${refusalHint(err)}`);
-        }
-      }
-      // Reading the hosted index needs no local index at all, so this comes
-      // before ensureIndexed: requiring a local build first would make the
-      // hosted path depend on the very thing it exists to do without.
-      // ctx.hosted is set for the default root whenever this tool is
-      // registered at all; it is unset only when `path` names a different,
-      // local-only repository (RepoRegistry carries the platform client for
-      // the default root alone) - there is no local vector fallback to fall
-      // back to any more, so that case is a clear refusal, not a degraded run.
-      if (!ctx.hosted) {
-        if (signedIn) return fail(`search: ${SIGNED_IN_ROOT}`);
-        return fail(
-          "search needs an account; the default repository has one but " +
-            `'${path}' does not. Use sql's bm25_search/token_match for keyword ranking there instead.`,
-        );
-      }
-      const notReady = await platformNotReady("search", ctx);
-      if (notReady) return notReady;
-      try {
-        const t0 = performance.now();
-        // The hosted table's analyzer decides which lines carry a term
-        // (`lines`): the platform manifest this machine wrote when it loaded
-        // the table records it; a table loaded some other way is read with
-        // the platform's default for a bare column, as analyzerOf says.
-        const hostedAnalyzer = analyzerOf(readPlatformManifest(ctx.dir) ?? { origin: "hosted" });
-        const result = await searchHosted(ctx.hosted, query, k, { lines, analyzer: hostedAnalyzer });
-        recordOf(ctx).addPlaces(TABLE, result.hits);
-        let usage: string | undefined;
-        if (receiptOn) {
-          // withPlatform, as the ask path does: the platform
-          // returns the tokens it metered for this call, and without this
-          // a remote search is the one hosted path whose read tokens never
-          // reach the ledger. They were being estimated at a measured rate
-          // per search instead, which is a made-up number standing in for
-          // one the response already carried.
-          const entry = withPlatform(searchEntry(result, ctx.root), ctx);
-          recordUsage(ctx.dir, entry);
-          usage = formatReceipt(entry, session);
-        }
-        return ok({
-          ...result,
-          index: "platform",
-          took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
-          ...(usage ? { usage } : {}),
-        });
-      } catch (err) {
-        return fail(`search failed: ${(err as Error).message}${refusalHint(err)}`);
-      }
-    }),
-  );
-  }
-
-  server.registerTool(
-    "find",
-    {
-      title: "Find exact text (every occurrence, like grep -n)",
-      annotations: READ_ONLY,
-      description: (rows
-        ? rowsFindDescription(rows)
-        : mode.kind === "unresolved"
-        ? unresolvedDescription("Every row holding every word of an exact string", TABLE)
-        : "Every line in the repository containing an exact string, like grep -n: complete and " +
-        "unranked, written as grep writes it (path:line:text, one line per match, the enclosing " +
-        "definition in brackets when known), with the repo-wide total and the per-file counts after " +
-        "the matches (the grep -c answer). " +
-        "Literal text within one line, case-sensitive unless ignoreCase. Use it where you would " +
-        "grep: every use or definition of an identifier, an error message, a config key. Set defines " +
-        "to get only where a name is defined rather than everywhere it appears. " +
-        // Measured 2026-09-20: three finds for guessed signatures returned
-        // nothing and the model fell back to a regex Grep; the bare name with
-        // defines would have listed the declarations on the first call.
-        FIND_BY_BARE_NAME +
-        // A flood keeps every place: the lines past the text budget come as
-        // path and line numbers (`more`), and a line's text is a sql read.
-        " The lines around a match - what leads into an error and follows it - come with it when you ask " +
-        "for context (like grep -B/-A); no file need be opened for them. " +
-        "A wide result lists every matching place: the first lines with their text, the rest by path and " +
-        "line after them; a line's text is one sql statement away, and the per-file counts count them all. " +
-        "A count per project or per file - which projects use X, how many times each - is one sql statement, " +
-        "never a shell pipeline: " +
-        PER_PROJECT_COUNT +
-        " Not for a " +
-        `file you already know - its lines are one sql statement away (SELECT start_line, content FROM ${TABLE} ` +
-        "WHERE path = '...' ORDER BY start_line). " +
-        // find's hand-off must name the tool that owns the question on this
-        // surface, or it sends a mechanism question to search.
-        (agentTools
-          ? "For code by meaning, when you know roughly the words, use search; for a question - how " +
-            "X works, where Y is handled - use ask, several at once; for rankings use sql. "
-          : "For meaning or 'how does X work' use search; for rankings use sql. ") +
-        "Several finds at once: pass queries. " +
-        "The result includes a 'usage' field, a one-line receipt of tokens returned, matches and files.") + DATA_NOTE,
-      inputSchema: {
-        query: z
-          .string()
-          .min(1)
-          .optional()
-          .describe(
-            "The exact text to find, as it appears in the code - an identifier, a string, a key. Never a " +
-              "signature or a line you have not read: one character off and nothing matches.",
-          ),
-        queries: z
-          .array(z.string().min(1))
-          .max(BATCH_MAX)
-          .optional()
-          .describe(
-            "Several exact strings in one call, found at the same time; the results come back in the " +
-              "same order, each under its query. Use it in place of one call per string.",
-          ),
-        ignoreCase: z
-          .boolean()
-          .optional()
-          .describe("Match regardless of letter case. Default false: case-sensitive, like grep."),
-        defines: z
-          .boolean()
-          .optional()
-          .describe(
-            "Keep only lines inside a definition of the query - where the name is declared, not every " +
-              "place it is used. Answers 'where is X defined' in one call instead of reading use sites " +
-              "until one turns out to be the declaration. The result reports definedFrom, how many " +
-              "matching lines there were before the filter.",
-          ),
-        under: z
-          .string()
-          .optional()
-          .describe(
-            "Repo-relative path prefix to scope to - one repository of a workspace, one subtree of a " +
-              "monorepo, one directory. The total and the per-file counts then describe that subtree, " +
-              "and the result echoes `under` so the numbers are not mistaken for the whole repository. " +
-              "Reach for it when a common name would return thousands of lines across everything: " +
-              "scoping is exact here, because find retrieves every match and cuts afterwards.",
-          ),
-        limit: z
-          .number()
-          .int()
-          .positive()
-          .max(MAX_FIND_LIMIT)
-          .default(DEFAULT_FIND_LIMIT)
-          .describe("Maximum matching lines to return; the result reports the total either way."),
-        context: z
-          .number()
-          .int()
-          .min(0)
-          .max(MAX_FIND_CONTEXT)
-          .optional()
-          .describe(
-            "Lines before and after each match to carry, from the match's own window - what grep -B/-A " +
-              "shows - so the lines that lead into an error and follow it come with the match, without " +
-              "opening the file. Up to 20; more than a few matches with context is a wide result.",
-          ),
-        path: z
-          .string()
-          .optional()
-          .describe(
-            "Absolute path to the repository root to search. Defaults to the server's configured root; " +
-              "set it to target a specific repo when a session spans more than one. This is a different " +
-              "index; `under` narrows within one.",
-          ),
-        database: DATABASE_ARG,
-        table: TABLE_ARG,
-      },
-    },
-    async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, path, share, database, table }) => {
-      let ctx: RepoCtx;
-      try {
-        ctx = repoFor(database !== undefined ? undefined : path);
-      } catch (err) {
-        return fail((err as Error).message);
-      }
-      // Over a table of a database named on the call, as search runs: the
-      // rows whose text column holds every word, by the index's words.
-      if (database !== undefined) {
-        const settled = await dataTable("find", database, table);
-        if ("failed" in settled) return settled.failed;
-        const { shape, client } = settled;
-        if (shape.primaryText === "") return fail(`find: no column of ${database}.${table} is full-text indexed, so there is no find over it; sql filters its columns`);
-        try {
-          const t0 = performance.now();
-          const result = await findRows(client, shape, query, { limit });
-          recordOf(ctx).addKeys(shape.table, shape.keyColumn, result.matches);
-          let usage: string | undefined;
-          if (receiptOn) {
-            const entry = withPlatform(rowFindEntry(result), { hosted: client });
-            recordUsage(ctx.dir, entry);
-            usage = formatReceipt(entry, session);
-          }
-          return ok({ ...result, index: "platform", database, took_ms: Math.round((performance.now() - t0) * 1000) / 1000, ...(usage ? { usage } : {}) });
-        } catch (err) {
-          return fail(`find failed: ${(err as Error).message}${refusalHint(err)}`);
-        }
-      }
-      // Over the rows of a hosted table of another shape the find needs no
-      // local index, so this comes before the local index - which would be
-      // built, and with it drop the platform table (see ownsTable). The
-      // code-index options (ignoreCase, defines, under) have no meaning for a
-      // row and are left out, as the tool text says. Read off the startup
-      // decision: in chunks mode this is the local tool it always was, and
-      // nothing here waits on the platform.
-      const over = rowsOver("find", ctx);
-      if (over && "failed" in over) return over.failed;
-      if (over) {
-        try {
-          const t0 = performance.now();
-          const result = await findRows(ctx.hosted!, over.shape, query, { limit });
-          recordOf(ctx).addKeys(TABLE, over.shape.keyColumn, result.matches);
-          let usage: string | undefined;
-          if (receiptOn) {
-            const entry = withPlatform(rowFindEntry(result), ctx);
-            recordUsage(ctx.dir, entry);
-            usage = formatReceipt(entry, session);
-          }
-          return ok({
-            ...result,
-            index: "platform",
-            took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
-            ...(usage ? { usage } : {}),
-          });
-        } catch (err) {
-          return fail(`find failed: ${(err as Error).message}${refusalHint(err)}`);
-        }
-      }
-      const ensured = await localIndex(ctx);
-      if ("failed" in ensured) return ensured.failed;
-      const { handle, autoIndexed } = ensured;
-      if (!autoIndexed) maybeAutoSync(ctx); // a fresh build is already current
-      try {
-        const t0 = performance.now();
-        // A batch shares the one text budget between its queries.
-        const budget = share && share > 1 ? Math.floor(FIND_RESULT_CHAR_BUDGET / share) : undefined;
-        const result = await find(handle, query, { ignoreCase, defines, under, limit, context, budget });
-        recordOf(ctx).addLines(TABLE, result.matches);
-        const listed = result.matches.length + (result.more ?? []).reduce((n, m) => n + m.lines.length, 0);
-        const hint = findHint(query, result.total, Boolean(defines), result.matches.length, listed) ?? undefined;
-        const noted = autoIndexed ? autoIndexNote(autoIndexed) : undefined;
-        const tookMs = Math.round((performance.now() - t0) * 1000) / 1000;
-        // Written as grep writes it (`renderFind`); the receipt prices that
-        // text, since it is what was returned, and rides on its last line.
-        let usage: string | undefined;
-        if (receiptOn) {
-          const entry = findEntry(result, false, renderFind(result, { hint, autoIndexed: noted?.note, tookMs }));
-          recordUsage(ctx.dir, entry);
-          usage = formatReceipt(entry, session);
-        }
-        return ok(
-          {
-            ...result,
-            ...(hint ? { hint } : {}),
-            ...(noted ? { auto_indexed: noted } : {}),
-            took_ms: tookMs,
-            ...(usage ? { usage } : {}),
+    // search is registered only with an account: local vectors don't exist any
+    // more (the owner's decision, 2026-09-09 - see wantsLocalEmbed above), so a
+    // local "search" would just be a thinner bm25_search under a misleading
+    // name. Without an account, reach for sql's bm25_search/token_match instead.
+    if (platformTools) {
+      server.registerTool(
+        "search",
+        {
+          title: "Code search (exact terms + meaning)",
+          annotations: READ_ONLY,
+          description: (rows
+            ? rowsSearchDescription(rows)
+            : mode.kind === "unresolved"
+            ? unresolvedDescription("Ranked search", TABLE)
+            : "Ranked code search fusing exact keyword matching with semantic similarity, so it works " +
+            "whether or not you know the words. " +
+            "Use it for 'how does X work', 'where is Y handled', code by meaning, context before a " +
+            "change, similar implementations. " +
+            "Each hit carries path, line " +
+            "range, and the chunk content: answer from the hits. The content shows each line with its " +
+            "own number in the file, so cite from those numbers - the hit's line range spans the whole " +
+            "chunk and is not the line a quoted or named thing sits on. Quote only text a hit shows, " +
+            "from the lines you cite it to." +
+            CITE_FROM_HIT +
+            " When one " +
+            "search is not enough, refine the query and search again. " +
+            // Measured on LogDx-CI (35 CI failure logs, evidence lines marked):
+            // at 200 lines returned per log, whole chunks kept 0.797 of the
+            // critical signals and the matching lines 0.853; see focusLines.
+            "Set lines to get each hit as only the lines carrying your query's words, with two lines " +
+            "of context, in place of the whole chunk - for logs, test output and other long records, " +
+            "where the matching lines are the answer; put the words you expect on those lines in the " +
+            "query. For every occurrence of an exact " +
+            "string use find; for counts and rankings use sql; for the whole files the hits name, read, " +
+            "several in one call. Several searches at once: pass queries. The result includes a 'usage' field, a " +
+            "one-line receipt of tokens returned, chunks and files.") + DATA_NOTE,
+          inputSchema: {
+            query: z.string().optional().describe("What you're looking for - terms, a phrase, or a description."),
+            queries: z
+              .array(z.string().min(1))
+              .max(BATCH_MAX)
+              .optional()
+              .describe(
+                "Several queries in one call, run at the same time; the results come back in the same order, " +
+                  "each under its query. Use it in place of one call per query.",
+              ),
+            k: z.number().int().positive().max(50).default(DEFAULT_SEARCH_K).describe("Maximum hits."),
+            question: z.string().optional().describe(RERANK_QUESTION_PARAM),
+            lines: z
+              .boolean()
+              .optional()
+              .describe(
+                "Return each hit as only the lines of its chunk that carry one of the query's words, with " +
+                  "two lines of context, each numbered with its line in the file - not the whole chunk. A " +
+                  "hit reporting matchedLines 0 ranked on meaning alone and comes back whole.",
+              ),
+            path: z
+              .string()
+              .optional()
+              .describe(
+                "Absolute path to the repository root to search. Defaults to the server's configured root; " +
+                  "set it to target a specific repo when a session spans more than one.",
+              ),
+            database: DATABASE_ARG,
+            table: TABLE_ARG,
           },
-          renderFind(result, { hint, autoIndexed: noted?.note, tookMs, usage }),
-        );
-      } catch (err) {
-        return fail(`find failed: ${(err as Error).message}`);
-      }
-    }),
-  );
+        },
+        async (args) => batched("search", args, async ({ query, k, lines, path, question, database, table }) => {
+          let ctx: RepoCtx;
+          try {
+            ctx = repoFor(database !== undefined ? undefined : path);
+          } catch (err) {
+            return fail((err as Error).message);
+          }
+          // Over a table of a database named on the call: the table's own text
+          // and embedding columns, through its database's client; the record
+          // and the ledger are the default root's.
+          if (database !== undefined) {
+            const settled = await dataTable("search", database, table);
+            if ("failed" in settled) return settled.failed;
+            const { shape, client } = settled;
+            if (shape.primaryText === "") {
+              return fail(`search: no column of ${database}.${table} is full-text indexed, so there is no search over it; sql filters its columns${shape.vectorColumn ? `, and vector_search('${table}','${shape.vectorColumn}', {{q:"..."}}, k) ranks them by meaning` : ""}`);
+            }
+            try {
+              const t0 = performance.now();
+              const result = await searchRows(client, shape, query, k, question);
+              let usage: string | undefined;
+              if (receiptOn) {
+                const entry = withPlatform(rowSearchEntry(result), { hosted: client });
+                recordUsage(ctx.dir, entry);
+                usage = formatReceipt(entry, session);
+              }
+              return ok({ ...result, index: "platform", database, took_ms: Math.round((performance.now() - t0) * 1000) / 1000, ...(usage ? { usage } : {}) });
+            } catch (err) {
+              return fail(`search failed: ${(err as Error).message}${refusalHint(err)}`);
+            }
+          }
+          // Over the rows of a hosted table of another shape: the platform
+          // fuses the table's own text and embedding columns. No local index, no
+          // readiness probe - the startup decision already said the table is
+          // there and what it is (rowsOver). A row has no lines to cut to, so
+          // `lines` has no meaning here and is left out.
+          const over = rowsOver("search", ctx);
+          if (over && "failed" in over) return over.failed;
+          if (over) {
+            try {
+              const t0 = performance.now();
+              const [{ value: result, own }, recalled] = await Promise.all([answeredBy(searchRows(ctx.hosted!, over.shape, query, k, question), ctx), recallFor(query)]);
+              const connected = await connectAcrossGraph(ctx, TABLE, result.hits, { query });
+              let usage: string | undefined;
+              if (receiptOn) {
+                const entry = withMemoryTokens(withCalls(rowSearchEntry(result), own, callTelemetry(recalled.call)), recalled.block);
+                recordUsage(ctx.dir, entry);
+                usage = formatReceipt(entry, session);
+              }
+              return ok({
+                ...result,
+                ...connected,
+                index: "platform",
+                ...(recalled.block ? { memory: recalled.block } : {}),
+                took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
+                ...(usage ? { usage } : {}),
+              });
+            } catch (err) {
+              return fail(`search failed: ${(err as Error).message}${refusalHint(err)}`);
+            }
+          }
+          // Reading the hosted index needs no local index at all, so this comes
+          // before ensureIndexed: requiring a local build first would make the
+          // hosted path depend on the very thing it exists to do without.
+          // ctx.hosted is set for the default root whenever this tool is
+          // registered at all; it is unset only when `path` names a different,
+          // local-only repository (RepoRegistry carries the platform client for
+          // the default root alone) - there is no local vector fallback to fall
+          // back to any more, so that case is a clear refusal, not a degraded run.
+          if (!ctx.hosted) {
+            if (signedIn) return fail(`search: ${SIGNED_IN_ROOT}`);
+            return fail(
+              "search needs an account; the default repository has one but " +
+                `'${path}' does not. Use sql's bm25_search/token_match for keyword ranking there instead.`,
+            );
+          }
+          const notReady = await platformNotReady("search", ctx);
+          if (notReady) return notReady;
+          try {
+            const t0 = performance.now();
+            // The hosted table's analyzer decides which lines carry a term
+            // (`lines`): the platform manifest this machine wrote when it loaded
+            // the table records it; a table loaded some other way is read with
+            // the platform's default for a bare column, as analyzerOf says.
+            const hostedAnalyzer = analyzerOf(readPlatformManifest(ctx.dir) ?? { origin: "hosted" });
+            const [{ value: result, own }, recalled] = await Promise.all([
+              answeredBy(searchHosted(ctx.hosted, query, k, { lines, analyzer: hostedAnalyzer }), ctx),
+              recallFor(query),
+            ]);
+            // The hits seed the graph by their place: a chunk's path and
+            // start line name its row.
+            const connected = await connectAcrossGraph(
+              ctx,
+              TABLE,
+              result.hits.map((hit) => ({ path: hit.path, start_line: hit.startLine })),
+              { query },
+            );
+            let usage: string | undefined;
+            if (receiptOn) {
+              // withPlatform, as the rows path does: the platform
+              // returns the tokens it metered for this call, and without this
+              // a remote search is the one hosted path whose read tokens never
+              // reach the ledger. They were being estimated at a measured rate
+              // per search instead, which is a made-up number standing in for
+              // one the response already carried. The recall's read rides on
+              // the same line.
+              const entry = withMemoryTokens(withCalls(searchEntry(result, ctx.root), own, callTelemetry(recalled.call)), recalled.block);
+              recordUsage(ctx.dir, entry);
+              usage = formatReceipt(entry, session);
+            }
+            return ok({
+              ...result,
+              ...connected,
+              index: "platform",
+              ...(recalled.block ? { memory: recalled.block } : {}),
+              took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
+              ...(usage ? { usage } : {}),
+            });
+          } catch (err) {
+            return fail(`search failed: ${(err as Error).message}${refusalHint(err)}`);
+          }
+        }),
+      );
+    }
+
+    server.registerTool(
+      "find",
+      {
+        title: "Find exact text (every occurrence, like grep -n)",
+        annotations: READ_ONLY,
+        description: (rows
+          ? rowsFindDescription(rows)
+          : mode.kind === "unresolved"
+          ? unresolvedDescription("Every row holding every word of an exact string", TABLE)
+          : "Every line in the repository containing an exact string, like grep -n: complete and " +
+          "unranked, written as grep writes it (path:line:text, one line per match, the enclosing " +
+          "definition in brackets when known), with the repo-wide total and the per-file counts after " +
+          "the matches (the grep -c answer). " +
+          "Literal text within one line, case-sensitive unless ignoreCase. Use it where you would " +
+          "grep: every use or definition of an identifier, an error message, a config key. Set defines " +
+          "to get only where a name is defined rather than everywhere it appears. " +
+          // Measured 2026-09-20: three finds for guessed signatures returned
+          // nothing and the model fell back to a regex Grep; the bare name with
+          // defines would have listed the declarations on the first call.
+          FIND_BY_BARE_NAME +
+          // A flood keeps every place: the lines past the text budget come as
+          // path and line numbers (`more`), and a line's text is a sql read.
+          " The lines around a match - what leads into an error and follows it - come with it when you ask " +
+          "for context (like grep -B/-A); no file need be opened for them. " +
+          "A wide result lists every matching place: the first lines with their text, the rest by path and " +
+          "line after them; a line's text is one sql statement away, and the per-file counts count them all. " +
+          "A count per project or per file - which projects use X, how many times each - is one sql statement, " +
+          "never a shell pipeline: " +
+          PER_PROJECT_COUNT +
+          " Not for a file you already know - read it, with every other file you need, in one read call, or its lines are " +
+          `one sql statement away (SELECT start_line, content FROM ${TABLE} WHERE path = '...' ORDER BY start_line). ` +
+          "For meaning or 'how does X work' use search; for rankings use sql. " +
+          "Several finds at once: pass queries. " +
+          "The result includes a 'usage' field, a one-line receipt of tokens returned, matches and files.") + DATA_NOTE,
+        inputSchema: {
+          query: z
+            .string()
+            .min(1)
+            .optional()
+            .describe(
+              "The exact text to find, as it appears in the code - an identifier, a string, a key. Never a " +
+                "signature or a line you have not read: one character off and nothing matches.",
+            ),
+          queries: z
+            .array(z.string().min(1))
+            .max(BATCH_MAX)
+            .optional()
+            .describe(
+              "Several exact strings in one call, found at the same time; the results come back in the " +
+                "same order, each under its query. Use it in place of one call per string.",
+            ),
+          ignoreCase: z
+            .boolean()
+            .optional()
+            .describe("Match regardless of letter case. Default false: case-sensitive, like grep."),
+          defines: z
+            .boolean()
+            .optional()
+            .describe(
+              "Keep only lines inside a definition of the query - where the name is declared, not every " +
+                "place it is used. Answers 'where is X defined' in one call instead of reading use sites " +
+                "until one turns out to be the declaration. The result reports definedFrom, how many " +
+                "matching lines there were before the filter.",
+            ),
+          under: z
+            .string()
+            .optional()
+            .describe(
+              "Repo-relative path prefix to scope to - one repository of a workspace, one subtree of a " +
+                "monorepo, one directory. The total and the per-file counts then describe that subtree, " +
+                "and the result echoes `under` so the numbers are not mistaken for the whole repository. " +
+                "Reach for it when a common name would return thousands of lines across everything: " +
+                "scoping is exact here, because find retrieves every match and cuts afterwards.",
+            ),
+          limit: z
+            .number()
+            .int()
+            .positive()
+            .max(MAX_FIND_LIMIT)
+            .default(DEFAULT_FIND_LIMIT)
+            .describe("Maximum matching lines to return; the result reports the total either way."),
+          question: z.string().optional().describe(RERANK_QUESTION_PARAM),
+          context: z
+            .number()
+            .int()
+            .min(0)
+            .max(MAX_FIND_CONTEXT)
+            .optional()
+            .describe(
+              "Lines before and after each match to carry, from the match's own window - what grep -B/-A " +
+                "shows - so the lines that lead into an error and follow it come with the match, without " +
+                "opening the file. Up to 20; more than a few matches with context is a wide result.",
+            ),
+          path: z
+            .string()
+            .optional()
+            .describe(
+              "Absolute path to the repository root to search. Defaults to the server's configured root; " +
+                "set it to target a specific repo when a session spans more than one. This is a different " +
+                "index; `under` narrows within one.",
+            ),
+          database: DATABASE_ARG,
+          table: TABLE_ARG,
+        },
+      },
+      async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, path, question, share, database, table }) => {
+        let ctx: RepoCtx;
+        try {
+          ctx = repoFor(database !== undefined ? undefined : path);
+        } catch (err) {
+          return fail((err as Error).message);
+        }
+        // Over a table of a database named on the call, as search runs: the
+        // rows whose text column holds every word, by the index's words.
+        if (database !== undefined) {
+          const settled = await dataTable("find", database, table);
+          if ("failed" in settled) return settled.failed;
+          const { shape, client } = settled;
+          if (shape.primaryText === "") return fail(`find: no column of ${database}.${table} is full-text indexed, so there is no find over it; sql filters its columns`);
+          try {
+            const t0 = performance.now();
+            const result = await findRows(client, shape, query, { limit, question });
+            let usage: string | undefined;
+            if (receiptOn) {
+              const entry = withPlatform(rowFindEntry(result), { hosted: client });
+              recordUsage(ctx.dir, entry);
+              usage = formatReceipt(entry, session);
+            }
+            return ok({ ...result, index: "platform", database, took_ms: Math.round((performance.now() - t0) * 1000) / 1000, ...(usage ? { usage } : {}) });
+          } catch (err) {
+            return fail(`find failed: ${(err as Error).message}${refusalHint(err)}`);
+          }
+        }
+        // Over the rows of a hosted table of another shape the find needs no
+        // local index, so this comes before the local index - which would be
+        // built, and with it drop the platform table (see ownsTable). The
+        // code-index options (ignoreCase, defines, under) have no meaning for a
+        // row and are left out, as the tool text says. Read off the startup
+        // decision: in chunks mode this is the local tool it always was, and
+        // nothing here waits on the platform.
+        const over = rowsOver("find", ctx);
+        if (over && "failed" in over) return over.failed;
+        if (over) {
+          try {
+            const t0 = performance.now();
+            const result = await findRows(ctx.hosted!, over.shape, query, { limit, question });
+            let usage: string | undefined;
+            if (receiptOn) {
+              const entry = withPlatform(rowFindEntry(result), ctx);
+              recordUsage(ctx.dir, entry);
+              usage = formatReceipt(entry, session);
+            }
+            return ok({
+              ...result,
+              index: "platform",
+              took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
+              ...(usage ? { usage } : {}),
+            });
+          } catch (err) {
+            return fail(`find failed: ${(err as Error).message}${refusalHint(err)}`);
+          }
+        }
+        const ensured = await localIndex(ctx);
+        if ("failed" in ensured) return ensured.failed;
+        const { handle, autoIndexed } = ensured;
+        if (!autoIndexed) maybeAutoSync(ctx); // a fresh build is already current
+        try {
+          const t0 = performance.now();
+          // A batch shares the one text budget between its queries.
+          const budget = share && share > 1 ? Math.floor(FIND_RESULT_CHAR_BUDGET / share) : undefined;
+          const result = await find(handle, query, { ignoreCase, defines, under, limit, context, budget });
+          const listed = result.matches.length + (result.more ?? []).reduce((n, m) => n + m.lines.length, 0);
+          const hint = findHint(query, result.total, Boolean(defines), result.matches.length, listed) ?? undefined;
+          const noted = autoIndexed ? autoIndexNote(autoIndexed) : undefined;
+          const tookMs = Math.round((performance.now() - t0) * 1000) / 1000;
+          // Written as grep writes it (`renderFind`); the receipt prices that
+          // text, since it is what was returned, and rides on its last line.
+          let usage: string | undefined;
+          if (receiptOn) {
+            const entry = findEntry(result, false, renderFind(result, { hint, autoIndexed: noted?.note, tookMs }));
+            recordUsage(ctx.dir, entry);
+            usage = formatReceipt(entry, session);
+          }
+          return ok(
+            {
+              ...result,
+              ...(hint ? { hint } : {}),
+              ...(noted ? { auto_indexed: noted } : {}),
+              took_ms: tookMs,
+              ...(usage ? { usage } : {}),
+            },
+            renderFind(result, { hint, autoIndexed: noted?.note, tookMs, usage }),
+          );
+        } catch (err) {
+          return fail(`find failed: ${(err as Error).message}`);
+        }
+      }),
+    );
   }
 
   server.registerTool(
@@ -2866,7 +3571,6 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         // Ranked the same way the platform path's rows are: an ordered
         // result carries each row's place in its order (core/facts.ts).
         const raw = await runSql(handle, getEmbedder(), query, embed as Record<string, string> | undefined);
-        recordOf(ctx).addRows(TABLE, raw);
         const rows = rankRows(raw.map(numberRowLines), code);
         const partial = partialIndex(handle.manifest);
         // The platform's own retrieval contract, applied to these rows before
@@ -2908,31 +3612,37 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     }),
   );
 
-  // The files the index named, read from the index: several in one call.
-  // Measured on the live demo (2026-09-26): after find and ask had named
-  // the files, the caller read them with its own Read one per turn, each
-  // turn re-sending the transcript. A rows table has no files to read.
-  if (!rows) {
+  // The files the index named, read whole: several in one call. Measured on
+  // the live demo (2026-09-26): after the index had named the files, the
+  // caller read them with its own Read one per turn, each turn re-sending the
+  // transcript. Over a table of documents (`TableShape.document`) a document
+  // is the rows sharing a path; without a door for it a legal-document benchmark run's
+  // caller paged each one through sql, about 18 calls a task (2026-10-07). A
+  // table of records has no document to read, and the rows of one that could
+  // not be described none either: neither registers it.
+  if (mode.kind === "chunks" || rows?.document) {
     server.registerTool(
       "read",
       {
-        title: "Read files the index named (several at once)",
+        title: rows ? "Read documents the index named (several at once)" : "Read files the index named (several at once)",
         annotations: READ_ONLY,
-        description:
-          "The numbered lines of the files named - several files in one call, from the index, each line " +
-          "as path:line. Use it after find, search, sql or ask have named the files you want, for every " +
-          "file at once, in place of one Read per file. from and to cut every file to a line range; a " +
-          `file over ${READ_LINES_CAP} lines comes back a page at a time, with more saying where the next ` +
-          "page starts. A path the index does not hold comes back as a miss beside the others. " +
-          "The result includes a 'usage' field, a one-line receipt of tokens returned and files.",
+        description: readDescription(rows),
         inputSchema: {
           paths: z
             .array(z.string().min(1))
             .min(1)
-            .max(BATCH_MAX)
-            .describe("Repo-relative paths, as find, search, sql and ask cite them - every file you want, in one call."),
-          from: z.number().int().positive().optional().describe("First line to return, in every file named. Default 1."),
-          to: z.number().int().positive().optional().describe("Last line to return, in every file named. Default the end."),
+            .max(READ_PATHS_MAX)
+            .describe(
+              rows?.document
+                ? `The documents' ${rows.document.pathColumn} values, as find, search and sql return them - every document you want, in one call.`
+                : "Repo-relative paths, as find, search and sql cite them - every file you want, in one call.",
+            ),
+          from: lineOrLines
+            .optional()
+            .describe("First line to return, in every file named - or a list, one per range, paired with to. Default 1."),
+          to: lineOrLines
+            .optional()
+            .describe("Last line to return, in every file named - or a list, one per range, paired with from. Default the end."),
           path: z
             .string()
             .optional()
@@ -2949,23 +3659,59 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         } catch (err) {
           return fail((err as Error).message);
         }
+        let ranges: ReturnType<typeof readRanges>;
+        try {
+          ranges = readRanges(from, to);
+        } catch (err) {
+          return fail(`read failed: ${(err as Error).message}`);
+        }
+        // Over a hosted table of documents the read is one statement on the
+        // platform, before the local index for the reason find's is: a build
+        // would drop the table (see ownsTable).
+        const over = rowsOver("read", ctx);
+        if (over && "failed" in over) return over.failed;
+        if (over) {
+          const document = over.shape.document;
+          try {
+            const t0 = performance.now();
+            const { value: files, own } = await answeredBy(readRows(ctx.hosted!, over.shape, paths, { ranges, budget: readBudget(paths) }), ctx);
+            const got = readHits(files).filter((f) => f.lines !== "");
+            let usage: string | undefined;
+            if (receiptOn) {
+              const entry = withCalls(readEntry(got, TABLE), own);
+              recordUsage(ctx.dir, entry);
+              usage = formatReceipt(entry, session);
+            }
+            const next = readNextCalls(files);
+            return ok({
+              files,
+              ...(next.length > 0 ? { next } : {}),
+              index: "platform",
+              took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
+              ...(usage ? { usage } : {}),
+            });
+          } catch (err) {
+            return fail(`read failed: ${(err as Error).message}${refusalHint(err)}`);
+          }
+        }
         const ensured = await localIndex(ctx);
         if ("failed" in ensured) return ensured.failed;
         const { handle, autoIndexed } = ensured;
         if (!autoIndexed) maybeAutoSync(ctx); // a fresh build is already current
         try {
           const t0 = performance.now();
-          const files = await readFiles(handle, paths, { from, to });
-          const got = files.filter((f): f is Exclude<typeof f, { error: string }> => !("error" in f));
-          recordOf(ctx).addPlaces(TABLE, got.map((f) => ({ path: f.path, startLine: f.from })));
+          const files = await readFiles(handle, paths, { ranges, budget: readBudget(paths) });
+          const got = readHits(files).filter((f) => f.lines !== "");
           let usage: string | undefined;
           if (receiptOn) {
             const entry = readEntry(got);
             recordUsage(ctx.dir, entry);
             usage = formatReceipt(entry, session);
           }
+          const next = readNextCalls(files);
           return ok({
             files,
+            ...(next.length > 0 ? { next } : {}),
             ...(autoIndexed ? { auto_indexed: autoIndexNote(autoIndexed) } : {}),
             took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
             ...(usage ? { usage } : {}),
@@ -3014,6 +3760,100 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         }
       },
     );
+
+    // The page a row came from, for the tables whose card says the
+    // deployment knows where their documents lie (`pages`, from the
+    // platform's `gateway_settings.pages`). The text a row holds is a parse
+    // of the page; what the parse loses - a chart's shading, a misread
+    // figure - is still on the page, and the platform hands back its scanned
+    // image. With one such table the tool names none; with several, the
+    // model says which table the row is in.
+    const pageTables = pagedTables([{ table: TABLE, pages: primaryPages }, ...siblings]);
+    if (pageTables.length > 0) {
+      const rowInput = {
+        document: z.string().min(1).describe("The row's `document`, as the table holds it."),
+        page: z.number().int().min(1).describe("The row's `page`, counted from 1."),
+      };
+      const inputSchema: Record<string, z.ZodTypeAny> =
+        pageTables.length > 1
+          ? { table: z.enum(pageTables as [string, ...string[]]).describe("The table the row is in."), ...rowInput }
+          : rowInput;
+      server.registerTool(
+        "page",
+        {
+          title: "A row's page as it was printed",
+          annotations: READ_ONLY,
+          _meta: { "anthropic/maxResultSizeChars": PAGE_RESULT_MAX_CHARS },
+          description:
+            "The page a row came from, as its scanned image: pass the row's `document` and `page`. Use it when the " +
+            "row's text cannot settle the question - a chart or a shading the text only describes ('[figure: ...]'), " +
+            "a figure that looks misread (digits that do not add up to the printed total), columns the text has run " +
+            "together. The image is the page as printed: read the figures off it.",
+          inputSchema,
+        },
+        async (args: Record<string, unknown>) => {
+          // The schema above is checked before this runs: `table` only where
+          // several tables have pages, one of them.
+          const { table, document, page } = args as { table?: string; document: string; page: number };
+          try {
+            const image = await keysDb.page(table ?? pageTables[0], document, page);
+            return {
+              content: [
+                { type: "image" as const, data: String(image.data), mimeType: String(image.media_type) },
+                { type: "text" as const, text: `${document}, page ${page} (${image.width} x ${image.height} px)` },
+              ],
+            };
+          } catch (err) {
+            return fail(`page failed: ${(err as Error).message}${refusalHint(err)}`);
+          }
+        },
+      );
+    }
+
+    // A web page, where the deployment gives the run the web (CX_WEB_FETCH).
+    // A search answers with snippets, so a series the database does not hold
+    // - a price index's monthly values - was taken from memory instead; this
+    // reads the page the search named. The platform reads it, as it reads a
+    // row's page: nothing is fetched from this machine, and the platform
+    // refuses any address not on the public internet.
+    if (webFetchEnabled()) {
+      server.registerTool(
+        "web_fetch",
+        {
+          title: "A web page's text",
+          annotations: { ...READ_ONLY, openWorldHint: true },
+          description:
+            "The text of a web page, read by the platform: pass its `url` (http or https), such as a page a web " +
+            "search named. A markup page comes back as its words, a table's cells kept apart; a CSV, JSON or plain " +
+            "text page as sent. A long page comes a stretch at a time: pass the answer's `next_offset` as `offset` " +
+            "to read on. Use it for figures the database does not hold - a published series, an index's values - " +
+            "and take them from the page, never from memory.",
+          inputSchema: {
+            url: z.string().min(1).describe("The page's address, http or https."),
+            offset: z
+              .number()
+              .int()
+              .min(0)
+              .optional()
+              .describe("The character to start from: a previous answer's `next_offset`. 0 when absent."),
+          },
+        },
+        async ({ url, offset }: { url: string; offset?: number }) => {
+          try {
+            const page = await keysDb.webFetch(url, offset ?? 0);
+            const text = String(page.text ?? "");
+            const from = Number(page.offset ?? 0);
+            const next = page.next_offset == null ? "" : `; read on with offset ${page.next_offset}`;
+            const header =
+              `${page.url} (${page.content_type || "no stated type"}): characters ${from}-${from + Array.from(text).length} ` +
+              `of ${page.total_chars}${next}`;
+            return { content: [{ type: "text" as const, text: `${header}\n\n${text}` }] };
+          } catch (err) {
+            return fail(`web_fetch failed: ${(err as Error).message}${refusalHint(err)}`);
+          }
+        },
+      );
+    }
   }
 
   if (data) {
@@ -3030,7 +3870,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           "table's columns with their types, which columns are full-text indexed and which the platform embeds, " +
           "the column that names a row, and the table's card - its statistics, sample rows and, when the " +
           "optimizer wrote one, what each column means. Call it once before writing a statement over a table; " +
-          "then sql, search, find and ask take database (and table) to run over it.",
+          "then sql, search and find take database (and table) to run over it.",
         inputSchema: {
           database: z.string().min(1).optional().describe("A database of the account: its tables. With table, that table's shape."),
           table: z.string().min(1).optional().describe("With database: the table whose columns, indexes, key and card to return."),
@@ -3076,7 +3916,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
               (shape.primaryText !== ""
                 ? `; search and find with table "${table}" run over its ${shape.primaryText}`
                 : "; no column is full-text indexed, so there is no search or find over it") +
-              `; ask with tables ["${table}"] asks the platform's loop about it.`,
+              ".",
           });
         } catch (err) {
           return fail(`tables failed: ${(err as Error).message}${refusalHint(err)}`);
@@ -3317,344 +4157,6 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             return fail(`cite failed: ${(err as Error).message}${refusalHint(err)}`);
           }
         },
-      );
-    }
-  }
-
-  if (agentTools) {
-    /** The inputs of `ask`. */
-    const retrievalInputs = {
-      question: z.string().min(1).describe("The question or task, in plain language, about the indexed code."),
-      under: z
-        .string()
-        .optional()
-        .describe(
-          "Repo-relative path prefix to scope to - one repository of a workspace, one subtree of a " +
-            "monorepo, one directory. Carried to the retrieval loop as a constraint on where to look, " +
-            "and echoed back on the result so a scoped answer's facts are not read as the whole " +
-            "repository's.",
-        ),
-      path: z
-        .string()
-        .optional()
-        .describe(
-          "Absolute path to the repository root to ask about. Defaults to the server's configured root; " +
-            "set it to target a specific repo when a session spans more than one.",
-        ),
-      database: DATABASE_ARG,
-      tables: z
-        .array(z.string().min(1))
-        .max(8)
-        .optional()
-        .describe("With `database`: the tables the question is about, when it is about some of them; absent, the loop sees every table of the database."),
-    };
-
-    /** `ask` over a database named on the call: the platform's loop over
-     * every table of it, or the tables named. One table named, its shape is
-     * read so the facts come back as rows of it - text as snippets, placed
-     * by its key and link (`rowsProjection`); several or none, the loop is
-     * shown their cards and the facts come back as the rows it selected. */
-    const askDatabase = async (question: string, database: string, tables: string[] | undefined) => {
-      if (!data) return noDataPlane("ask");
-      const ctx = repoFor();
-      const client = data.client(database);
-      let shape: TableShape | undefined;
-      if (tables?.length === 1) {
-        try {
-          shape = await data.shape(database, tables[0]);
-        } catch (err) {
-          return fail(`ask failed: ${database}.${tables[0]} could not be described: ${(err as Error).message}${refusalHint(err)}`);
-        }
-      }
-      try {
-        const t0 = performance.now();
-        // Without one table's shape no projection is sent (an empty one):
-        // the chunks table's place columns would be sent otherwise, and the
-        // platform refuses a projection naming no column of any table
-        // (measured on the Berka tables, 2026-10-11); each fact then
-        // carries its table's own keys.
-        const { result: returned, spend } = await runRetrievalAgent(
-          client,
-          {
-            question,
-            ...(shape ? { projection: rowsProjection(shape), shape, table: shape.table } : { projection: [] }),
-            ...(!shape && tables?.length ? { tables } : {}),
-          },
-          { maxTurns: subagentMaxTurns(), maxWallSecs: subagentMaxWallSecs(), k: subagentK() },
-        );
-        const result = await completeTruncated(client, returned, shape);
-        const record = recordOf(ctx);
-        if (shape) record.addKeys(shape.table, shape.keyColumn, result.rows);
-        else record.addRows(tables?.[0] ?? database, result.rows);
-        let usage: string | undefined;
-        if (receiptOn) {
-          const entry = withPlatform(subagentEntry(result, spend), { hosted: client });
-          recordUsage(ctx.dir, entry);
-          usage = formatReceipt(entry, session);
-        }
-        return ok({ ...result, database, took_ms: Math.round((performance.now() - t0) * 1000) / 1000, ...(usage ? { usage } : {}) });
-      } catch (err) {
-        return fail(`ask failed: ${(err as Error).message}${refusalHint(err)}`);
-      }
-    };
-
-    /** One retrieval through the platform's loop: the facts back.
-     *
-     * The platform can also write the answer from the rows (`answer: true`
-     * on `runRetrievalAgent`, kept for a caller that wants it). No tool here
-     * asks for it any more: an `explore` tool did, and was measured twice
-     * against the same model fanning out asks - once with Sonnet in early
-     * September, and on 2026-09-19/20 with Opus on both arms of the demo,
-     * twelve questions, the same judge: with explore 8 A / 1 B / 3 C and four
-     * contradicted claims at a median 52 s; without it 12 A, none
-     * contradicted, 47 s, at 1.9x the caller's tokens. The owner: "we have to
-     * go with faster even if a bit more expensive. quality is better and
-     * performance is better." */
-    /** What every call into the platform's loop settles first, for `ask` and
-     * `answer` alike. A repo without the platform client is refused before
-     * any build. Then the same first-query build and auto-sync the other
-     * tools make (both write the platform table too), then the platform
-     * table's own readiness: without a chunks table the platform would spend
-     * the whole cold-start budget on "no table described yet" before saying
-     * anything useful. Over a hosted table of another shape there is no
-     * local index to build or sync - and a build would drop that table (see
-     * ownsTable) - and no readiness to probe: the startup decision saw the
-     * table. The facts are then placed by the columns `rowsProjection` names -
-     * the table's own key, and its link and name where it has a link - not
-     * the chunks table's place columns, and come back as rows of that shape,
-     * text cut to snippets as a search hit's is. */
-    const loopContext = async (tool: string, path: string | undefined): Promise<{ ctx: RepoCtx; over: { shape: TableShape } | null } | { failed: ReturnType<typeof fail> }> => {
-      let ctx: RepoCtx;
-      try {
-        ctx = repoFor(path);
-      } catch (err) {
-        return { failed: fail((err as Error).message) };
-      }
-      const missing = noPlatform(tool, ctx);
-      if (missing) return { failed: missing };
-      const over = rowsOver(tool, ctx);
-      if (over && "failed" in over) return { failed: over.failed };
-      if (!over) {
-        const ensured = await localIndex(ctx);
-        if ("failed" in ensured) return { failed: ensured.failed };
-        if (!ensured.autoIndexed) maybeAutoSync(ctx); // a fresh build is already current
-        const notReady = await platformNotReady(tool, ctx);
-        if (notReady) return { failed: notReady };
-      }
-      return { ctx, over };
-    };
-
-    const retrieve = async ({ question, under, path, database, tables }: { question: string; under?: string; path?: string; database?: string; tables?: string[] }) => {
-      if (database !== undefined) return askDatabase(question, database, tables);
-      const settled = await loopContext("ask", path);
-      if ("failed" in settled) return settled.failed;
-      const { ctx, over } = settled;
-      try {
-        const t0 = performance.now();
-        // The spend (turns, tokens) goes to the ledger and the receipt only;
-        // the result the model sees is the facts: sql, hits, rows, queries.
-        // The repository's own instructions ride with the question only
-        // when asked for (CX_DEV_CONTEXT=1); off, the loop's model gets the
-        // question alone.
-        // With sibling tables in scope the loop sees their cards - columns
-        // and sample rows - and not the deployment's own words on how they
-        // join and what their values mean; those ride as context, the way
-        // a repository's instructions do (the owner, 2026-09-24: "does the
-        // inner loop have those strong sql examples?").
-        const context =
-          [devContextEnabled() ? devContext(ctx.root) : undefined, siblingNames.length > 0 ? siblingNotes() : ""]
-            .filter(Boolean)
-            .join("\n\n") || undefined;
-        // `under` names a subtree of a code index, and a row of a hosted
-        // table of another shape sits in no directory - so it is left out
-        // there, exactly as find leaves its own out.
-        const { result: returned, spend } = await runRetrievalAgent(
-          ctx.hosted!,
-          {
-            question,
-            ...(context !== undefined ? { context } : {}),
-            ...(under !== undefined && !over ? { under } : {}),
-            ...(over ? { projection: rowsProjection(over.shape), shape: over.shape } : {}),
-            // The table this client reads, in either mode: the database can
-            // hold several and the loop, shown all of them, does not always
-            // pick this one (measured 2026-09-12: two code indexes, and every
-            // ask about the second was answered from the first). With
-            // siblings named, the loop sees those too and can join them.
-            table: TABLE,
-            ...(siblingNames.length > 0 ? { tables: siblingNames } : {}),
-          },
-          { maxTurns: subagentMaxTurns(), maxWallSecs: subagentMaxWallSecs(), k: subagentK() },
-        );
-        // The first k of a statement that matched more are a sample, and an
-        // answer written from a sample is not an answer: the rest are read
-        // with the statement (`completeTruncated`), or the statement is
-        // handed over when there are too many to read.
-        const result = await completeTruncated(ctx.hosted!, returned, over?.shape);
-        // On the record for `answer`: the places the hits name, and the
-        // rows of a table of another shape by their key.
-        const record = recordOf(ctx);
-        record.addPlaces(TABLE, result.hits);
-        if (over) record.addKeys(TABLE, over.shape.keyColumn, result.rows);
-        else record.addRows(TABLE, result.rows);
-        let usage: string | undefined;
-        if (receiptOn) {
-          const entry = withPlatform(subagentEntry(result, spend), ctx);
-          recordUsage(ctx.dir, entry);
-          usage = formatReceipt(entry, session);
-        }
-        return ok({
-          ...result,
-          took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
-          ...(usage ? { usage } : {}),
-        });
-      } catch (err) {
-        return fail(`ask failed: ${(err as Error).message}${refusalHint(err)}`);
-      }
-    };
-
-    server.registerTool(
-      "ask",
-      {
-        title: "Ask the repository index: one retrieval, the facts back",
-        annotations: READ_ONLY,
-        description: (rows
-          ? rowsAskDescription(rows, DEV_CONTEXT_NOTE)
-          : mode.kind === "unresolved"
-          ? unresolvedDescription("A question or task in plain language, answered with the rows it retrieved,", TABLE)
-          : // The first sentence is what the choice between ask and the model's
-            // own file tools turns on, so it says what one call does and covers
-            // before it says what comes back. How the subagent works inside -
-            // which model, how many searches at once - stays out: the caller
-            // cannot act on it, and a call that advertises its own parallelism
-            // invites one broad question where several asks in one reply are
-            // the shape wanted (PREFER_SEVERAL_ASKS).
-            "Ask the repository index a question or task in plain language: a read-only retrieval " +
-          "subagent chooses and runs the searches itself - keyword, hybrid, vector and SQL, as the " +
-          "question needs - over the whole repository and returns the rows it found, with exact path, " +
-          "start_line, end_line and the code, in the shape of search hits, plus aggregate rows (counts, " +
-          "rankings) and the SQL whose rows answer the question - never a summary. " +
-          // The scope, said where the choice is made: with siblings, an ask
-          // reaches the tables beside the code and joins them (the owner,
-          // 2026-09-24: "it's still not reaching for ask often enough").
-          (siblingNames.length > 0
-            ? `It searches ${TABLE} and, in the same database, ${siblingNames.join(", ")}, and joins them: a question ` +
-              "that touches the code and the tables beside it is an ask first, not your own sql - the loop writes the " +
-              "statements, several at once, joins included, and you read the rows. "
-            : "") +
-          // "Use it for a lookup" read as a narrow tool; the owner's rule is
-          // the opposite ("it should also use ask extensively it's just
-          // cheaper and faster").
-          "Use it for most questions, before your own sql or search: any question about the code or the data " +
-          "that is not one statement you already know or one exact literal - where is Y handled, how does X " +
-          "work, which files or projects do Z, what the rows about W say, what fails and why. " +
-          `${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS} ` +
-          "A single question over a large codebase splits the same way: one call per section with " +
-          "`under` naming its subtree, all issued together. " +
-          // The whole-mechanism question is ask's too, as several asks in one
-          // reply (see the note on `retrieve`).
-          "A mechanism that spans files - how X works end to end, what calls what - is one ask per " +
-          "part: they run at the same time, and you do the following-up yourself from the rows they " +
-          "return. " +
-          // A model whose ask came back thin went to Read next, file after
-          // file (Fable on the demo, 2026-09-24). The owner: "you can
-          // rephrase ask to be more specific and re-issue the question again
-          // if you don't get what you want from ask. it can handle a lot of
-          // parallelism so you could even be broader in your search."
-          "If an ask did not bring back what you wanted, rephrase it - more specific, or broader - and " +
-          "ask again, or ask several at once: it runs many searches in parallel, so several asks in one " +
-          "reply cost one wait, and a second ask is cheaper than reading files yourself. " +
-          // A count and a question across projects were going to Bash: the
-          // sentence here sent "how many" to find and "a file you already
-          // know" to Read, and the model took that as the file tools' turn
-          // (the owner, 2026-09-24: "it should use sql or find but it should
-          // also use ask extensively it's just cheaper and faster").
-          "How many - files, projects, places that do X - is one ask, or one sql statement when you " +
-          "can already write it; every line holding one exact string is find's. A question across " +
-          "projects or repositories is ask's, several at once. Never Grep, Glob or Read for what one " +
-          "of these answers; a hit marked truncated is its row, one sql statement away. Answer from " +
-          "the rows and cite path:line. " +
-          DEV_CONTEXT_NOTE +
-          "The result includes a 'usage' field, a one-line receipt of what the call cost.") + DATA_NOTE,
-        inputSchema: retrievalInputs,
-      },
-      retrieve,
-    );
-
-    /** The written answer: the platform's loop retrieves for the question
-     * once more with the caller's notes as its context, its writer composes
-     * from the rows under the same citation instruction the caller has, the
-     * cite pass checks the places, and the text comes back. How it reaches
-     * the person is the display mode's business (core/answer-display.ts):
-     * under the hook it goes to a file the hook shows and the model is told
-     * to say one sentence, with the text beside the instruction so the
-     * model holds it for the next request; without a hook the model is told
-     * to relay it exactly. Either way nothing in the result invites a
-     * rewrite: no rows, no coverage, no receipt beside the text. */
-    const writeAnswer = async ({ question, narration, under, path }: { question: string; narration?: string; under?: string; path?: string }) => {
-      const settled = await loopContext("answer", path);
-      if ("failed" in settled) return settled.failed;
-      const { ctx, over } = settled;
-      try {
-        const dev = devContextEnabled() ? devContext(ctx.root) : undefined;
-        // What the model said while it worked - its text between tool calls,
-        // as the installed hook read it from the session transcript; the
-        // model itself types nothing here.
-        const said = narration?.trim();
-        const context = [dev, siblingNames.length > 0 ? siblingNotes() : "", said ? `${NARRATION_HEADING}\n${said}` : undefined]
-          .filter(Boolean)
-          .join("\n\n");
-        // The rows this server returned to the model in the session: the
-        // platform writes from them and runs no loop. With none on record -
-        // a question answered without a retrieval through this server - the
-        // platform retrieves for the question itself.
-        const record = recordOf(ctx);
-        const facts = record.facts();
-        const { result, spend } = await runRetrievalAgent(
-          ctx.hosted!,
-          {
-            question,
-            answer: true,
-            ...(facts.length ? { facts } : {}),
-            ...(context ? { context } : {}),
-            ...(under !== undefined && !over ? { under } : {}),
-            ...(over ? { projection: rowsProjection(over.shape), shape: over.shape } : {}),
-            table: TABLE,
-            ...(siblingNames.length > 0 ? { tables: siblingNames } : {}),
-          },
-          { maxTurns: subagentMaxTurns(), maxWallSecs: subagentMaxWallSecs(), k: subagentK() },
-        );
-        if (receiptOn) recordUsage(ctx.dir, withPlatform(subagentEntry(result, spend, "answer"), ctx));
-        if (!result.answer) return fail(`answer: ${result.error ?? "the platform wrote no answer from the rows it retrieved"} - answer the question yourself from what you have gathered.`);
-        // The answer consumed the record: the next question starts its own.
-        record.clear();
-        // The file the hook reads, kept under the index directory beside the
-        // ledger; written in both modes so a run's answers can be read back.
-        const dir = join(ctx.dir, ANSWERS_DIR);
-        mkdirSync(dir, { recursive: true });
-        const file = join(dir, `${new Date().toISOString().replace(/[:.]/g, "-")}.md`);
-        writeFileSync(file, result.answer);
-        const text = answerDisplay === "hook" ? hookDeliveryText(file, result.answer) : relayDeliveryText(result.answer);
-        return { content: [{ type: "text" as const, text }] };
-      } catch (err) {
-        return fail(`answer failed: ${(err as Error).message}${refusalHint(err)}`);
-      }
-    };
-
-    if (answerTool) {
-      server.registerTool(
-        "answer",
-        {
-          title: "Write the answer from what was retrieved, and deliver it",
-          annotations: READ_ONLY,
-          description: answerDescription(answerDisplay, Boolean(rows)),
-          inputSchema: {
-            question: z.string().min(1).describe("The question as the user asked it."),
-            narration: z.string().optional().describe("Set by the installed hook. Leave it out."),
-            under: retrievalInputs.under,
-            path: retrievalInputs.path,
-          },
-        },
-        writeAnswer,
       );
     }
   }

@@ -120,7 +120,8 @@ describe("the server over Streamable HTTP, read-only", () => {
     const names = tools.map((t) => t.name);
     expect(names).toContain("tables");
     expect(names).toContain("sql");
-    expect(names).toContain("ask");
+    expect(names).toContain("search");
+    expect(names).not.toContain("ask");
     expect(names).not.toContain("hydrate");
     expect(names).not.toContain("hydrate_status");
     expect(names).not.toContain("hydrate_cancel");

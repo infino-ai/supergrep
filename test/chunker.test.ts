@@ -254,6 +254,15 @@ describe("chunkFile", () => {
     expect(second?.scope).toBe("Title");
   });
 
+  it("keeps a long heading whole, as symbol and as scope", async () => {
+    const title = Array(40).fill("word").join(" ");
+    const md = [`# ${title}`, ...Array(70).fill("text"), "## Second", ...Array(10).fill("more")].join("\n");
+    const chunks = await chunkFile("doc.md", md);
+    expect(chunks.some((c) => c.symbol === title)).toBe(true);
+    const second = chunks.find((c) => c.content.startsWith("## Second"));
+    expect(second?.scope).toBe(title);
+  });
+
   it("leaves symbol unset for fixed-window (unparsed) chunks", async () => {
     const content = Array.from({ length: 150 }, (_, i) => `line ${i}`).join("\n");
     const chunks = await chunkFile("data.toml", content);

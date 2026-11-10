@@ -28,12 +28,12 @@ to provision. (Running the server via `npx` also contacts the npm registry;
 install the package for fully offline use.) Semantic ranking (`search`) is
 not part of this mode: it is a platform capability, so it needs an account.
 
-**With an account (`find` and plain `sql` still local; `search`, a `sql`
-statement with a ranked search in it, and `ask` run in the cloud):** the
+**With an account (`find` and plain `sql` still local; `search`, and a `sql`
+statement with a ranked search in it, run in the cloud):** the
 chunks your index holds - `path`, `start_line`, `end_line`, `lang`, `symbol`
 and the code `content` itself - are loaded into a platform database: one of
-the directory's own on your account, the first time you use `search` or
-`ask` in it (a directory you only `find` in is never uploaded), or one you
+the directory's own on your account, the first time you use `search` in
+it (a directory you only `find` in is never uploaded), or one you
 name with `--db`, over HTTPS (plain `http://` is accepted for a loopback
 host only). A bearer key authenticates every request; it is never passed as
 a command-line argument (arguments are visible to every process on the
@@ -41,7 +41,7 @@ machine) - it comes from `login`'s own consent-and-store flow, a file
 (`--api-key-file`), or the `INFINO_API_KEY` environment variable. By
 default the platform's own model embeds that copy server-side
 (`--embed-provider local` keeps embedding on this machine and ships the
-vectors instead). `search`, a ranked `sql` statement and `ask` send your
+vectors instead). `search` and a ranked `sql` statement send your
 question or code to that platform and answer from what it retrieves;
 `find` and plain `sql` never leave the local index. If you need the
 local-only mode's guarantees, do not sign in (`cx login --logout` undoes

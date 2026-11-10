@@ -193,12 +193,10 @@ describe("a signed-in session and the repository the server was started for", ()
 
   it("is served neither the server's repository nor another directory of its machine, and writes nothing to the caller's account for them", async () => {
     const { client } = await signedIn(url, GOOD_KEY);
-    const names = (await client.listTools()).tools.map((t) => t.name);
     const doors = [
       { name: "find", args: { query: TOKEN } },
       { name: "sql", args: { query: "SELECT path FROM chunks" } },
       { name: "search", args: { query: TOKEN } },
-      ...(names.includes("ask") ? [{ name: "ask", args: { question: `where is ${TOKEN}` } }] : []),
     ];
     for (const { name, args } of doors) {
       const own = await callText(client, name, args);

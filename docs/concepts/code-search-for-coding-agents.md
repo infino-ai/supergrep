@@ -3,11 +3,9 @@
 A coding agent answers a question about a codebase in one of two ways. It can
 crawl (glob, grep, then read whole files into the context window until it has
 enough to answer), or it can retrieve (ask a ranked index for the most
-relevant code and read only that). SuperGrep is the retrieval path, and it
-offers it two ways: `find`, `search` and `sql` for the agent to retrieve
-itself, and `ask` to hand the retrieval to small models on the Infino
-service, over the same index's platform copy, so the exploration never
-enters the caller's own context at all.
+relevant code and read only that). SuperGrep is the retrieval path: `find`,
+`search` and `sql` for the agent to retrieve itself, each returning the lines
+that matter rather than whole files.
 
 ## Why crawling is expensive
 
@@ -64,8 +62,8 @@ the same chunks load into a database on the platform, where the embeddings
 are computed. Keyword search is live seconds after indexing starts; vectors
 backfill in the background; and edits re-sync incrementally to both copies,
 so the index tracks the working tree without anyone asking. `find` and plain
-`sql` read the local copy and need no account; `search`, a ranked `sql` and
-`ask` run on the platform copy and are metered there.
+`sql` read the local copy and need no account; `search` and a ranked `sql`
+run on the platform copy and are metered there.
 
 See the [README](../../README.md#what-it-saves) for measured cost and quality
 on real agent runs, and [tradeoffs](../tradeoffs.md) for the limits.

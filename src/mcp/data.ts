@@ -304,7 +304,7 @@ export class DataPlane {
       ...(req.dry_run
         ? {}
         : {
-            follow: `the load runs on the platform; hydrate_status with database "${database}" and the table follows it, and the table answers sql, search, find and ask once its state is succeeded`,
+            follow: `the load runs on the platform; hydrate_status with database "${database}" and the table follows it, and the table answers sql, search and find once its state is succeeded`,
           }),
     };
   }

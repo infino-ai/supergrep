@@ -7,7 +7,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { connect } from "@infino-ai/infino";
 import { indexRepo, indexRepoStaged, syncRepo } from "../src/core/indexer.js";
 import { readManifest } from "../src/core/manifest.js";
-import { analyzerOf, analyzerTokens, cutFindMatches, find, plainTerms, readFiles, READ_LINES_CAP, runSql, search } from "../src/core/searcher.js";
+import { analyzerOf, analyzerTokens, cutFindMatches, find, plainTerms, readFiles, readRanges, READ_LINES_CAP, runSql, search } from "../src/core/searcher.js";
+/** The read budget the tests read under: a result past it is paged. */
+const RESULT_MAX_CHARS = 60_000;
 import { TABLE } from "../src/core/config.js";
 import type { IndexHandle } from "../src/core/context.js";
 import type { Embedder } from "../src/core/embedder.js";
@@ -129,7 +131,7 @@ describe("search", () => {
   it("keyword ranking, since the local index never has vectors", async () => {
     const r = await search(handle, fakeEmbedder, "commit log", 5);
     expect(r.ranking).toBe("keyword");
-    expect(r.note).toMatch(/vectors not ready/);
+    expect(r.note).toMatch(/local index is keyword-only/);
   });
 
   it("with lines, a hit is the chunk's matching lines with two of context, numbered in the file", async () => {
@@ -382,9 +384,15 @@ describe("find", () => {
   });
 });
 
+/** A result budget small enough for a test to pass: two numbered lines of
+ * the long fixture files and a little more. */
+const SMALL_BUDGET = 20;
+
 describe("read", () => {
+  const budget = RESULT_MAX_CHARS;
+
   it("returns every file named in one call, numbered from the index, a miss beside the others", async () => {
-    const files = await readFiles(handle, ["src/auth.ts", "src/storage.ts", "nowhere.ts"]);
+    const files = await readFiles(handle, ["src/auth.ts", "src/storage.ts", "nowhere.ts"], { budget });
     expect(files.map((f) => f.path)).toEqual(["src/auth.ts", "src/storage.ts", "nowhere.ts"]);
     const auth = files[0] as { lines: string; from: number; to: number; total: number };
     expect(auth.from).toBe(1);
@@ -397,31 +405,99 @@ describe("read", () => {
   });
 
   it("stitches overlapping windows so a line appears once, and cuts to a range", async () => {
-    const [notes] = (await readFiles(handle, ["notes.txt"])) as Array<{ lines: string; total: number; more?: unknown }>;
+    const [notes] = (await readFiles(handle, ["notes.txt"], { budget })) as Array<{ lines: string; total: number; more?: unknown }>;
     // Line 55 is in two windows of the fixed-window chunking; once here.
     expect(notes.lines.split("\n").filter((l) => l.includes("OVERLAP_MARK"))).toHaveLength(1);
     expect(notes.total).toBe(130);
     expect(notes.more).toBeUndefined();
-    const [range] = (await readFiles(handle, ["notes.txt"], { from: 20, to: 22 })) as Array<{ lines: string; from: number; to: number }>;
+    const [range] = (await readFiles(handle, ["notes.txt"], { ranges: readRanges(20, 22), budget })) as Array<{ lines: string; from: number; to: number }>;
     expect(range.from).toBe(20);
     expect(range.to).toBe(22);
     expect(range.lines.split("\n")).toEqual(["20: parse_config(Path) ABC-123 x.y Süd ok", "21: filler 21", "22: filler 22"]);
-    await expect(readFiles(handle, ["notes.txt"], { from: 5, to: 2 })).rejects.toThrow(/before/);
+    await expect(readFiles(handle, ["notes.txt"], { ranges: readRanges(5, 2), budget })).rejects.toThrow(/before/);
+  });
+
+  it("reads several files with several ranges in one call, merged where they meet, a gap marked between the rest", async () => {
+    const ranges = readRanges([1, 20, 30, 33], [2, 21, 34, 36]);
+    const [notes, auth] = (await readFiles(handle, ["notes.txt", "src/auth.ts"], { ranges, budget })) as Array<{
+      lines: string;
+      from: number;
+      to: number;
+      more?: unknown;
+    }>;
+    expect(notes.from).toBe(1);
+    expect(notes.to).toBe(36);
+    expect(notes.more).toBeUndefined();
+    // 30-34 and 33-36 overlap and come back as one run; 1-2 and 20-21 stand apart.
+    expect(notes.lines.split("\n").map((l) => l.split(":")[0])).toEqual(["1", "2", "--", "20", "21", "--", "30", "31", "32", "33", "34", "35", "36"]);
+    // The same ranges cut every file named: the short file has lines 1-2 alone.
+    expect(auth.lines.split("\n")).toEqual(["1: // Session tokens and verification.", "2: export function verifySession(token: string): boolean {"]);
+    await expect(readFiles(handle, ["notes.txt"], { ranges: [{ from: 9, to: 3 }], budget })).rejects.toThrow(/before/);
+  });
+
+  it("pairs lists of from and to in order, and refuses lists that do not pair", () => {
+    expect(readRanges(undefined, undefined)).toBeUndefined();
+    expect(readRanges(5, undefined)).toEqual([{ from: 5, to: Number.MAX_SAFE_INTEGER }]);
+    expect(readRanges(undefined, 9)).toEqual([{ from: 1, to: 9 }]);
+    expect(readRanges([559, 1938], [610, 1975])).toEqual([
+      { from: 559, to: 610 },
+      { from: 1938, to: 1975 },
+    ]);
+    expect(() => readRanges([1, 2], [3])).toThrow(/same length/);
+    expect(() => readRanges([1, 2], 9)).toThrow(/same length/);
+    expect(() => readRanges([1, 2], undefined)).toThrow(/same length/);
   });
 
   it("pages a long file at the line cap and says where the next page starts", async () => {
     const long = Array.from({ length: READ_LINES_CAP + 50 }, (_, i) => `row ${i + 1}`);
     writeFileSync(join(root, "long.txt"), long.join("\n") + "\n");
     await syncRepo({ root, db: handle.db, indexDirPath: dir, embedder: fakeEmbedder });
-    const [page] = (await readFiles(handle, ["long.txt"])) as Array<{ from: number; to: number; total: number; more?: { from: number }; lines: string }>;
+    const [page] = (await readFiles(handle, ["long.txt"], { budget })) as Array<{ from: number; to: number; total: number; more?: { from: number }; lines: string }>;
     expect(page.from).toBe(1);
     expect(page.to).toBe(READ_LINES_CAP);
     expect(page.more).toEqual({ from: READ_LINES_CAP + 1 });
     expect(page.lines.split("\n")).toHaveLength(READ_LINES_CAP);
-    const [rest] = (await readFiles(handle, ["long.txt"], { from: READ_LINES_CAP + 1 })) as Array<{ from: number; to: number; more?: unknown }>;
+    const [rest] = (await readFiles(handle, ["long.txt"], { ranges: readRanges(page.more!.from, undefined), budget })) as Array<{ from: number; to: number; more?: unknown }>;
     expect(rest.from).toBe(READ_LINES_CAP + 1);
     expect(rest.to).toBe(READ_LINES_CAP + 50);
     expect(rest.more).toBeUndefined();
+  });
+
+  it("pages several ranges past the line cap and names the ranges still to come", async () => {
+    const long = Array.from({ length: READ_LINES_CAP + 100 }, (_, i) => `row ${i + 1}`);
+    writeFileSync(join(root, "long2.txt"), long.join("\n") + "\n");
+    await syncRepo({ root, db: handle.db, indexDirPath: dir, embedder: fakeEmbedder });
+    const ranges = readRanges([1, READ_LINES_CAP + 10, READ_LINES_CAP + 50], [READ_LINES_CAP - 5, READ_LINES_CAP + 20, READ_LINES_CAP + 60]);
+    const [page] = (await readFiles(handle, ["long2.txt"], { ranges, budget })) as Array<{ to: number; more?: { from: number[]; to: number[] } }>;
+    // The first range is 395 lines and the second begins the cap's last five.
+    expect(page.to).toBe(READ_LINES_CAP + 14);
+    expect(page.more).toEqual({ from: [READ_LINES_CAP + 15, READ_LINES_CAP + 50], to: [READ_LINES_CAP + 20, READ_LINES_CAP + 60] });
+    const [rest] = (await readFiles(handle, ["long2.txt"], { ranges: readRanges(page.more!.from, page.more!.to), budget })) as Array<{
+      lines: string;
+      more?: unknown;
+    }>;
+    expect(rest.more).toBeUndefined();
+    expect(rest.lines.split("\n")[0]).toBe(`${READ_LINES_CAP + 15}: row ${READ_LINES_CAP + 15}`);
+  });
+
+  it("pages at the result's budget too: the first file keeps a page that fits, a file past it keeps its count, a note and where to start", async () => {
+    const [first, second] = (await readFiles(handle, ["long.txt", "src/auth.ts"], { budget: SMALL_BUDGET })) as Array<{
+      from: number;
+      to: number;
+      total: number;
+      lines: string;
+      more?: { from: number };
+      note?: string;
+    }>;
+    // The page's text, line breaks and all, holds to the budget.
+    expect(first.lines.length).toBeLessThanOrEqual(SMALL_BUDGET);
+    // "1: row 1" and "2: row 2" fit in the budget, a third line would not.
+    expect(first.lines.split("\n")).toEqual(["1: row 1", "2: row 2"]);
+    expect(first.more).toEqual({ from: 3 });
+    expect(second.lines).toBe("");
+    expect(second.total).toBeGreaterThan(0);
+    expect(second.note).toMatch(/past the result budget/);
+    expect(second.more).toEqual({ from: 1 });
   });
 });
 

@@ -4,7 +4,7 @@
 // The platform REST client: code-context talks to an Infino platform database
 // over its `/v1/<op>/<database>` data plane to keep the repository's chunks
 // table there beside the local index (every build and sync writes both) and
-// to run the `ask` tool against it. This file owns the
+// to run `search` against it. This file owns the
 // wire: request shapes (field names as the platform's request structs spell
 // them), auth, the cold-start retry loop, error decoding, and the Arrow IPC
 // encoding an append carries. Nothing here knows about chunks or tools - the
@@ -15,7 +15,7 @@ import * as arrow from "apache-arrow";
 import { Agent, fetch as undiciFetch } from "undici";
 
 import { jsonify } from "./json.js";
-import type { PlatformFact } from "./retrieval-record.js";
+import type { Searched } from "./graph-expand.js";
 
 // --- constants ------------------------------------------------------------------
 
@@ -49,10 +49,9 @@ export const DEFAULT_COLD_START_SECS = 120;
 /** Seconds to wait before a retry when the server sent no `Retry-After`. */
 const DEFAULT_RETRY_AFTER_SECS = 5;
 
-/** Extra wall clock a `sub_agent` call gets on top of its own `max_wall_secs`:
- * the loop may run right up to its budget and the answer still has to travel
- * back. */
-const ASK_TIMEOUT_MARGIN_SECS = 60;
+/** What a call says when its client's deadline (`HostedOptions.deadlineMs`)
+ * ended it: never made, or abandoned in flight. */
+const PAST_DEADLINE = "no answer before this client's deadline";
 
 /** Milliseconds per second, named so the unit conversions read as such. */
 const MS_PER_SEC = 1000;
@@ -161,15 +160,92 @@ export interface HostedCallInfo {
 export interface HostedOptions {
   /** Injected for tests; defaults to the global fetch. */
   fetch?: typeof fetch;
-  /** Per-call timeout (default 60 s). A `sub_agent` call uses its own budget instead. */
+  /** Per-call timeout (default 60 s). */
   timeoutMs?: number;
   /** How long retryable failures are re-issued before giving up (default 120 s). */
   coldStartSecs?: number;
+  /** An instant (`Date.now()` milliseconds) past which no call through this
+   * client runs: one made after it fails at once without reaching the
+   * platform, and one in flight then is abandoned, a wait before a retry
+   * included. Every other budget of a call ends at it too. Absent, a call has
+   * only its own budgets. For reads a server's start-up makes, which a
+   * client waits on for a fixed time only (see serveMcp). */
+  deadlineMs?: number;
   /** Called once per logical call with its telemetry. */
   onCall?: (info: HostedCallInfo) => void;
 }
 
 export type RowRecord = Record<string, unknown>;
+
+/** What a card is asked for beyond its tier (`HostedDb.tableCard`): laid
+ * out within a budget - `whole` columns listed whole, most rows with a
+ * value first, and a map of at most `families` name families for the rest,
+ * the layout the platform's own loop reads a wide table in - or the entries
+ * matching a `pattern` (a column name; `*` for any run of characters, as
+ * in `name*` or `*word*`; or `*` alone),
+ * whole, most rows first, `limit` of them, with `matched` on the record
+ * saying how many there were. The two forms do not go together. */
+export interface TableCardOptions {
+  whole?: number;
+  families?: number;
+  pattern?: string;
+  limit?: number;
+  /** With `pattern`: what the caller needs the columns for, so the ones it
+   * needs come first - ranked by the pass the platform's loop ranks its
+   * own lookups by. */
+  question?: string;
+}
+
+/** What a read asks the platform to do to its rows before they come back:
+ * check them against the question (`validate`, `query_sql` alone) and
+ * order them by its grader for the question, keeping the top `k`
+ * (`rerank`) - the triage pass the platform's own retrieval loop ranks its
+ * results by. A search with `rerank` is fetched wider (the platform's triage pool)
+ * and cut to `k` after. */
+export interface ReadChecks {
+  validate?: { table_name: string; field_name: string; question?: string };
+  rerank?: { question: string; k?: number };
+}
+
+/** A read's rows with what the platform said of them. */
+export interface CheckedRows {
+  rows: RowRecord[];
+  validation?: RowRecord;
+  rerank?: RowRecord;
+}
+
+/** The fields `checks` adds to a read's body: none for a check not asked. */
+function readChecks(checks: ReadChecks): RowRecord {
+  return {
+    ...(checks.validate ? { validate: checks.validate } : {}),
+    ...(checks.rerank ? { rerank: checks.rerank } : {}),
+  };
+}
+
+/** The scope's cards as the platform's loop carries them in its prompt
+ * (`GET /v1/table_card/{db}?tables=`): one rendering for the model inside
+ * the loop and the one outside it. */
+export interface PromptCards {
+  /** The cards' JSON text, as the loop's prompt carries it. */
+  cards: string;
+  /** The tables' search vocabulary, as the prompt carries it; "" when none. */
+  vocabulary: string;
+  /** The tables whose cards `cards` shows, best first. */
+  shown: string[];
+  /** The tables `cards` names in a line each, without their cards. */
+  listed: string[];
+  /** The tables asked for that have no card yet. */
+  missing: string[];
+  tier: string;
+  /** Whether the cards were ranked for a question rather than shown as
+   * they are, and whether the platform's grader ranked them. */
+  ranked: boolean;
+  graded: boolean;
+  /** The note the loop puts under the question when the cards are ranked
+   * for one: the tables in the ranking's order and the columns judged to
+   * hold what it asks. Absent otherwise. */
+  note?: string;
+}
 
 /** One column of a `create_table` schema, in code-context's shape. A scalar is
  * the platform's type spelling (`"large_utf8"`, `"i32"`, ...); a vector column
@@ -216,13 +292,18 @@ export class HostedError extends Error {
   readonly op: string;
   /** The server's `Retry-After`, in seconds, when the failure carried one. */
   readonly retryAfterSecs?: number;
+  /** Whether the call ran out of its client's deadline (`deadlineMs`) rather
+   * than failing on its own: not made at all, or abandoned in flight. The
+   * platform said nothing about the table; the caller ran out of time. */
+  readonly pastDeadline: boolean;
 
-  constructor(op: string, status: number, message: string, options?: { retryAfterSecs?: number; cause?: unknown }) {
+  constructor(op: string, status: number, message: string, options?: { retryAfterSecs?: number; cause?: unknown; pastDeadline?: boolean }) {
     super(status > 0 ? `${op}: server returned ${status}: ${message}` : `${op}: ${message}`, options?.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = "HostedError";
     this.op = op;
     this.status = status;
     if (options?.retryAfterSecs !== undefined) this.retryAfterSecs = options.retryAfterSecs;
+    this.pastDeadline = options?.pastDeadline === true;
   }
 }
 
@@ -383,12 +464,20 @@ export async function uploadBytes(
   }
   if (!response.ok) throw new HostedError("upload", response.status, serverMessage(response.status, await response.text()));
 }
+/** The status a platform answers a read whose body it does not take. */
+const HTTP_BAD_REQUEST = 400;
 
 export class HostedDb {
+  /** Whether this platform refused a read's `rerank` - one that predates
+   * it, whose read requests take no field they do not know. Set by the
+   * first refusal; from then on a read goes out without it. */
+  private rerankUnsupported = false;
+
   readonly target: HostedTarget;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly coldStartMs: number;
+  private readonly deadlineMs: number;
   private readonly onCall?: (info: HostedCallInfo) => void;
   private last: HostedCallInfo | null = null;
 
@@ -402,6 +491,7 @@ export class HostedDb {
     this.fetchImpl = opts.fetch ?? platformFetch;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.coldStartMs = (opts.coldStartSecs ?? DEFAULT_COLD_START_SECS) * MS_PER_SEC;
+    this.deadlineMs = opts.deadlineMs ?? Number.POSITIVE_INFINITY;
     this.onCall = opts.onCall;
   }
 
@@ -526,24 +616,114 @@ export class HostedDb {
     return this.parseJson(exchange, "join_keys") as RowRecord;
   }
 
+  /** `POST /v1/graph_expand/{db}`: the rows of the other tables the
+   * platform's graph links to these rows of `table` - the rows a verified
+   * join reaches from their key values, the definitions of the names a code
+   * row uses (`relation: defines <name>`, first), the rows the platform read
+   * as mentioning the same entities - by table, strongest first, each row
+   * as that table's search shows it. The platform's own answering loop runs
+   * the same expansion on its own retrievals; this is how a caller driving
+   * retrieval itself gets it. `seeds` is how many of the rows seeded the
+   * walk, `note` why nothing was reached when nothing was. Rows carry the
+   * engine's `_id` when the caller has it, else their place or key; sent
+   * through jsonify since a cell may be a bigint. With `searched`, the facts
+   * matching the words searched come back too, from every document. */
+  async graphExpand(table: string, rows: readonly object[], searched?: Searched): Promise<RowRecord> {
+    const exchange = await this.call({
+      op: "graph_expand",
+      method: "POST",
+      body: jsonify({ table_name: table, rows, ...(searched?.query ? { query: searched.query } : {}), ...(searched?.statement ? { statement: searched.statement } : {}) }),
+      contentType: JSON_CONTENT_TYPE,
+      acceptJson: true,
+      timeoutMs: this.timeoutMs,
+    });
+    return (this.parseJson(exchange, "graph_expand") as RowRecord | null) ?? {};
+  }
+
+  /** `POST /v1/graph_facts/{db}`: one read statement over the facts the
+   * platform's graph read from this database's text - its `facts` table,
+   * kept beside the database and never in its catalog, so no statement over
+   * the database can name it. Its rows, and a note when the deployment builds
+   * no graph. */
+  async graphFacts(sql: string): Promise<RowRecord> {
+    const exchange = await this.call({
+      op: "graph_facts",
+      method: "POST",
+      body: jsonify({ sql }),
+      contentType: JSON_CONTENT_TYPE,
+      acceptJson: true,
+      timeoutMs: this.timeoutMs,
+    });
+    return (this.parseJson(exchange, "graph_facts") as RowRecord | null) ?? {};
+  }
+
   /** `GET /v1/table_card/{db}?table=[&tier=]`: the table's card - its schema
    * with each column's index role, per-column statistics (min, max, distinct)
    * and sample rows, as the platform's optimizer last computed them from the
    * table itself. A tier asks for a particular depth (`lean` is the measured
    * shape; `enriched` adds column descriptions and synonyms; `semantic` adds
    * the semantic map and is large); absent, the platform serves the best it
-   * has. Nothing about keys: those are `joinKeys`'s to return. The one GET
-   * on this client: the card is a read of stored state, not a query, and the
+   * has. `options` ask for the card in another form (TableCardOptions, below):
+   * laid out within a budget, or the entries matching a pattern. Nothing
+   * about keys: those are `joinKeys`'s to return. The one GET on this
+   * client: the card is a read of stored state, not a query, and the
    * platform routes it that way. */
-  async tableCard(table: string, tier?: string): Promise<RowRecord> {
+  async tableCard(table: string, tier?: string, options: TableCardOptions = {}): Promise<RowRecord> {
+    const query: Record<string, string> = { table, ...(tier ? { tier } : {}) };
+    for (const [name, value] of Object.entries(options)) {
+      if (value !== undefined) query[name] = String(value);
+    }
     const exchange = await this.call({
       op: "table_card",
       method: "GET",
-      query: { table, ...(tier ? { tier } : {}) },
+      query,
       acceptJson: true,
       timeoutMs: this.timeoutMs,
     });
     return this.parseJson(exchange, "table_card") as RowRecord;
+  }
+
+  /** `GET /v1/table_card/{db}?tables=[&tier=][&question=][&overview=true]`:
+   * with `overview` and no question, every table in one line instead of its
+   * card (what the start-up text describes a database by when its cards do
+   * not fit); otherwise the cards of
+   * `tables` rendered exactly as the platform's loop carries them in its
+   * prompt (the platform's card ranking, `prompt_cards`) - the same tables,
+   * joins, layout and character budget, ranked for `question` when one is
+   * given and the cards do not fit as they are - for this client to fold
+   * into its own text unchanged rather than lay the cards out itself. A
+   * platform that predates the form refuses it (it asks for `table`). */
+  async promptCards(tables: readonly string[], tier?: string, question?: string, overview = false): Promise<PromptCards> {
+    const query: Record<string, string> = {
+      tables: tables.join(","),
+      ...(tier ? { tier } : {}),
+      ...(question ? { question } : {}),
+      ...(overview && !question ? { overview: "true" } : {}),
+    };
+    const exchange = await this.call({
+      op: "table_card",
+      method: "GET",
+      query,
+      acceptJson: true,
+      timeoutMs: this.timeoutMs,
+    });
+    const rendered = this.parseJson(exchange, "table_card") as RowRecord | null;
+    // A platform that predates the form answers with something else, or not
+    // at all: only the rendering itself is folded in.
+    if (typeof rendered?.cards !== "string" || !Array.isArray(rendered.shown) || !Array.isArray(rendered.listed)) {
+      throw new HostedError("table_card", 0, "the platform did not render the cards (no `cards` in its answer)");
+    }
+    return {
+      cards: rendered.cards,
+      vocabulary: typeof rendered.vocabulary === "string" ? rendered.vocabulary : "",
+      shown: rendered.shown as string[],
+      listed: rendered.listed as string[],
+      missing: Array.isArray(rendered.missing) ? (rendered.missing as string[]) : [],
+      tier: typeof rendered.tier === "string" ? rendered.tier : "",
+      ranked: rendered.ranked === true,
+      graded: rendered.graded === true,
+      ...(typeof rendered.note === "string" ? { note: rendered.note } : {}),
+    };
   }
 
   /** `GET /v1/hydrate/{db}?table=`: the record of the hydrate job that loaded
@@ -650,6 +830,45 @@ export class HostedDb {
     });
   }
 
+  /** `POST /v1/remember/{db}` with `{"data": [...]}`: rows for the database's
+   * memory, which the platform keeps in a store of its own under the
+   * database's root and lists in no table listing. Each row is `{kind,
+   * content, question?, path?, session_id?, created_at?}`; the platform
+   * creates the store on the first write and embeds `question` and `content`
+   * where the account embeds. */
+  async remember(rows: RowRecord[]): Promise<void> {
+    await this.postJson("remember", { data: rows }, true);
+  }
+
+  /** `POST /v1/recall/{db}`: the `k` memory rows nearest `query`, best first,
+   * each `{kind, question, content, path, session_id, created_at, score}`;
+   * none before anything was remembered. `kinds` keeps the recall to the
+   * rows of those kinds: the hook's own answers and files, never the
+   * playbook bullets a curator remembered for the platform's loop. */
+  async recall(query: string, k: number, kinds?: readonly string[]): Promise<RowRecord[]> {
+    const body: RowRecord = { query, k };
+    if (kinds?.length) body.kinds = [...kinds];
+    return this.rows(await this.postJson("recall", body, true), "recall");
+  }
+
+  /** `POST /v1/page/{db}`: the page a row of `table` came from - the row's
+   * `document` and a page counted from 1 - as its scanned image:
+   * `{media_type, data, width, height}`, `data` base64. Where the table's
+   * documents lie is the deployment's to say (its card's `pages`); the
+   * platform reads the document there, with the database's own credential,
+   * and refuses a page drawn rather than scanned by name. */
+  async page(table: string, document: string, page: number): Promise<RowRecord> {
+    return this.parseJson(await this.postJson("page", { table, document, page }, true), "page") as RowRecord;
+  }
+
+  /** POST /v1/fetch/{database}: the text of the web page at `url`, from
+   * character `offset` on - `{url, content_type, text, offset, total_chars,
+   * next_offset}`. The platform reads the page, and refuses an address that
+   * is not on the public internet. */
+  async webFetch(url: string, offset: number): Promise<RowRecord> {
+    return this.parseJson(await this.postJson("fetch", { url, offset }, true), "fetch") as RowRecord;
+  }
+
   /** `POST /v1/delete/{db}?table=T&predicate=P` (no body): the mutation's
    * `{matched, n_tombstoned, n_not_found}`. */
   async deleteWhere(table: string, predicate: string): Promise<RowRecord> {
@@ -672,6 +891,32 @@ export class HostedDb {
     return this.rows(await this.postJson("query_sql", { query: sql }, true), "query_sql");
   }
 
+  /** `POST /v1/query_sql/{db}` with `{query, validate?, rerank?}`: the rows
+   * with what the platform did to them in the same call - checked against
+   * the question (`validate`) and ordered by its grader (`rerank`) where
+   * they lie, so no row travels back up to be checked or ranked. */
+  async querySqlChecked(sql: string, checks: ReadChecks): Promise<CheckedRows> {
+    return this.withRerank(checks, (asked) =>
+      this.postJson("query_sql", { query: sql, ...readChecks(asked) }, true).then((exchange) => this.checkedRows(exchange, "query_sql")),
+    );
+  }
+
+  /** `read` with `checks`, and - when the platform refuses the `rerank`
+   * because it predates it (a 400 naming the field) - again without it,
+   * remembering the refusal so no later read asks: a platform without the
+   * rerank answers as it did before the client knew of it. Any other
+   * failure is the read's own. */
+  private async withRerank<T>(checks: ReadChecks, read: (checks: ReadChecks) => Promise<T>): Promise<T> {
+    if (!checks.rerank || this.rerankUnsupported) return read({ ...checks, rerank: undefined });
+    try {
+      return await read(checks);
+    } catch (err) {
+      if (!(err instanceof HostedError && err.status === HTTP_BAD_REQUEST && /\brerank\b/.test(err.message))) throw err;
+      this.rerankUnsupported = true;
+      return read({ ...checks, rerank: undefined });
+    }
+  }
+
   /** `POST /v1/hybrid_search/{db}`: BM25 and the vector leg fused, over the
    * HOSTED index, returned as rows.
    *
@@ -683,8 +928,8 @@ export class HostedDb {
    * space it does not belong to.
    *
    * This exists so that the hosted index can be read WITHOUT the platform's
-   * answering loop. Before it, the only remote retrieval surface was `ask`,
-   * which runs that loop - so "hosted index, local brain" was not
+   * answering loop. Before it, the only remote retrieval surface was the
+   * platform's loop itself - so "hosted index, local brain" was not
    * expressible, and the choice was the whole platform or none of it. A reviewer asked for exactly that middle configuration and it
    * could not be measured. */
   async hybridSearch(
@@ -694,9 +939,10 @@ export class HostedDb {
     query: string,
     k: number,
     projection: string[],
+    rerank?: ReadChecks["rerank"],
   ): Promise<RowRecord[]> {
-    return this.rows(
-      await this.postJson(
+    return this.withRerank({ rerank }, (asked) =>
+      this.postJson(
         "hybrid_search",
         {
           table_name: table,
@@ -709,10 +955,10 @@ export class HostedDb {
           vector_text: query,
           k,
           projection,
+          ...readChecks(asked),
         },
         true,
-      ),
-      "hybrid_search",
+      ).then((exchange) => this.checkedRows(exchange, "hybrid_search").rows),
     );
   }
 
@@ -733,91 +979,21 @@ export class HostedDb {
    * index, returned as rows. The search a table without an embedding column
    * gets: there is no vector to fuse, and asking `hybrid_search` for one is
    * a 400. Same `Or` as the hybrid search, for the same reason. */
-  async bm25Search(table: string, field: string, query: string, k: number, projection: string[]): Promise<RowRecord[]> {
-    return this.rows(
-      await this.postJson(
+  async bm25Search(
+    table: string,
+    field: string,
+    query: string,
+    k: number,
+    projection: string[],
+    rerank?: ReadChecks["rerank"],
+  ): Promise<RowRecord[]> {
+    return this.withRerank({ rerank }, (asked) =>
+      this.postJson(
         "bm25_search",
-        { table_name: table, field_name: field, query, k, mode: "Or", projection },
+        { table_name: table, field_name: field, query, k, mode: "Or", projection, ...readChecks(asked) },
         true,
-      ),
-      "bm25_search",
+      ).then((exchange) => this.checkedRows(exchange, "bm25_search").rows),
     );
-  }
-
-  // --- sub_agent ---
-
-  /** `POST /v1/sub_agent/{db}`: the platform's retrieval loop. It answers
-   * with facts - `facts`, the first `k` rows of the query that validated,
-   * each `{table?, row}`; `statement`, that query verbatim; `coverage`, how
-   * many rows the query returned against how many are in `facts` - and the
-   * loop's accounting (`turns`, `retries`, and `model_tokens`, the one number
-   * the platform meters the call on; its costs are otherwise its own); never
-   * anything the model wrote. A loop that found no
-   * query still answers 200 with `terminate` saying how (`escalated` carries
-   * the model's account of the problem in `error`). The per-call timeout is
-   * the request's own `max_wall_secs` plus a margin for the answer to
-   * travel; with no `max_wall_secs` the server's cap applies and the
-   * client's general timeout is all it can go on. A retryable 503 is retried
-   * like any other op; 501 (no agent configured) is terminal. */
-  async subAgent(req: {
-    question: string;
-    /** Text the loop's model reads beside the question and not as part of
-     * it - the repository's own instructions, a convention, a hint. Nothing
-     * in it is required of the result; the platform anchors validation on
-     * the question alone. */
-    context?: string;
-    k?: number;
-    /** Columns a search or find fact carries beside its text and score, in
-     * place of the table's keys - for a code table, the ones that place it. */
-    projection?: string[];
-    max_turns?: number;
-    max_wall_secs?: number;
-    include_transcript?: boolean;
-    /** The one table the question is about. The database holds several and
-     * the loop, shown every table's card, picks - and on a database with two
-     * code indexes it picked the wrong one for every question about the
-     * other (2026-09-12). Named, the loop sees that table's card alone. */
-    table?: string;
-    /** The tables the question is about when it spans a few - the one this
-     * client reads and the siblings joinable with it - and not the whole
-     * database; the loop is shown their cards alone and may join them. Sent
-     * with `table`, the scope is both. */
-    tables?: string[];
-    /** Ask the platform for a written answer beside the facts: once they are
-     * final, the loop's own model is shown them with every line numbered and
-     * writes the answer, citing those lines. The response then carries
-     * `answer`. */
-    answer?: boolean;
-    /** With `answer`: the rows to write from, when the caller already holds
-     * them - each its table and the cells that name it. The platform runs no
-     * loop, reads a row given by its place back from the table, and shows
-     * the writer those rows. */
-    facts?: readonly PlatformFact[];
-  }): Promise<RowRecord> {
-    // Only the fields given are sent: the request type rejects unknown keys and
-    // defaults the rest itself.
-    const body: RowRecord = { question: req.question };
-    if (req.facts !== undefined) body.facts = req.facts;
-    if (req.context !== undefined) body.context = req.context;
-    if (req.k !== undefined) body.k = req.k;
-    if (req.projection !== undefined) body.projection = req.projection;
-    if (req.max_turns !== undefined) body.max_turns = req.max_turns;
-    if (req.max_wall_secs !== undefined) body.max_wall_secs = req.max_wall_secs;
-    if (req.include_transcript !== undefined) body.include_transcript = req.include_transcript;
-    if (req.table !== undefined) body.table = req.table;
-    if (req.tables !== undefined && req.tables.length > 0) body.tables = req.tables;
-    if (req.answer !== undefined) body.answer = req.answer;
-    const timeoutMs =
-      req.max_wall_secs !== undefined ? (req.max_wall_secs + ASK_TIMEOUT_MARGIN_SECS) * MS_PER_SEC : this.timeoutMs;
-    const exchange = await this.call({
-      op: "sub_agent",
-      method: "POST",
-      body: jsonify(body),
-      contentType: JSON_CONTENT_TYPE,
-      acceptJson: true,
-      timeoutMs,
-    });
-    return this.parseJson(exchange, "sub_agent") as RowRecord;
   }
 
   // --- plumbing ---
@@ -848,6 +1024,25 @@ export class HostedDb {
     return this.parseJson(exchange, op) as RowRecord[];
   }
 
+  /** A read response that may be the platform's envelope - `{rows,
+   * validation?, rerank?}`, what a read that asked for a check or a rerank
+   * gets - or the bare rows a read that asked for neither does. */
+  private checkedRows(exchange: Exchange, op: string): CheckedRows {
+    const contentType = exchange.headers.get("content-type") ?? "";
+    if (contentType.includes(ARROW_STREAM_CONTENT_TYPE)) {
+      throw new HostedError(op, exchange.status, "expected JSON rows but the server answered an Arrow stream");
+    }
+    const parsed = this.parseJson(exchange, op);
+    if (parsed === null) return { rows: [] };
+    if (Array.isArray(parsed)) return { rows: parsed as RowRecord[] };
+    const envelope = parsed as RowRecord;
+    return {
+      rows: Array.isArray(envelope.rows) ? (envelope.rows as RowRecord[]) : [],
+      ...(envelope.validation && typeof envelope.validation === "object" ? { validation: envelope.validation as RowRecord } : {}),
+      ...(envelope.rerank && typeof envelope.rerank === "object" ? { rerank: envelope.rerank as RowRecord } : {}),
+    };
+  }
+
   private parseJson(exchange: Exchange, op: string): unknown {
     if (exchange.text.trim().length === 0) return null;
     try {
@@ -872,18 +1067,25 @@ export class HostedDb {
    * Two budgets because they are two different waits: a database coming up
    * is bounded by --cold-start-secs whatever the call; a pool with no room is
    * worth waiting on for exactly as long as the caller would wait for the
-   * answer itself. */
+   * answer itself. A client with a deadline (`deadlineMs`) ends both budgets
+   * there: no request starts after it, the one in flight is abandoned at it,
+   * and a wait that would outlive it is not taken. */
   private async call(spec: CallSpec): Promise<Exchange> {
     const headers: Record<string, string> = { authorization: `Bearer ${this.target.apiKey}` };
     if (spec.acceptJson) headers.accept = JSON_CONTENT_TYPE;
     if (spec.contentType) headers["content-type"] = spec.contentType;
     const url = this.url(spec.op, spec.query, spec.suffix);
     const started = Date.now();
-    const coldStartDeadline = started + this.coldStartMs;
-    const capacityDeadline = started + spec.timeoutMs;
+    const coldStartDeadline = Math.min(started + this.coldStartMs, this.deadlineMs);
+    const capacityDeadline = Math.min(started + spec.timeoutMs, this.deadlineMs);
     let retries = 0;
 
     for (;;) {
+      // The attempt's own timeout, or what is left of the client's deadline
+      // when that comes first.
+      const left = this.deadlineMs - Date.now();
+      if (left <= 0) throw new HostedError(spec.op, 0, PAST_DEADLINE, { pastDeadline: true });
+      const cutByDeadline = left < spec.timeoutMs;
       const t0 = performance.now();
       let response: Response;
       try {
@@ -893,17 +1095,18 @@ export class HostedDb {
           // fetch takes a Uint8Array body; the DOM typing only spells it as
           // BodyInit, hence the cast.
           ...(spec.body !== undefined ? { body: spec.body as BodyInit } : {}),
-          signal: AbortSignal.timeout(spec.timeoutMs),
+          signal: AbortSignal.timeout(cutByDeadline ? left : spec.timeoutMs),
         });
       } catch (err) {
         const rttMs = performance.now() - t0;
         this.record({ op: spec.op, status: 0, rttMs, retries });
         const timedOut = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+        const pastDeadline = timedOut && cutByDeadline;
         throw new HostedError(
           spec.op,
           0,
-          timedOut ? `no response within ${spec.timeoutMs} ms` : `request failed: ${(err as Error).message}`,
-          { cause: err },
+          pastDeadline ? PAST_DEADLINE : timedOut ? `no response within ${spec.timeoutMs} ms` : `request failed: ${(err as Error).message}`,
+          { cause: err, pastDeadline },
         );
       }
       const text = await response.text();
@@ -941,12 +1144,19 @@ export class HostedDb {
 
       this.record(info);
       const message = serverMessage(response.status, text);
-      const budget = atCapacity
+      // Whether it was the client's deadline, earlier than the call's own
+      // budget, that left no room for another try.
+      const ownBudgetEnd = atCapacity ? started + spec.timeoutMs : started + this.coldStartMs;
+      const pastDeadline = (atCapacity || notReady) && this.deadlineMs < ownBudgetEnd;
+      const budget = pastDeadline
+        ? "this client's deadline"
+        : atCapacity
         ? `the call's ${spec.timeoutMs / MS_PER_SEC} s budget`
         : `the ${this.coldStartMs / MS_PER_SEC} s cold-start budget`;
       const gaveUp = atCapacity || notReady ? ` (gave up after ${retries} retr${retries === 1 ? "y" : "ies"} within ${budget})` : "";
       throw new HostedError(spec.op, response.status, `${message}${gaveUp}`, {
         ...(retryAfter !== null ? { retryAfterSecs: retryAfterMs(retryAfter) / MS_PER_SEC } : {}),
+        pastDeadline,
       });
     }
   }

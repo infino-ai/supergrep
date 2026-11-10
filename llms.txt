@@ -1,12 +1,10 @@
 # SuperGrep
 
-> Retrieval + inference offload for AI coding agents. Four tools over an
+> Retrieval + inference offload for AI coding agents. Three tools over an
 > Infino index kept in two places: `find` and plain `sql` run on your
-> machine over the keyword index; `search`, a `sql` statement with a ranked
-> search inside it, and `ask` run in the Infino cloud over the same index's
-> platform copy, where the embeddings are computed. `ask` hands a question
-> to small models on the service that work the index and return the rows
-> they found, cited `path:line`, rather than prose. The package, the CLI
+> machine over the keyword index; `search`, and a `sql` statement with a
+> ranked search inside it, run in the Infino cloud over the same index's
+> platform copy, where the embeddings are computed. The package, the CLI
 > (`cx`) and the MCP server are still named `code-context`.
 
 SuperGrep is built on infino (https://github.com/infino-ai/infino), a
@@ -24,11 +22,11 @@ copy of the data. Try it live at https://infino.ai/supergrep.
   `claude plugin marketplace add infino-ai/supergrep` then
   `claude plugin install code-context@infino-ai`. Any directory a session
   opens is indexed on its first question; `find`, `sql` and `read` need no
-  account and upload nothing. `search` and `ask` need one: the person runs
+  account and upload nothing. `search` needs one: the person runs
   `npx -y @infino-ai/code-context login --platform https://api.supergrep.infino.ai` once, in a
   terminal - it asks, creates a free account (key at `~/.infino/key`, mode
-  600), and every directory after that has all four tools, each in its own
-  database, uploaded the first time `search` or `ask` is used in it. `cx
+  600), and every directory after that has `search` too, each in its own
+  database, uploaded the first time `search` is used in it. `cx
   install` writes a per-repository `.mcp.json` entry for other clients.
 - MCP tools (stdio): `find` (every line containing an exact string, written
   like `grep -n` with per-file counts; complete and unranked), `search` (one
@@ -36,13 +34,11 @@ copy of the data. Try it live at https://infino.ai/supergrep.
   citation), `sql` (read-only SELECT/WITH over
   `chunks(path, start_line, end_line, lang, symbol, content)`, with
   `bm25_search`, `hybrid_search`, `vector_search` and `token_match` as
-  table-valued relations so a search composes with GROUP BY), `ask` (a
-  question that spans the repository, returned as the rows found). `read`
+  table-valued relations so a search composes with GROUP BY). `read`
   returns the numbered lines of files the index named, several in one call.
   `find`, `search` and `sql` take `queries`, several in one call, and an
   optional `path` (absolute repository root) so one server serves several
-  local repositories; `ask` is scoped to the one platform database the
-  server was started with. No reindex tool: the first query builds the
+  local repositories. No reindex tool: the first query builds the
   index and every query re-syncs it.
 - CLI: `cx install`, `cx login`, `cx index` (incremental; `--full`,
   `--watch`, `--no-embed`, `--max-files`), `cx find`, `cx search`, `cx sql`,

@@ -3,10 +3,9 @@ name: code-context
 description: >
   How to answer codebase questions with the SuperGrep MCP tools: find and
   plain sql locally (exact-text lookup that replaces grep, read-only SQL
-  aggregation over the index), and search and ask over the platform copy
-  when the server has an account (ranked hybrid keyword+semantic search,
-  and small models that retrieve the facts instead of you crawling the repo
-  yourself). Use when you would grep for an identifier or literal, when a
+  aggregation over the index), and search over the platform copy when the
+  server has an account (ranked hybrid keyword+semantic search). Use when
+  you would grep for an identifier or literal, when a
   question spans many files ("how does X work", "where is Y handled"), when
   ranking or counting code by topic across a repo, or when the code-context
   tools are present but deferred and need loading before use.
@@ -15,23 +14,21 @@ description: >
 # code-context: search over the repository
 
 code-context maintains a local index of the repository (in `.infino/` at the
-repo root) and always exposes `find`, `sql` and `read` over it; `search` and
-`ask` register too when the server has an account, running over the same
-index's platform copy where the embeddings are computed. Every lookup an
-agent would otherwise do with grep or by crawling files runs against the
-index instead, or is delegated to small models entirely: `find` for the
-exact-text case, `search` for one ranked pass over everything that spans
-the repo, `ask` when you would rather hand the retrieval off than do it
-yourself.
+repo root) and always exposes `find`, `sql` and `read` over it; `search`
+registers too when the server has an account, running over the same index's
+platform copy where the embeddings are computed. Every lookup an agent
+would otherwise do with grep or by crawling files runs against the index
+instead: `find` for the exact-text case, `search` for one ranked pass over
+everything that spans the repo, `sql` to count and rank.
 
 ## If the tools are deferred
 
 When the tool names appear in a deferred-tools listing but their schemas are
 not loaded, load them in ONE ToolSearch call before the first use, e.g. query
-`+code-context find search sql ask` (or `select:` with the exact
+`+code-context find search sql read` (or `select:` with the exact
 listed names, comma-separated) - name only the tools that actually appear in
-the deferred listing, since `search` and `ask` are registered only when the
-server has an account. Never load them one call at a time.
+the deferred listing, since `search` is registered only when the server has
+an account. Never load them one call at a time.
 
 ## Choosing the right tool
 
@@ -39,9 +36,9 @@ server has an account. Never load them one call at a time.
 | --- | --- |
 | Every occurrence of an exact identifier, string, or key (where you would grep) | `find` |
 | A file you already know the path of | `read` |
-| "How does X work", "where is Y handled", concept without exact name | `ask` (or `search` for one ranked pass yourself) |
+| "How does X work", "where is Y handled", concept without exact name | `search` |
 | Counts, rankings, GROUP BY across the repo ("which files have the most code about X") | `sql` |
-| Several independent questions at once | one `ask` each, issued in the same turn |
+| Several independent questions at once | one call with `queries`, or several calls in the same turn |
 | Working tree changed a lot mid-session | nothing - the next query re-syncs (see lifecycle) |
 
 ## find
@@ -69,8 +66,8 @@ server has an account. Never load them one call at a time.
 
 ## search (when present)
 
-Registered, like `ask`, only when the server has an account; it runs over
-the platform copy of the index, where the embeddings are computed.
+Registered only when the server has an account; it runs over the platform
+copy of the index, where the embeddings are computed.
 
 - Pass terms, a phrase, or a plain-language description; one pass fuses BM25
   keyword matching with semantic similarity, so it works whether or not you
@@ -164,24 +161,6 @@ GROUP BY t.path ORDER BY chunks_with_term DESC LIMIT 15
   Infino platform database; the build and every sync write both, so nothing
   about the lifecycle changes for you.
 
-## ask (when present)
-
-Registered, like `search`, only when the server has an account, running on
-the platform copy of the index. `ask` hands a question or task in plain
-language to small models on the service and returns the facts they
-retrieved, never a summary: `hits` (`path`, `startLine`-`endLine`, `content`
-- the shape of a `search` hit), `rows` (aggregates: a count or rank per
-path), and `sql` (the statement whose rows answer the question, when there
-is one). Use it for how does X work, where is Y handled, which files or
-symbols. Prefer several asks in one reply, one per part of the question,
-over one broad ask or a chain of your own searches. A mechanism that spans
-files is one ask per part, issued together: they run at once, so the wait
-is the slowest of them rather than the sum. For every occurrence of an exact
-string, and for how many times it occurs per file, use `find` (`byFile` is
-the `grep -c` answer); for a file you already know, `read` it. Answer from
-the rows and cite `path:line`. Like the other tools, its result carries a
-one-line `usage` receipt.
-
 ## Reading results honestly
 
 - A result carrying a `partial` marker means the repo exceeded the index's
@@ -189,23 +168,21 @@ one-line `usage` receipt.
   possibly-unindexed, not as proof the code doesn't exist.
 - Every tool's result carries a one-line `usage` receipt - `find`, plain
   `sql` and `read`'s computed locally (tokens returned, matches or chunks /
-  files, session running total); `search` and `ask`'s name what the
-  platform metered for the call. It is there for the user who asks what a
+  files, session running total); `search`'s names what the platform
+  metered for the call. It is there for the user who asks what a
   lookup cost; `cx usage` keeps the local ledger.
 
 ## Multi-repo sessions
 
 `find`, `search` and `sql` take an optional `path` (an **absolute** repo
 root) to target a different repository than the one the server started in,
-each with its own local index. `ask` reads the one platform database the
-server was started with, which holds one repository's index; it refuses a
-`path` naming a different one.
+each with its own local index.
 
 ## Cost awareness
 
 - `find` and a plain `sql` statement are cheap: milliseconds against the
-  local index, no account needed. `search`, a `sql` statement with a ranked
-  search in it, and `ask` are platform round trips, metered there.
+  local index, no account needed. `search`, and a `sql` statement with a
+  ranked search in it, are platform round trips, metered there.
 - The first index of a repo and the platform's vector backfill are the
   expensive part. Avoid forcing `cx index --full` rebuilds unless the index
   is actually wrong, and avoid triggering first-time indexing of large repos

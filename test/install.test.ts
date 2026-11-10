@@ -17,7 +17,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { InstallError, answerHookEntries, answerHookMatcher, installCmd, platformArgs, serverEntry } from "../src/commands/install-cmd.js";
+import { InstallError, answerHookMatcher, answerHooks, installCmd, platformArgs, serverEntry } from "../src/commands/install-cmd.js";
 
 const VERSION = "9.9.9";
 
@@ -637,52 +637,98 @@ describe("cx install: the first install on a machine with no account", () => {
   });
 });
 
-describe("cx install: the answer-display hooks", () => {
+describe("cx install: the Stop hooks", () => {
   const settingsIn = (dir: string) => join(dir, ".claude", "settings.json");
-  const matcher = answerHookMatcher("code-context");
+  const stopTails = () =>
+    (read(settingsIn(root)).hooks.Stop as Array<{ hooks: Array<{ command: string }> }>).map((e) => {
+      const c = e.hooks[0].command;
+      return c.slice(c.indexOf(" hook "));
+    });
 
-  it("writes one PostToolUse hook per chunk beside a platform entry, and tells the server so", async () => {
+  it("writes the figures and memory Stop hooks beside a platform entry, and tells the server to recall memory", async () => {
     await installCmd({ path: root, db: "https://host/db" }, VERSION);
     const entry = read(configIn(root)).mcpServers["code-context"];
-    expect(entry.env).toEqual({ CX_ANSWER_DISPLAY: "hook" });
-    const all = read(settingsIn(root)).hooks.PostToolUse as Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }>;
-    // Three chunk entries on the answer tool, then the one on the retrieval
-    // tools that reminds the model the writer has the rows.
-    const hooks = all.slice(0, 3);
-    expect(hooks.map((h) => h.matcher)).toEqual([matcher, matcher, matcher]);
-    hooks.forEach((h, i) => {
-      expect(h.hooks).toHaveLength(1);
-      expect(h.hooks[0].type).toBe("command");
-      expect(h.hooks[0].command).toContain(` hook answer --chunk ${i + 1} --chunks 3`);
+    expect(entry.env).toEqual({ CX_MEMORY: "1" });
+    const hooks = read(settingsIn(root)).hooks;
+    // No hook on any tool's result, and none before a tool runs.
+    expect(hooks.PostToolUse).toBeUndefined();
+    expect(hooks.PreToolUse).toBeUndefined();
+    // Two Stop hooks, none with a matcher: one sends the model back to
+    // compute with sql a figure of its final answer no tool result holds,
+    // and memory's writes the turn to the database it names.
+    const stop = hooks.Stop as Array<{ matcher?: string; hooks: Array<{ type: string; command: string }> }>;
+    expect(stop).toHaveLength(2);
+    for (const [i, tail] of [" hook answer-figures --server code-context", " hook memory --server code-context --db https://host/db"].entries()) {
+      expect(stop[i].matcher).toBeUndefined();
+      expect(stop[i].hooks).toHaveLength(1);
+      expect(stop[i].hooks[0].command.endsWith(tail)).toBe(true);
       // The same build the server entry runs, so the hook and the server
       // cannot disagree about which cx they are.
-      expect(h.hooks[0].command.startsWith(entry.command)).toBe(true);
-    });
-    // The retrieval entry. Its matcher is a regex naming the four retrieval
-    // tools and, deliberately, not `answer`: the note belongs beside rows,
-    // never beside the answer the writer just produced.
-    expect(all).toHaveLength(4);
-    const due = all[3];
-    expect(due.matcher).toBe("mcp__code-context__(ask|search|find|sql)");
-    expect(new RegExp(due.matcher).test("mcp__code-context__ask")).toBe(true);
-    expect(new RegExp(due.matcher).test("mcp__code-context__sql")).toBe(true);
-    expect(new RegExp(due.matcher).test("mcp__code-context__answer")).toBe(false);
-    expect(due.hooks[0].command.endsWith(" hook answer-due")).toBe(true);
-    expect(due.hooks[0].command.startsWith(entry.command)).toBe(true);
-    // And one PreToolUse hook on the same tool, filling its narration from
-    // the session transcript before it runs.
-    const before = read(settingsIn(root)).hooks.PreToolUse as Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }>;
-    expect(before.map((h) => h.matcher)).toEqual([matcher]);
-    expect(before[0].hooks[0].command).toContain(" hook answer-input");
-    expect(before[0].hooks[0].command.startsWith(entry.command)).toBe(true);
-    // And one Stop hook that sends the model back for the answer call when
-    // it retrieved and stopped without one. A Stop entry has no matcher.
-    const stop = read(settingsIn(root)).hooks.Stop as Array<{ matcher?: string; hooks: Array<{ type: string; command: string }> }>;
-    expect(stop).toHaveLength(1);
-    expect(stop[0].matcher).toBeUndefined();
-    expect(stop[0].hooks).toHaveLength(1);
-    expect(stop[0].hooks[0].command.endsWith(" hook answer-stop")).toBe(true);
-    expect(stop[0].hooks[0].command.startsWith(entry.command)).toBe(true);
+      expect(stop[i].hooks[0].command.startsWith(entry.command)).toBe(true);
+    }
+  });
+
+  it("points the memory hook at the database a flagless install resolved from the stored account", () => {
+    const [, memory] = answerHooks({ db: "https://host/acct-db", apiKeyFile: "/keys/infino" }, VERSION, "code-context").Stop;
+    expect(memory.matcher).toBeUndefined();
+    expect(memory.hooks[0].command.endsWith(" hook memory --server code-context --db https://host/acct-db --api-key-file /keys/infino")).toBe(true);
+  });
+
+  it("keeps each server's Stop hooks, the memory one naming its own database, on an install or uninstall of another", async () => {
+    await installCmd({ path: root, db: "https://host/prod" }, VERSION);
+    await installCmd({ path: root, name: "staging", db: "https://host/staging" }, VERSION);
+    expect(stopTails()).toEqual([
+      " hook answer-figures --server code-context",
+      " hook memory --server code-context --db https://host/prod",
+      " hook answer-figures --server staging",
+      " hook memory --server staging --db https://host/staging",
+    ]);
+    await installCmd({ path: root, name: "staging", uninstall: true }, VERSION);
+    expect(stopTails()).toEqual([" hook answer-figures --server code-context", " hook memory --server code-context --db https://host/prod"]);
+  });
+
+  it("takes out every hook an earlier version wrote for the answer tool, and gives another server its own figures hook", async () => {
+    // Two servers installed by an earlier version: answer hooks on both, a
+    // narration hook, a retrieval hook, and a shared bare answer-stop and
+    // figures pair.
+    const legacyStop = (event: string) => ({ hooks: [{ type: "command", command: `npx -y code-context@0.4.0 hook ${event}` }] });
+    const answerEntry = (server: string) => ({ matcher: answerHookMatcher(server), hooks: [{ type: "command", command: "npx -y code-context@0.4.0 hook answer --chunk 1 --chunks 3" }] });
+    const due = { matcher: "mcp__code-context__(ask|search|find|sql)", hooks: [{ type: "command", command: "npx -y code-context@0.4.0 hook answer-due" }] };
+    const input = { matcher: answerHookMatcher("code-context"), hooks: [{ type: "command", command: "npx -y code-context@0.4.0 hook answer-input" }] };
+    const legacy = {
+      hooks: {
+        PostToolUse: [answerEntry("code-context"), answerEntry("staging"), due],
+        PreToolUse: [input],
+        Stop: [legacyStop("answer-stop"), legacyStop("answer-figures")],
+      },
+    };
+    mkdirSync(join(root, ".claude"), { recursive: true });
+    writeFileSync(settingsIn(root), JSON.stringify(legacy));
+    await installCmd({ path: root, db: "https://host/db" }, VERSION);
+    const after = read(settingsIn(root)).hooks;
+    // code-context's answer, retrieval and narration entries are gone;
+    // staging's answer entry is not this install's to take.
+    expect(after.PostToolUse).toEqual([answerEntry("staging")]);
+    expect(after.PreToolUse).toBeUndefined();
+    expect(stopTails()).toEqual([
+      " hook answer-figures --server staging",
+      " hook answer-figures --server code-context",
+      " hook memory --server code-context --db https://host/db",
+    ]);
+  });
+
+  it("replaces the Stop hooks an earlier version wrote, with or without a server name", async () => {
+    mkdirSync(join(root, ".claude"), { recursive: true });
+    const legacy = (event: string) => ({ hooks: [{ type: "command", command: `npx -y code-context@0.4.0 hook ${event}` }] });
+    const named = (event: string) => ({ hooks: [{ type: "command", command: `npx -y code-context@0.5.1 hook ${event} --server code-context` }] });
+    writeFileSync(settingsIn(root), JSON.stringify({ hooks: { Stop: [legacy("answer-stop"), legacy("answer-figures"), named("answer-stop")] } }));
+    await installCmd({ path: root, db: "https://host/db" }, VERSION);
+    expect(stopTails()).toEqual([" hook answer-figures --server code-context", " hook memory --server code-context --db https://host/db"]);
+  });
+
+  it("refuses a server name Claude Code would rewrite in its tools' names", async () => {
+    await expect(installCmd({ path: root, name: "code.context", db: "https://host/db" }, VERSION)).rejects.toThrow(/letters, digits/);
+    expect(existsSync(settingsIn(root))).toBe(false);
   });
 
   it("writes no hooks and no env for a local-only entry", async () => {
@@ -708,24 +754,20 @@ describe("cx install: the answer-display hooks", () => {
     await installCmd({ path: root, db: "https://host/db" }, VERSION);
     const after = read(settingsIn(root));
     expect(after.permissions).toEqual({ allow: ["Read"] });
-    expect(after.hooks.PostToolUse.filter((h: { matcher: string }) => h.matcher === "Bash")).toHaveLength(1);
-    expect(after.hooks.PostToolUse.filter((h: { matcher: string }) => h.matcher === matcher)).toHaveLength(3);
-    expect(after.hooks.PreToolUse.filter((h: { matcher: string }) => h.matcher === matcher)).toHaveLength(1);
-    // Their Stop hook stands beside ours.
-    expect(after.hooks.Stop).toHaveLength(2);
+    expect(after.hooks.PostToolUse).toEqual([{ matcher: "Bash", hooks: [{ type: "command", command: "echo theirs" }] }]);
+    // Their Stop hook stands beside our two.
+    expect(after.hooks.Stop).toHaveLength(3);
     expect(after.hooks.Stop[0]).toEqual({ hooks: [{ type: "command", command: "echo stop" }] });
     await installCmd({ path: root, uninstall: true }, VERSION);
     const removed = read(settingsIn(root));
     expect(removed.hooks.PostToolUse).toEqual([{ matcher: "Bash", hooks: [{ type: "command", command: "echo theirs" }] }]);
-    expect(removed.hooks.PreToolUse).toBeUndefined();
     expect(removed.hooks.Stop).toEqual([{ hooks: [{ type: "command", command: "echo stop" }] }]);
     expect(read(configIn(root)).mcpServers["code-context"]).toBeUndefined();
   });
 
   it("names the pinned package in the hook command when the entry is npx", () => {
-    const entries = answerHookEntries({ npx: true }, VERSION, "code-context");
-    expect(entries).toHaveLength(3);
-    expect(entries[0].hooks[0].command).toBe(`npx -y @infino-ai/code-context@${VERSION} hook answer --chunk 1 --chunks 3`);
+    const [figures] = answerHooks({ npx: true, db: "https://host/db" }, VERSION, "code-context").Stop;
+    expect(figures.hooks[0].command).toBe(`npx -y @infino-ai/code-context@${VERSION} hook answer-figures --server code-context`);
   });
 
   it("--dry-run writes neither file", async () => {

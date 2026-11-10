@@ -36,8 +36,8 @@ the choice is documented in [the embedder eval](embedder-eval.md).
 With an account every build and every sync also writes the platform table,
 over HTTPS, and a database that is not yet ready is retried for a bounded
 time (`--cold-start-secs`) before the client gives up. `find` and plain `sql`
-never wait on it: they read the local index. `search`, a `sql` statement with
-a ranked search in it, and `ask` run on the platform copy, so they are as
+never wait on it: they read the local index. `search`, and a `sql` statement
+with a ranked search in it, run on the platform copy, so they are as
 available as the network is. A sync is not done until both sides have the
 diff, and a platform failure is reported and retried by the next sync rather
 than papered over.

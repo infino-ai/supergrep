@@ -8,7 +8,6 @@ import {
   findEntry,
   searchEntry,
   sqlEntry,
-  subagentEntry,
   withPlatform,
   formatReceipt,
   recordUsage,
@@ -21,7 +20,6 @@ import {
   promptStatsPath,
 } from "../src/core/usage.js";
 import type { SearchResult, SearchHit } from "../src/core/searcher.js";
-import type { RetrievalAgentResult, RetrievalAgentSpend } from "../src/core/retrieval-agent.js";
 import type { HostedDb, HostedCallInfo } from "../src/core/hosted.js";
 
 const hit = (path: string, content: string): SearchHit => ({
@@ -156,87 +154,6 @@ describe("sql receipt", () => {
     expect(session.queries).toBe(1);
     expect(line).not.toMatch(/to read those files whole/);
     expect(line).toMatch(/invoked 1x this session/);
-  });
-});
-
-describe("ask receipt", () => {
-  const answered: RetrievalAgentResult = {
-    question: "which files?",
-    sql: "SELECT path, COUNT(*) AS n FROM token_match('chunks','content','compaction') GROUP BY path",
-    hits: [{ path: "src/a.ts", startLine: 10, endLine: 30, content: "export function a() {\n}" }],
-    rows: [{ path: "src/a.ts", n: 3 }],
-    hitsTotal: 1,
-    rowsTotal: 1,
-    turns: 4,
-  };
-  const spend: RetrievalAgentSpend = { modelTokens: 12_555 };
-
-  it("counts the statement, hits and rows as what was returned, records the places, and the loop's spend", () => {
-    const entry = subagentEntry(answered, spend);
-    expect(entry.tool).toBe("ask");
-    expect(entry.query).toBe("which files?");
-    expect(entry.returnedTokens).toBe(estTokens(JSON.stringify({ sql: answered.sql, hits: answered.hits, rows: answered.rows })));
-    expect(entry.hits).toEqual([{ path: "src/a.ts", startLine: 10, endLine: 30 }]);
-    expect(entry.rows).toBe(1);
-    expect(entry.agentTurns).toBe(4);
-    expect(entry.agentInferenceTokens).toBe(12_555);
-    // The ledger points at places; the code does not leak into it.
-    expect(JSON.stringify(entry)).not.toContain("export function a");
-  });
-
-  it("prints the returned tokens, the hits and rows, the turns, and the inference tokens the platform metered", () => {
-    const line = formatReceipt(subagentEntry(answered, spend));
-    expect(line).toMatch(/^returned ~\d+ tokens \| 1 hit \/ 1 row \| 4 turns \| 12\.6k inference tokens$/);
-  });
-
-  it("singularizes one turn and accumulates into the session", () => {
-    const session = newSession();
-    const line = formatReceipt(subagentEntry({ ...answered, turns: 1 }, spend), session);
-    expect(line).toMatch(/\| 1 turn \|/);
-    expect(line).toMatch(/invoked 1x this session/);
-    expect(session.queries).toBe(1);
-  });
-
-  it("counts a no-answer result by the facts it still carries", () => {
-    const { sql: _none, ...noStatement } = answered;
-    const entry = subagentEntry({ ...noStatement, error: "the retrieval agent ran out of turns - the hits and rows below are what it retrieved before stopping" }, spend);
-    expect(entry.returnedTokens).toBe(estTokens(JSON.stringify({ hits: answered.hits, rows: answered.rows })));
-  });
-
-  it("round-trips through the ledger", () => {
-    const dir = mkdtempSync(join(tmpdir(), "cx-agent-ledger-"));
-    try {
-      recordUsage(dir, subagentEntry(answered, spend));
-      const [entry] = readUsage(dir);
-      expect(entry.tool).toBe("ask");
-      expect(entry.agentTurns).toBe(4);
-      expect(entry.agentInferenceTokens).toBe(12_555);
-      expect(entry.hits).toEqual([{ path: "src/a.ts", startLine: 10, endLine: 30 }]);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("records that the platform ranked the facts, and only then", () => {
-    expect(subagentEntry(answered, spend)).not.toHaveProperty("agentRanked");
-    const ranked = subagentEntry({ ...answered, coverage: { rowsTotal: 20, rowsReturned: 1, truncated: true, ranked: true } }, spend);
-    expect(ranked.agentRanked).toBe(true);
-  });
-
-  it("records who wrote an answer on the platform and how long it took, and only when one was written", () => {
-    expect(subagentEntry(answered, spend, "answer")).not.toHaveProperty("agentWriter");
-    const written = subagentEntry(
-      { ...answered, answer: "the text", coverage: { rowsTotal: 2, rowsReturned: 2, truncated: false, answer: { model: "qwen-3.8-27b", ms: 1068 } } },
-      spend,
-      "answer",
-    );
-    expect(written.agentWriter).toBe("qwen-3.8-27b");
-    expect(written.agentWriteMs).toBe(1068);
-  });
-
-  it("records nothing about the platform's costs beyond the one metered number", () => {
-    const entry = subagentEntry(answered, spend) as Record<string, unknown>;
-    for (const gone of ["agentCalls", "agentPromptTokens", "agentCompletionTokens", "agentRung", "agentModel"]) expect(entry).not.toHaveProperty(gone);
   });
 });
 

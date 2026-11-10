@@ -37,8 +37,7 @@ in a repository, `node dist/cli.js install` there writes an entry naming it
 
 - `src/core/` - indexing, chunking, file-state sync, search; shared by both
   surfaces. Pure logic lives here and is unit-tested directly. `hosted.ts`
-  (the platform client) and `retrieval-agent.ts` (the `ask` loop)
-  are the platform half, live only in the `--db` path.
+  (the platform client) is the platform half, live only in the `--db` path.
 - `src/commands/` + `src/cli.ts` - the CLI surface.
 - `src/mcp/` - the MCP server surface.
 

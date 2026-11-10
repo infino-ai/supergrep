@@ -128,7 +128,8 @@ describe("RepoRegistry on the account", () => {
 describe("what a server with no account says", () => {
   it("names the tools that are off and on, and the person's one command", () => {
     const steps = noAccountSteps();
-    expect(steps).toMatch(/search and ask are off/);
+    expect(steps).toMatch(/search is off/);
+    expect(steps).not.toMatch(/\bask\b(?! for or paste)/);
     expect(steps).toMatch(/find, sql and read run on the local index/);
     expect(steps).toMatch(/npx -y @infino-ai\/code-context login --platform/);
     expect(steps).toMatch(/the person - not you/);

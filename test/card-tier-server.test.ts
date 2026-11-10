@@ -25,7 +25,6 @@ process.env.CX_TABLE = TRANS_TABLE;
 process.env.CX_REMOTE_SEARCH = "1";
 process.env.CX_NO_EMBED = "1";
 process.env.CX_CARD_TIER = "enriched";
-process.env.CX_SIBLING_TABLES = `${DISTRICT_TABLE},${LOAN_TABLE}`;
 delete process.env.CX_AUTO_INDEX;
 delete process.env.CX_NO_RECEIPT;
 delete process.env.CX_INDEX_DIR;
@@ -94,8 +93,10 @@ const CARDS: Record<string, Record<string, unknown>> = {
   [`${LOAN_TABLE}:lean`]: LOAN_LEAN,
 };
 
+/** The platform's database: the primary and its two siblings. */
 const platform = () =>
   scriptPlatform({
+    list_tables: () => [200, [TRANS_TABLE, DISTRICT_TABLE, LOAN_TABLE]],
     schema: (body) => {
       const fields = SCHEMAS[String(body?.table_name)];
       return fields ? [200, fields] : [404, { error: "no such table" }];
@@ -115,7 +116,6 @@ beforeAll(() => {
 afterAll(() => {
   configureHosted(null);
   delete process.env.CX_CARD_TIER;
-  delete process.env.CX_SIBLING_TABLES;
 });
 
 describe("the sql text with the semantic layer folded in", () => {
@@ -128,8 +128,24 @@ describe("the sql text with the semantic layer folded in", () => {
   });
 
   it("asks for each table's enriched card, and the lean one where there is no enriched card", () => {
-    const asked = s.sent.filter((x) => x.op === "table_card").map((x) => `${String(x.body?.table)}:${String(x.body?.tier)}`);
-    expect(asked).toEqual([`${TRANS_TABLE}:enriched`, `${DISTRICT_TABLE}:enriched`, `${LOAN_TABLE}:enriched`, `${LOAN_TABLE}:lean`]);
+    // The tables are the ones the platform lists, asked for once.
+    expect(s.startup.filter((op) => op === "list_tables")).toHaveLength(1);
+    const asked = s.sent
+      .filter((x) => x.op === "table_card" && x.body?.tables === undefined)
+      .map((x) => `${String(x.body?.table)}:${String(x.body?.tier)}`);
+    // The primary's card first; the siblings' are asked for at once, so
+    // their order among themselves is not fixed - but a table's lean card is
+    // asked only after its enriched one was not there.
+    expect(asked[0]).toBe(`${TRANS_TABLE}:enriched`);
+    expect([...asked].sort()).toEqual([`${DISTRICT_TABLE}:enriched`, `${LOAN_TABLE}:enriched`, `${LOAN_TABLE}:lean`, `${TRANS_TABLE}:enriched`]);
+    expect(asked.indexOf(`${LOAN_TABLE}:enriched`)).toBeLessThan(asked.indexOf(`${LOAN_TABLE}:lean`));
+    // Then the platform's rendering of every carded table's card, once, at
+    // the same tier (`promptCards`); this platform predates it, so the
+    // cards as read are folded in.
+    const rendered = s.sent.filter((x) => x.op === "table_card" && x.body?.tables !== undefined);
+    expect(rendered).toHaveLength(1);
+    expect(String(rendered[0].body?.tables).split(",").sort()).toEqual([DISTRICT_TABLE, LOAN_TABLE, TRANS_TABLE].sort());
+    expect(rendered[0].body?.tier).toBe("enriched");
   });
 
   it("folds in the primary's enriched card and each sibling's meanings beside the columns", async () => {

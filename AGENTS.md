@@ -7,12 +7,12 @@ code.
 
 ## Project overview
 
-**SuperGrep is retrieval + inference offload for AI coding agents: four
+**SuperGrep is retrieval + inference offload for AI coding agents: three
 tools over an Infino index kept in two places.** `find` and plain `sql` run
 locally - a CLI (`cx`) and MCP server over a ranked index in plain files
 inside the repo, exposing read-only SQL over it, so an agent answers
 questions about a codebase without crawling files into the context window.
-`search`, a `sql` statement with a ranked search inside it, and `ask` run in
+`search`, and a `sql` statement with a ranked search inside it, run in
 the Infino cloud, over the same index's platform copy, where the embeddings
 are computed: a bearer key authenticates the connection, and the platform's
 own model embeds that copy by default. Without an account the server is
@@ -37,9 +37,8 @@ live in [README.md](README.md); the honest limits in
 - `src/mcp/server.ts`: the MCP server. `find`, `sql` and `read` are always
   registered and each takes an optional `path` (repo root) so one server
   serves multiple local repos in a session, defaulting to the startup root.
-  `search` and `ask` register too when an account is configured (`--db`);
-  `ask` reads the one platform database the server was started with, and
-  refuses a `path` naming a different repo. Freshness is not a tool: the
+  `search` registers too when an account is configured (`--db`).
+  Freshness is not a tool: the
   first query builds the index and every query re-syncs it.
 - `src/mcp/repos.ts`: the per-repo registry - resolves and validates a
   requested root, one engine connection per repo, LRU-capped.
@@ -51,8 +50,8 @@ live in [README.md](README.md); the honest limits in
   (find, hybrid search, SQL), `embedder`/`embed-worker` (local model),
   `filestate` (incremental sync state), `walker`, `manifest`, `config`,
   `context`, `output`, `usage` (the local ledger and receipts). `hosted.ts`
-  (the platform client - auth, sync, metering) and `retrieval-agent.ts`
-  (the `ask` loop) are the platform half; both exist only with an account.
+  (the platform client - auth, sync, metering) is the platform half; it
+  exists only with an account.
 - `src/commands/`: CLI command implementations (`index-cmd`, `query-cmds`).
 - `test/`: vitest suites. `docs/`: docs.
 
@@ -70,18 +69,13 @@ newer is the floor: undici 8 requires it). Keep it green before opening a PR.
 ## Conventions
 
 - TypeScript, ES modules. Every source file carries an SPDX header.
-- The MCP surface is deliberately four tools, one per question: where does
+- The MCP surface is deliberately three tools, one per question: where does
   this exact text occur (`find`, unranked and complete - the grep
-  replacement), what is most relevant (`search`, ranked top-k), how much of
-  what is where (`sql`), and - with an account - a question worth delegating
-  rather than exploring yourself (`ask`, which returns the rows the
-  platform's small models retrieved). `read` returns the numbered lines of
-  files the index has named, several in one call, beside the four. Adding
+  replacement), what is most relevant (`search`, ranked top-k), and how much
+  of what is where (`sql`). `read` returns the numbered lines of files the
+  index has named, several in one call, beside the three. Adding
   near-duplicate retrieval tools worsens an agent's tool selection; resist
-  it. A new tool must answer a question none of these does. An `explore`
-  tool was a second platform tool until it was measured: several asks
-  issued together answered the same questions faster and for less than its
-  long loop. A `reindex` tool was a fourth local tool until it was measured:
+  it. A new tool must answer a question none of these does. A `reindex` tool was a fourth local tool until it was measured:
   no Sonnet run called it, Haiku called it where it hurt, and auto-sync
   already does the job.
 - Search results carry chunk content, a citation (`cite`, `path:start-end`)
