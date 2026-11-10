@@ -13,6 +13,7 @@ import {
   hookFiguresOutput,
   memoryAdmits,
   memoryRows,
+  memorySend,
   memorySendArgv,
   sendRememberedRows,
   transcriptToolUses,
@@ -377,6 +378,59 @@ describe("the detached sender", () => {
     writeFileSync(kept, JSON.stringify(rows));
     await sendRememberedRows(kept, db);
     expect(readFileSync(kept, "utf8")).toBe(JSON.stringify(rows));
+  });
+});
+
+describe("the memory sender", () => {
+  const target = { baseUrl: "https://api.example.test", database: "cx", apiKey: "k" };
+  const rows = [{ kind: "answer", question: "q", content: "a", path: null, session_id: "s", created_at: 1 }];
+  /** A rows file where the hook leaves one, and its directory. */
+  const rowsFile = () => {
+    const dir = mkdtempSync(join(tmpdir(), "cx-memory-"));
+    const file = join(dir, "rows.json");
+    writeFileSync(file, JSON.stringify(rows));
+    return { dir, file };
+  };
+  /** A platform whose features read answers `features`, recording every request. */
+  const platform = (features: Response | (() => Promise<Response>)) => {
+    const sent: string[] = [];
+    const fetchImpl: typeof fetch = async (input) => {
+      const url = String(input);
+      sent.push(url.replace("https://api.example.test/v1/", ""));
+      if (url.endsWith("/account/features")) return typeof features === "function" ? features() : features.clone();
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    };
+    return { sent, fetchImpl };
+  };
+  const answer = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+  it("sends the rows to an account with the agent routes, then removes the file", async () => {
+    const { dir, file } = rowsFile();
+    const { sent, fetchImpl } = platform(answer(200, { agent_apis: true }));
+    await memorySend(file, target, fetchImpl);
+    expect(sent).toEqual(["account/features", "remember/cx"]);
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it("sends nothing to an account without them, and removes the file", async () => {
+    const { dir, file } = rowsFile();
+    const { sent, fetchImpl } = platform(answer(200, { agent_apis: false }));
+    await memorySend(file, target, fetchImpl);
+    expect(sent).toEqual(["account/features"]);
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it("removes the file when the features cannot be read, or there is no platform", async () => {
+    for (const features of [answer(404, { error: "no such route" }), answer(503, { error: "starting" }), () => Promise.reject(new Error("network down"))]) {
+      const { dir, file } = rowsFile();
+      const { sent, fetchImpl } = platform(features);
+      await expect(memorySend(file, target, fetchImpl)).rejects.toThrow();
+      expect(sent).toEqual(["account/features"]);
+      expect(existsSync(dir), String(features)).toBe(false);
+    }
+    const { dir, file } = rowsFile();
+    await memorySend(file, null);
+    expect(existsSync(dir)).toBe(false);
   });
 });
 

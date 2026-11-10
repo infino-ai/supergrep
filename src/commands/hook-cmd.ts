@@ -30,7 +30,7 @@ import { shouldIndexFile } from "../core/chunker.js";
 import { DEFAULT_CAPS, hostedTarget, indexDir } from "../core/config.js";
 import { accountFeatures } from "../core/account-api.js";
 import { hostedDbFor } from "../core/context.js";
-import type { HostedDb } from "../core/hosted.js";
+import type { HostedDb, HostedTarget } from "../core/hosted.js";
 import { MEMORY_KIND_ANSWER, MEMORY_KIND_FILE, type MemoryRow, rememberRows } from "../core/memory.js";
 import { walkAdmits } from "../core/walker.js";
 import { RETRIEVAL_TOOLS } from "../mcp/wording.js";
@@ -520,23 +520,32 @@ export async function sendRememberedRows(rowsFile: string, db: HostedDb): Promis
   }
 }
 
+/** The memory sender's whole job: send the rows a memory hook left in
+ * `rowsFile` to `target`'s memory, when the account has the agent routes
+ * (`remember` is one; an account without them answers 403), and remove the
+ * file whatever happens - no platform, no agent routes, a features read or a
+ * send that fails - since it holds the person's question, the answer and the
+ * text of the files the model wrote. `fetchImpl` is for tests. */
+export async function memorySend(rowsFile: string, target: HostedTarget | null, fetchImpl?: typeof fetch): Promise<void> {
+  try {
+    if (target === null) return;
+    const { agentApis } = await accountFeatures({ baseUrl: target.baseUrl, apiKey: target.apiKey }, fetchImpl ? { fetch: fetchImpl } : {});
+    if (!agentApis) return;
+    await rememberRows(hostedDbFor(target, fetchImpl ? { fetch: fetchImpl } : {}), JSON.parse(readFileSync(rowsFile, "utf8")) as MemoryRow[]);
+  } finally {
+    removeRowsFile(rowsFile);
+  }
+}
+
 export async function hookCmd(event: string, opts: HookCmdOptions): Promise<void> {
   if (![HOOK_ANSWER_FIGURES, HOOK_MEMORY, HOOK_MEMORY_SEND].includes(event)) return;
   // The sender is started by the memory hook, detached, with nothing on its
   // stdin: it has a file to send and a platform to send it to. It may wait
   // out a cold embedder, since no turn waits on it.
   if (event === HOOK_MEMORY_SEND) {
-    const target = hostedTarget();
-    if (target === null || !opts.rowsFile) return;
+    if (!opts.rowsFile) return;
     try {
-      // `remember` is an agent route: an account without them answers 403,
-      // so the rows are not sent there at all.
-      const { agentApis } = await accountFeatures({ baseUrl: target.baseUrl, apiKey: target.apiKey });
-      if (!agentApis) {
-        removeRowsFile(opts.rowsFile);
-        return;
-      }
-      await sendRememberedRows(opts.rowsFile, hostedDbFor(target));
+      await memorySend(opts.rowsFile, hostedTarget());
     } catch (err) {
       console.error(`${new Date().toISOString()} code-context: memory not written: ${(err as Error).message}`);
     }

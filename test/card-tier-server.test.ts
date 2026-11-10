@@ -110,7 +110,7 @@ const platform = () =>
   });
 
 beforeAll(() => {
-  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/cxbench" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
+  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/testdb" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
 });
 
 afterAll(() => {

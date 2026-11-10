@@ -71,8 +71,7 @@ export function rankRows<R extends Record<string, unknown>>(rows: readonly R[], 
 export const SQL_RESULT_CHAR_BUDGET = 24_000;
 /** A text cell longer than this is cut and the cut marked, so one wide
  * column cannot spend the whole budget on its first rows. Half the budget,
- * the loop's rule for one text field (the platform's renderer,
- * `TOOL_RESULT_MAX_CHARS`): a row of two such cells still fits. A smaller cap
+ * the loop's rule for one text field: a row of two such cells still fits. A smaller cap
  * cut a typical document passage, which runs past 2,000 characters, so the
  * text a hit's snippet points to was not one `sql` away after all. */
 export const SQL_CELL_CHAR_CAP = SQL_RESULT_CHAR_BUDGET / 2;

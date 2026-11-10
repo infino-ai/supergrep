@@ -4,13 +4,13 @@
 // A hosted table of PASSAGES this process did not build, end to end through
 // the MCP server on an in-memory transport against a scripted platform: the
 // data rooms of a document benchmark, one hosted table a room, named by
-// CX_TABLE a question at a time (2026-10-11). Its columns are the chunks
+// CX_TABLE a question at a time. Its columns are the chunks
 // table's, so its shape says chunks - and the chunks mode runs find, read
 // and a plain sql on the LOCAL index under the table's name, which holds the
 // one table this process built and no other. On every room task every such
 // call failed "table not found", and search asked the hosted index for the
 // local vector column's name (`embedding`, where the table has `emb`); the
-// loop's ask was the one door that reached the rooms.
+// platform's own retrieval loop was the one door that reached the rooms.
 //
 // So: with CX_REMOTE_SEARCH on and CX_TABLE naming a chunks-shaped table the
 // local index does not hold, the server runs the rows tools over the table
@@ -40,8 +40,8 @@ const { API_KEY_ENV, MANIFEST_NAME, configureHosted, hostedSettingsFromFlags } =
 /** The width the rooms' `emb` is embedded at. */
 const ROOM_DIM = 768;
 
-/** A room table's columns as `POST /v1/schema` returns them on the fleet
- * (cxbench, 2026-10-12): the chunks table's place columns and content, the
+/** A room table's columns as `POST /v1/schema` returns them for such
+ * a table: the chunks table's place columns and content, the
  * room's own, and the vector the platform embeds. */
 const ROOM_SCHEMA = [
   { name: "area", nullable: true, type: "large_utf8" },
@@ -97,7 +97,7 @@ const platform = () =>
   });
 
 beforeAll(() => {
-  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/cxbench" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
+  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/testdb" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
 });
 
 afterAll(() => {

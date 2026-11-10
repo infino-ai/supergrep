@@ -202,7 +202,7 @@ function expectNothingBuilt(s: Started): void {
 }
 
 beforeAll(() => {
-  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/cxbench" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
+  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/testdb" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
 });
 
 afterAll(() => {
@@ -439,9 +439,8 @@ describe("the chunks table with other tables in its database: the tables a state
     // and its share of the card budget alone (a card route parameter that
     // handed joins back with the card is gone); no join_keys call is made
     // at startup; the worked JOIN carries a placeholder and says to call
-    // join_keys first (2026-09-24, after the corpus's keys had been written
-    // into this text by hand and then by a startup call: the owner, "you
-    // doctored the demo?").
+    // join_keys first, so no key is ever written into this text, by hand or
+    // by a startup call.
     const cardAsks = s.sent.filter((sent) => sent.op === "table_card").map((sent) => [sent.body?.table, Object.keys(sent.body ?? {}).sort()]);
     expect(cardAsks).toContainEqual(["swe_issues", ["families", "table", "tier", "whole"]]);
     expect(cardAsks).toContainEqual(["chunks_swelogs", ["families", "table", "tier", "whole"]]);

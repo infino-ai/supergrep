@@ -325,6 +325,22 @@ describe("cx install: no flags, with an account stored", () => {
     expect(JSON.stringify(entry)).not.toContain("inf_deadbeef");
   });
 
+  it("writes the entry without hooks, and says why, for a name Claude Code would rewrite", async () => {
+    // Without --db, whether hooks are written is known only once the
+    // platform half has resolved - here it registered the database - so the
+    // install goes ahead and leaves the hooks out rather than refusing.
+    signIn("https://platform.example");
+    const { impl } = platform(201);
+    const notes: string[] = [];
+    vi.mocked(console.log).mockImplementation((line?: unknown) => {
+      notes.push(String(line));
+    });
+    await installCmd({ path: root, name: "my.server" }, VERSION, { fetch: impl });
+    expect(read(configIn(root)).mcpServers["my.server"].args).toContain("--db");
+    expect(existsSync(join(root, ".claude", "settings.json"))).toBe(false);
+    expect(notes.some((n) => n.includes("No hooks written"))).toBe(true);
+  });
+
   it("refuses when --platform names a different host than the stored account", async () => {
     // The bug this pins: --platform was read only on the no-account path, so
     // with an account stored it was silently dropped and the repository was

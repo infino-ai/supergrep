@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 //
 // The cards the model outside the loop reads are the platform's rendering
-// of them, the one its own loop's prompt carries (the owner, 2026-11-07:
-// "we must have the same process inner and outer"): one call at start-up
+// of them, the one its own loop's prompt carries, so the model inside the
+// loop and the one outside read the same cards: one call at start-up
 // for every carded table (`GET /v1/table_card/{db}?tables=`), its text
 // folded into the sql tool unchanged, and describe_columns handing the
 // platform the caller's question so the columns it needs come first, ranked

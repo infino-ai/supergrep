@@ -486,8 +486,7 @@ export function cardNamesKinds(card: RowRecord | undefined): boolean {
 }
 
 /** What a text over several tables says about choosing among them: the
- * loop's words, word for word (the platform loop's text,
- * SEVERAL_TABLES_SENTENCE). Shown
+ * loop's words, word for word. Shown
  * two tables of events, a model took the one named first and the column
  * named like the question's words and told the reader the data held no tool
  * calls, while the other table's card said where they were. */
@@ -504,19 +503,16 @@ export const SEVERAL_TABLES_SENTENCE =
  * thousands of characters into each. */
 export const TEXT_COLUMNS_LISTED = 24;
 
-/** How the lookup is told to be called with the question, the loop's words
- * word for word (the platform loop's text, DESCRIBE_COLUMNS_QUESTION_RULE):
- * the question first, the
- * table when the caller knows it. */
+/** How the lookup is told to be called with the question, in the platform
+ * loop's words: the question first, the table when the caller knows it. */
 export const DESCRIBE_COLUMNS_QUESTION_RULE =
   " Pass the question you are answering as `question`: without `table` it returns the cards of the " +
   "tables that question needs, best first, with the columns it needs listed whole; with `table`, that " +
   "table's columns the question needs first. A `pattern` narrows the columns to names you already know.";
 
-/** The `describe_columns` tool's text, the loop's own tool's words
- * (the platform loop's text, describe_columns_tool): the model outside the
- * loop reads a wide table's laid-out card as the loop does and reaches a
- * mapped column the same way. */
+/** The `describe_columns` tool's text, in the words of the platform loop's
+ * own tool: the model outside the loop reads a wide table's laid-out card as
+ * the loop does and reaches a mapped column the same way. */
 export const DESCRIBE_COLUMNS_DESCRIPTION =
   "List a table's column entries from its card, whole: type, index role, rows with a value, distinct " +
   "count, range, most frequent values, and, where the card names a `kind_column`, `kinds`: which kinds " +
@@ -543,9 +539,8 @@ const OVERVIEW_PREAMBLE =
   "describe_columns with your question for the cards of the tables it needs, then with a table for its " +
   "columns:\n";
 
-/** The lookup's `question` parameter, the loop's words word for word
- * (the platform loop's text, DESCRIBE_COLUMNS_QUESTION_PARAM): one ranking
- * for a lookup inside the loop and out. */
+/** The lookup's `question` parameter, in the platform loop's words: one
+ * ranking for a lookup inside the loop and out. */
 export const DESCRIBE_COLUMNS_QUESTION_PARAM =
   "What you need the columns for, in a sentence: the matching columns that question needs come first, " +
   "best first, the rest after by rows with a value.";
@@ -561,11 +556,9 @@ export function promptCardsMap(rendered: PromptCards): boolean {
   );
 }
 
-/** Three rules the platform's retrieval loop writes its statements under
- * (the platform loop's text, `retrieval_system_prompt`), given to the caller
- * too, because both write statements over the same tables (the owner,
- * 2026-09-30: "both inner and outer loops whenever you are changing the
- * prompts"). The first two are the loop's words, word for word.
+/** Three rules the platform's retrieval loop writes its statements under,
+ * given to the caller too, because both write statements over the same
+ * tables. The first two are the loop's words, word for word.
  *
  * A question about some of the rows is answered over those rows alone:
  * "which centuries come up in village articles" was once answered by a
@@ -584,8 +577,7 @@ export const RELATED_TO_SENTENCE =
  * "angry", "furious" and matches them as words, and misses the complaints
  * that use none of them ("stop polling me"). Said beside
  * `RELATED_TO_SENTENCE` in the rows' sql text, where a table has a vector;
- * the loop carries the same sentence (the platform loop's text,
- * `LANGUAGE_KIND_SENTENCE`). */
+ * the loop carries the same sentence. */
 export const LANGUAGE_KIND_SENTENCE =
   "A question about a kind of language - angry, frustrated, praising, confused - is a question of meaning however " +
   "many example words it names: rank with hybrid_search or vector_search, the examples as its terms, never a keyword " +
@@ -605,16 +597,13 @@ export function withTaskChecklist(instructions: string): string {
   return `${instructions}\n${TASK_CHECKLIST_SENTENCE}`;
 }
 
-/** The whole question in one statement (the owner, 2026-10-01: "put as
- * much as it can into a single query"). Asked which news organisations the
- * Wikipedia articles cite most and which subjects cite them, the Infino arm
- * wrote seven statements - one regexp_match over every outlet, then one per
- * outlet - with 32.7 s of tool time, and its counts were wrong. One
- * statement, a UNION ALL of one token_match per outlet grouped by subject
- * and ranked per outlet with ROW_NUMBER(), answered both parts in 0.28 s on
- * the platform. Worded with no search function's name, since a table with no
- * full-text column is told none. The loop's text carries the same sentence
- * (the platform loop's text, `SQL_ONE_STATEMENT`). */
+/** The whole question in one statement. Asked which sources a set of
+ * articles cites most and which subjects cite them, a caller left alone
+ * writes a statement per source, slowly, and gets the counts wrong; one
+ * statement - a UNION ALL of one token_match per source, grouped by subject
+ * and ranked per source with ROW_NUMBER() - answers both parts at once.
+ * Worded with no search function's name, since a table with no full-text
+ * column is told none. The platform's own loop carries the same sentence. */
 export const ONE_STATEMENT_SENTENCE =
   "Put as much of the question as you can into one statement: WITH, UNION ALL, joins, CASE, GROUP BY and window " +
   "functions such as ROW_NUMBER() OVER (PARTITION BY ...) compose in one, so a question in several parts - several " +
@@ -626,7 +615,7 @@ export const ONE_STATEMENT_SENTENCE =
  * reads the first match alone (ROWS_REGEX_SENTENCE), and counted each article
  * for the first outlet it named: 13,216 for the New York Times where one
  * count per outlet gives 23,719. Run on the platform before it was written
- * here. The loop's text carries the same (`SQL_SEVERAL_TERMS`). */
+ * here. The platform's own loop carries the same sentence. */
 export function severalTermsSentence(table: string, column: string): string {
   return (
     `Several terms counted at once are one token_match per term, side by side in a UNION ALL - SELECT 'a' AS term, ` +
@@ -635,7 +624,7 @@ export function severalTermsSentence(table: string, column: string): string {
   );
 }
 /** The regex functions of the platform's dialect, for a table of rows; the
- * loop's dialect note (the platform loop's text, `SQL_DIALECT_NOTE`) carries
+ * loop's dialect note carries
  * the same sentence. Models write regexp_extract, which Snowflake, Spark and
  * BigQuery have and DataFusion does not: it appeared in the demo's Wikipedia
  * statements on every host since 2026-09-25, and on 2026-10-01 a caller lost
@@ -648,7 +637,7 @@ export const ROWS_REGEX_SENTENCE =
   "capture group of the first match alone (NULL where nothing matches), so a pattern of alternatives yields one of " +
   "them per row and never counts several, regexp_like(text, 'pattern') tests and regexp_replace rewrites. ";
 /** A row's `_id` in a statement, for a table of rows; the loop's dialect note
- * (the platform loop's text, `SQL_DIALECT_NOTE`) carries the same sentence,
+ * carries the same sentence,
  * word for word. The id is 32 digits, a DECIMAL(38, 0): written bare, the
  * engine reads it as a float and the statement fails with "Cannot cast to
  * Decimal128(38, 15). Overflowing" - a caller writing `WHERE _id = 3299...`
@@ -710,14 +699,11 @@ export const SQL_DESCRIPTION =
   "a short indexed column, never on content. " +
   "The {{name}} placeholders are filled server-side from the embed " +
   "map, so they cost you nothing but the name. " +
-  // The whole question as one statement, each clause one job, in place of
-  // the ranking example that showed the aggregate alone (the owner,
-  // 2026-10-04, on a question that hid six jobs - count, group, join,
-  // filter, keyword search, semantic search: "should we break down this
-  // question like this as an example for the inner and outer models in our
-  // tool descriptions? ... do it"). Run on the platform before it was
-  // written here; the inner loop's sql text carries the same shape in its
-  // table's names (the platform loop's text `worked_example`).
+  // The whole question as one statement, each clause one job - count,
+  // group, join, filter, keyword search, semantic search - in place of a
+  // ranking example that showed the aggregate alone. Run on the platform
+  // before it was written here; the platform's own loop carries the same
+  // shape in its table's names.
   "The whole question as one statement, each clause one job - filter, keyword and meaning search, " +
   "group, count - with your own words in place of the example's: SELECT path, SUM(end_line - start_line + 1) " +
   `AS ranked_lines, COUNT(*) AS chunks FROM hybrid_search('${TABLE}','content','merge small superfiles','embedding', {{q}}, 300) WHERE ` +
@@ -2653,18 +2639,13 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // without it.
   let graphOff = !agentApis;
   let graphPausedUntil = 0;
-  // The client each repository's expansion goes through: the repository's
-  // own database, with a short budget of its own and no cold-start wait, so
-  // a cold or slow graph never holds the result it was to add to.
-  const graphClients = new WeakMap<RepoCtx, HostedDb>();
-  const graphClientOf = (ctx: RepoCtx): HostedDb => {
-    let client = graphClients.get(ctx);
-    if (!client) {
-      client = hostedDbFor(ctx.hosted!.target, { ...hostedOptions, coldStartSecs: 0, timeoutMs: GRAPH_TIMEOUT_MS });
-      graphClients.set(ctx, client);
-    }
-    return client;
-  };
+  // The client one expansion goes through: the repository's own database,
+  // with a short budget of its own and no cold-start wait, so a cold or slow
+  // graph never holds the result it was to add to. A client per expansion,
+  // so the call it reports is this expansion's own request - or none, when
+  // it made none - and never another call's.
+  const graphClientFor = (ctx: RepoCtx): HostedDb =>
+    hostedDbFor(ctx.hosted!.target, { ...hostedOptions, coldStartSecs: 0, timeoutMs: GRAPH_TIMEOUT_MS });
   // The tables the platform said its graph does not cover (or that it
   // builds no graph): each answered once, then not asked about again.
   const graphUncovered = new Set<string>();
@@ -2686,7 +2667,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   ): Promise<GraphResult> => {
     if (graphOff || Date.now() < graphPausedUntil || !ctx.hosted || !graphTables.has(source) || graphUncovered.has(source)) return NO_GRAPH_RESULT;
     const trace: string[] = [];
-    const client = graphClientOf(ctx);
+    const client = graphClientFor(ctx);
+    // Undefined when the expansion made no request (no seeds, every seed
+    // walked already): nothing to bill.
     const metered = () => callTelemetry(client.lastCall());
     try {
       const connected = await expandAcrossGraph(client, source, rows, {

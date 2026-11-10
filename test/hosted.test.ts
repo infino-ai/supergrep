@@ -844,9 +844,44 @@ describe("a checked read whose check cannot answer", () => {
     expect(db.validatesOnRead).toBe(true);
   });
 
-  it("lets a refusal of the statement itself stand, without a second read", async () => {
-    const { db, calls } = client([error(400, "query_sql is read-only")]);
+  it("returns the rows plain when the platform rejects the check's own arguments", async () => {
+    const { db, calls } = client([error(400, "validate: no column named body in t"), json(rows)]);
+    expect(await db.querySqlChecked("SELECT id FROM t", VALIDATE)).toEqual({ rows });
+    expect(calls).toHaveLength(2);
+    expect(bodyJson(calls[1]).validate).toBeUndefined();
+    // Not a deployment without validation: the next read still asks.
+    expect(db.validatesOnRead).toBe(true);
+  });
+
+  it("refuses a statement the platform refuses, in the plain read's words", async () => {
+    const { db, calls } = client([error(400, "query_sql is read-only"), error(400, "query_sql is read-only")]);
     await expect(db.querySqlChecked("DELETE FROM t", VALIDATE)).rejects.toThrow("read-only");
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("lets a refusal of the key or the account stand, without a second read", async () => {
+    for (const status of [401, 402, 403]) {
+      const { db, calls } = client([error(status, "refused")]);
+      await expect(db.querySqlChecked("SELECT id FROM t", VALIDATE), String(status)).rejects.toThrow();
+      expect(calls, String(status)).toHaveLength(1);
+    }
+  });
+
+  it("gives the checked attempt a budget of its own, and returns the rows plain past it", async () => {
+    // The checked read never answers; the plain one does at once.
+    let call = 0;
+    const fetchImpl: typeof fetch = (_input, init) => {
+      call += 1;
+      if (call === 1) {
+        return new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)));
+      }
+      return Promise.resolve(new Response(JSON.stringify(rows), { status: 200, headers: { "content-type": "application/json" } }));
+    };
+    const db = new HostedDb({ ...target, apiKey: KEY }, { fetch: fetchImpl, timeoutMs: 60_000, checkedReadTimeoutMs: 50 });
+    const t0 = performance.now();
+    expect(await db.querySqlChecked("SELECT id FROM t", VALIDATE)).toEqual({ rows });
+    expect(call).toBe(2);
+    // Bounded by the checked budget, not the client's minute.
+    expect(performance.now() - t0).toBeLessThan(5_000);
   });
 });

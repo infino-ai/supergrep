@@ -890,10 +890,12 @@ export async function installCmd(
   const settingsPath = join(root, PROJECT_SETTINGS);
   const hooksHere = !opts.config;
   // A name Claude Code rewrites in its tools' names leaves the hooks
-  // matching tools that never exist, so it is refused - only where hooks
-  // will be written. With `--db` that is known now, before anything is
-  // asked of the platform; otherwise it is known once the platform half
-  // has resolved (`withHooks` below). A local-only entry writes none.
+  // matching tools that never exist. With `--db` hooks will be written, and
+  // that is known now, so the name is refused before anything is asked of
+  // the platform. Without it, whether hooks are written is known only once
+  // the platform half has resolved - which may already have registered a
+  // database - so the entry is written then and the hooks left out, said in
+  // a note (`hookable` below). A local-only entry writes none either way.
   const refuseHookName = () =>
     new InstallError(
       `--name ${JSON.stringify(name)} holds a character Claude Code rewrites in the server's tool names, so its hooks would ` +
@@ -927,8 +929,14 @@ export async function installCmd(
   const setup = await resolvePlatform(opts, root, deps);
   // With a platform database the Stop hooks are written beside the entry,
   // and the entry tells the server to recall the memory one of them writes.
-  const withHooks = hooksHere && Boolean(setup.db);
-  if (withHooks && !SERVER_NAME.test(name)) throw refuseHookName();
+  const hookable = SERVER_NAME.test(name);
+  const withHooks = hooksHere && Boolean(setup.db) && hookable;
+  if (hooksHere && setup.db && !hookable) {
+    setup.notes.push(
+      `No hooks written: --name ${JSON.stringify(name)} holds a character Claude Code rewrites in the server's tool names, ` +
+        `so its hooks would never see its tools. Re-run with letters, digits, "-" and "_" only to add them.`,
+    );
+  }
   const entry = serverEntry({ ...opts, db: setup.db, withHooks }, version);
   const existed = name in servers;
   const next: Config = { ...config, mcpServers: { ...servers, [name]: entry } };

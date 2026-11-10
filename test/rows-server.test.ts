@@ -7,9 +7,8 @@
 // things under test.
 //
 // The first: with an account and CX_TABLE naming a table that is not the
-// chunks table, find, search, sql and ask answer from that table with the
-// requests the platform's workers accept (the shapes the live
-// cxbench.chunks_jobs probes returned on 2026-09-11), the tool text describes
+// chunks table, find, search and sql answer from that table with the
+// requests the platform's workers accept, the tool text describes
 // it, and the shape is read from the platform ONCE, at startup - no call asks
 // the platform what it is about to run against, so each call's requests are
 // its own and nothing else. A non-default CX_TABLE always means rows mode
@@ -173,7 +172,7 @@ function expectNothingBuilt(started: Started): void {
 }
 
 beforeAll(() => {
-  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/cxbench" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
+  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/testdb" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
 });
 
 afterAll(() => {
@@ -383,7 +382,7 @@ describe.each(SPELLINGS)("a table of another shape, described at startup, its ve
 // cannot read the model it was filled with. Without the load's word that the
 // platform embedded it, the table's one vector column is still the candidate
 // - a table copied from a hydrated one carries its vectors and no such
-// record (a benchmark's data rooms, 2026-10-11) - and the platform's own check
+// record - and the platform's own check
 // says: asked to embed a query for it, it does, so search runs by meaning.
 // A column it refuses is left to keyword alone (UNEMBEDDED, below).
 describe("a table whose vector column no load record says the platform embedded", () => {

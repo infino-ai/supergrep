@@ -628,9 +628,7 @@ export interface CardBudget {
 
 /** The whole columns the cards of one server share, and the least a table
  * keeps when several share them; the map families likewise. The platform's
- * own loop lays the cards of one prompt out within the same four figures
- * (the platform's card layout: WHOLE_COLUMNS, WHOLE_COLUMNS_FLOOR, MAP_FAMILIES,
- * MAP_FAMILIES_FLOOR), so the model outside the loop and the one inside read
+ * own loop lays the cards of one prompt out within the same four figures, so the model outside the loop and the one inside read
  * a wide table the same way. Sized per table, one table of 4,692 columns put
  * 2.4 million characters into the sql tool's text. */
 export const WHOLE_COLUMNS = 200;

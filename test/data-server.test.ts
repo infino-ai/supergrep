@@ -33,7 +33,7 @@ const { API_KEY_ENV, MANIFEST_NAME, configureHosted, hostedSettingsFromFlags } =
 /** The platform the server is started against, and the database its
  * `--db` named: the repository's own. */
 const PLATFORM = "http://127.0.0.1:9";
-const REPO_DB = "cxbench";
+const REPO_DB = "testdb";
 /** A data database of the account, and its tables: a bank's accounts and
  * transactions, as a hydrate loaded them - no full-text column on either,
  * a vector on neither. */

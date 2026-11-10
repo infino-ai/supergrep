@@ -3,9 +3,8 @@
 //
 // Every set of instructions the server sends ends its habits with the task
 // checklist: list every explicit ask of the task and check the draft against
-// it before answering. In a legal-document benchmark's practice-area run (2026-10-08) an
-// ask never addressed, or a structure the task named and the deliverable
-// lacked, was 36% of the score lost.
+// it before answering. An ask never addressed, or a structure the task named
+// and the deliverable lacked, is a common way for an answer to lose marks.
 import { describe, expect, it } from "vitest";
 import { TASK_CHECKLIST_SENTENCE, withListedNames, withTaskChecklist } from "../src/mcp/server.js";
 

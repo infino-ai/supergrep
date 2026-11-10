@@ -3,11 +3,10 @@
 //
 // The server's start-up waits on the database's other tables for a fixed
 // time only (STARTUP_BUDGET_MS), end to end through the MCP server on an
-// in-memory transport against a scripted platform. On the public demo's
-// database, 213 tables behind the platform's per-account rate limit,
-// describing every other table before the handshake took 20-71 s (2026-10-30)
-// - past the 30 s Claude Code gives a server, so a session got no tools at
-// all, or past every visitor's patience. Here one other table never answers
+// in-memory transport against a scripted platform. On a database of a few
+// hundred tables behind the platform's per-account rate limit, describing
+// every other table before the handshake can take longer than Claude Code
+// gives a server to start, and the session gets no tools at all. Here one other table never answers
 // its schema, or one never answers its card: the handshake goes ahead at the
 // budget, the table the server is for is described whole whatever it takes,
 // what was read of the others is described, and what was not is named as a
@@ -94,7 +93,7 @@ const platform = (tables: string[], primaryCardMs = 0) =>
   });
 
 beforeAll(() => {
-  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/cxbench" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
+  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/testdb" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
 });
 
 afterAll(() => {

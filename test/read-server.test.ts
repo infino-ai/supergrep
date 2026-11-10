@@ -3,7 +3,7 @@
 //
 // `read` over a hosted table of documents, end to end through the MCP server
 // on an in-memory transport against a scripted platform. The table is laid
-// out as the live cxbench.chunks_docs is (read 2026-10-08): one row per
+// out as a hosted table of document passages is: one row per
 // passage of a file, its place in the file in `chunk` and its text in
 // `content`; `task` and `title` copied onto every passage, but `path` - a
 // long text column the load keeps on a record's first passage alone - on
@@ -305,7 +305,7 @@ async function readThrough(s: Started, docs: readonly Doc[]): Promise<{ first: S
 }
 
 beforeAll(() => {
-  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/cxbench" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
+  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/testdb" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
 });
 
 afterAll(() => {

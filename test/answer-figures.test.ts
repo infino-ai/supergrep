@@ -26,7 +26,7 @@ const stopEvent = (transcript: string, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ hook_event_name: "Stop", transcript_path: "/t.jsonl", ...extra, _t: transcript.length });
 const reader = (transcript: string) => (path: string) => (path === "/t.jsonl" ? transcript : null);
 
-/** OfficeQA question 1 as it ran: the receipts table read right (cents after a
+/** A table question from a public document benchmark: the receipts table read right (cents after a
  * space, as the scan prints them), the average computed by hand. */
 const TABLE = "1792 | 3,443,070 85 | $208,942 81 | 1793 | 4,255,306 56 | 337,705 70 | 1799 | 6,610,449 31 | 779,136 44";
 const HAND_REPLY = "The final EMA for CY 1799 is about $7,046,002.04.\n\n<FINAL_ANSWER>7046002.04</FINAL_ANSWER>";
@@ -86,7 +86,7 @@ describe("cx hook answer-figures", () => {
     expect(output.reason).toBe(figuresReason(["7046002.04"]));
   });
 
-  it("sends the model back to compute a reading it named and did not, as OfficeQA 24 and 30 replied", () => {
+  it("sends the model back to compute a reading it named and did not, as a reply that names a reading and leaves it uncomputed", () => {
     expect(namesUncomputedReading("If you add Panama Canal disbursements to 1909 ... I did not compute that variant.")).toBe(true);
     expect(namesUncomputedReading("If you instead take the literal ratio of receipt change to deficit change")).toBe(true);
     expect(namesUncomputedReading("The total is 12.5, computed with sql.")).toBe(false);

@@ -80,7 +80,7 @@ const CHUNKS_SCHEMA: SchemaField[] = [
   { name: "embedding", type: "embedding", source: ["content"] },
 ];
 
-/** The live job-postings table (cxbench.chunks_jobs), as its schema came
+/** The live job-postings table (testdb.chunks_jobs), as its schema came
  * back on 2026-09-11: hydrate cast the indexed and embedded text columns to
  * large_utf8 and left the rest utf8. */
 const JOBS_SCHEMA: SchemaField[] = [
@@ -722,8 +722,8 @@ describe("the tool text for a table of another shape", () => {
     expect(SQL_DESCRIPTION).toContain(RELATED_TO_SENTENCE);
     // The one rule for hybrid against keyword, in the sql text and the
     // instructions wherever a vector can rank, and nowhere a table has none
-    // to rank by (the owner, 2026-10-11: keyword matching only to count or
-    // list every exact occurrence). The loop's text carries the same words.
+    // to rank by: keyword matching only to count or list every exact
+    // occurrence. The platform loop's text carries the same words.
     expect(withVector).toContain(SEARCH_RULE_SENTENCE);
     expect(SQL_DESCRIPTION).toContain(SEARCH_RULE_SENTENCE);
     expect(rowsInstructions(JOBS)).toContain(SEARCH_RULE_SENTENCE.trimEnd());
@@ -864,7 +864,7 @@ describe("a vector column the platform embedded", () => {
 
   it("with no record naming one, offers the table's one vector column, or the one its card names, and of several unnamed none - and says why", () => {
     // No record: a table copied from a hydrated one carries its vectors and
-    // no record (a benchmark's data rooms, 2026-10-11). The one vector column is
+    // no record. The one vector column is
     // the candidate, with no source to name; the platform's check decides.
     let { shape, heard } = notes(PASSAGES_SCHEMA, PASSAGES_CARD, null);
     expect(shape.vectorColumn).toBe("emb");
@@ -949,7 +949,7 @@ describe("the platform's check of a vector column's model", () => {
   /** What the platform answers a check it ran: the nearest row. */
   const NEAREST = [{ _id: 1, score: 0.26 }];
   const TABLE = "chunks_wikipedia_v5";
-  /** The Wikipedia table's card naming `sections`, the passages the platform
+  /** An articles table's card naming `sections`, the passages the platform
    * embeds, as the table's prose: the column the doors search. */
   const SECTIONS_CARD = { ...PASSAGES_CARD, text_column: "sections" };
 
@@ -1001,7 +1001,7 @@ describe("the platform's check of a vector column's model", () => {
 
   // The other tables of a database are described with no check: each check
   // is a search by meaning that loads the table's vector index, and one per
-  // table of a 41-table database at startup stalled the worker (2026-10-20).
+  // table of a database of dozens of tables at startup stalls the worker.
   it("asks the platform nothing when told not to check, and offers the column the load and card describe", async () => {
     const { hosted, checks } = platform(refused(400, MISMATCH), PASSAGES_SCHEMA, PASSAGES_LOAD, SECTIONS_CARD);
     const { shape, heard } = await resolve(hosted, { checkVector: false });
@@ -1145,7 +1145,7 @@ describe("HostedDb.vectorSearchText", () => {
 
 // The text column the doors search on a table with several full-text
 // columns is the one the table's card names as its prose (`text_column`).
-// Picked by name, the Wikipedia table's was `abstract`, filled on an
+// Picked by name, an articles table's was `abstract`, filled on an
 // article's first passage alone, while the platform embeds `name` and
 // `sections`: a hybrid search paired keywords on abstracts with meaning on
 // passages.
@@ -1656,9 +1656,9 @@ describe("HostedDb.bm25Search", () => {
 
 // The wide-table text (the card preamble's map sentences, the table's name
 // before its card, the describe_columns tool and line) is for a card that
-// maps columns. A narrow table's card lists every column whole, and on
-// OfficeQA (2026-10-19) the text about maps cost two questions every earlier
-// run had right, so a card with no map entry is introduced as before.
+// maps columns. A narrow table's card lists every column whole, and the text
+// about maps only confuses a model reading it, so a card with no map entry
+// is introduced as before.
 describe("cardMapsColumns", () => {
   it("is true only for a card that lays out a column as a map entry", () => {
     expect(cardMapsColumns({ schema: [{ name: "path" }, { name: "text" }, { name: "year" }] })).toBe(false);

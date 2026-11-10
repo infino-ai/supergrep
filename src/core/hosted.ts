@@ -160,6 +160,9 @@ export interface HostedCallInfo {
 export interface HostedOptions {
   /** Injected for tests; defaults to the global fetch. */
   fetch?: typeof fetch;
+  /** The budget of a checked read's checked attempt
+   * (CHECKED_READ_TIMEOUT_MS by default). */
+  checkedReadTimeoutMs?: number;
   /** Per-call timeout (default 60 s). */
   timeoutMs?: number;
   /** How long retryable failures are re-issued before giving up (default 120 s). */
@@ -214,22 +217,23 @@ export interface CheckedRows {
   rerank?: RowRecord;
 }
 
-/** The fields `checks` adds to a read's body: none for a check not asked. */
 /** A 400 that says the deployment does not offer validation on a read: the
  * statement is fine, the check is not available here. */
 export function validationUnavailable(err: unknown): boolean {
   return err instanceof HostedError && err.status === HTTP_BAD_REQUEST && /\bvalidat(e|ion)\b/i.test(err.message) && /not (available|supported|enabled)|unknown field|unsupported/i.test(err.message);
 }
 
-/** A refusal that is about the statement itself - a 4xx other than
- * validation being unavailable, a capacity answer or a missing key - and so
- * the same with or without the check. */
-function statementRefused(err: unknown): boolean {
-  if (!(err instanceof HostedError)) return false;
-  if (validationUnavailable(err) || err.atCapacity || err.pastDeadline) return false;
-  return err.status >= 400 && err.status < 500;
+/** A refusal that would be the same for the plain statement: the key, the
+ * account's balance or its rights (401, 402, 403). Any other failure of a
+ * checked read - a 400 about the check's own arguments as much as a timeout
+ * or a 5xx - may be the check's, so the statement is resent plain, and a
+ * statement the platform refuses outright is refused again there, in its own
+ * words. */
+function refusedEitherWay(err: unknown): boolean {
+  return err instanceof HostedError && (err.unauthenticated || err.paymentRequired || err.status === HTTP_FORBIDDEN);
 }
 
+/** The fields `checks` adds to a read's body: none for a check not asked. */
 function readChecks(checks: ReadChecks): RowRecord {
   return {
     ...(checks.validate ? { validate: checks.validate } : {}),
@@ -484,6 +488,12 @@ export async function uploadBytes(
 }
 /** The status a platform answers a read whose body it does not take. */
 const HTTP_BAD_REQUEST = 400;
+/** The status of a key the account's rights do not cover. */
+const HTTP_FORBIDDEN = 403;
+/** The budget a checked read has before its statement is resent plain: the
+ * check rides on the statement, so a check that is slow holds the rows, and
+ * past this the rows are worth more than the verdict. */
+const CHECKED_READ_TIMEOUT_MS = 15_000;
 
 export class HostedDb {
   /** Whether this platform refused a read's `rerank` - one that predates
@@ -504,6 +514,7 @@ export class HostedDb {
   private readonly coldStartMs: number;
   private readonly deadlineMs: number;
   private readonly onCall?: (info: HostedCallInfo) => void;
+  private readonly checkedReadTimeoutMs: number;
   private last: HostedCallInfo | null = null;
 
   constructor(target: HostedTarget, opts: HostedOptions = {}) {
@@ -518,6 +529,7 @@ export class HostedDb {
     this.coldStartMs = (opts.coldStartSecs ?? DEFAULT_COLD_START_SECS) * MS_PER_SEC;
     this.deadlineMs = opts.deadlineMs ?? Number.POSITIVE_INFINITY;
     this.onCall = opts.onCall;
+    this.checkedReadTimeoutMs = opts.checkedReadTimeoutMs ?? CHECKED_READ_TIMEOUT_MS;
   }
 
   /** Telemetry of the most recent logical call, or null before the first. */
@@ -713,7 +725,7 @@ export class HostedDb {
    * card (what the start-up text describes a database by when its cards do
    * not fit); otherwise the cards of
    * `tables` rendered exactly as the platform's loop carries them in its
-   * prompt (the platform's card ranking, `prompt_cards`) - the same tables,
+   * prompt - the same tables,
    * joins, layout and character budget, ranked for `question` when one is
    * given and the cards do not fit as they are - for this client to fold
    * into its own text unchanged rather than lay the cards out itself. A
@@ -921,18 +933,21 @@ export class HostedDb {
    * the question (`validate`) and ordered by its grader (`rerank`) where
    * they lie, so no row travels back up to be checked or ranked. */
   async querySqlChecked(sql: string, checks: ReadChecks): Promise<CheckedRows> {
-    const plain = (asked: ReadChecks, coldStartMs?: number) =>
+    const plain = (asked: ReadChecks, coldStartMs?: number, timeoutMs?: number) =>
       this.withRerank(asked, (c) =>
-        this.postJson("query_sql", { query: sql, ...readChecks(c) }, true, coldStartMs).then((exchange) => this.checkedRows(exchange, "query_sql")),
+        this.postJson("query_sql", { query: sql, ...readChecks(c) }, true, coldStartMs, timeoutMs).then((exchange) =>
+          this.checkedRows(exchange, "query_sql"),
+        ),
       );
     if (!checks.validate || this.validateUnsupported) return plain({ ...checks, validate: undefined });
     try {
-      // The checked attempt waits out no cold start: a database coming up is
-      // waited on by the plain statement below, which has the rows to give.
-      return await plain(checks, 0);
+      // The checked attempt waits out no cold start and has a budget of its
+      // own (CHECKED_READ_TIMEOUT_MS): a database coming up, or a check that
+      // will not answer, is left to the plain statement below, which has the
+      // rows to give - so the worst case is that budget plus one plain read.
+      return await plain(checks, 0, this.checkedReadTimeoutMs);
     } catch (err) {
-      // A statement the platform refused is the statement's, checked or not.
-      if (statementRefused(err)) throw err;
+      if (refusedEitherWay(err)) throw err;
       // A deployment without validation says so; no later statement asks.
       if (validationUnavailable(err)) this.validateUnsupported = true;
       // Whatever kept the check from answering, the rows still come.
@@ -1040,14 +1055,14 @@ export class HostedDb {
   /** A JSON request body. Through jsonify, as every body here: a value the
    * caller took from a platform answer may carry a bigint
    * (`keepBigIntegers`), which JSON.stringify refuses and Number() rounds. */
-  private postJson(op: string, body: RowRecord, acceptJson: boolean, coldStartMs?: number): Promise<Exchange> {
+  private postJson(op: string, body: RowRecord, acceptJson: boolean, coldStartMs?: number, timeoutMs?: number): Promise<Exchange> {
     return this.call({
       op,
       method: "POST",
       body: jsonify(body),
       contentType: JSON_CONTENT_TYPE,
       acceptJson,
-      timeoutMs: this.timeoutMs,
+      timeoutMs: timeoutMs ?? this.timeoutMs,
       ...(coldStartMs !== undefined ? { coldStartMs } : {}),
     });
   }

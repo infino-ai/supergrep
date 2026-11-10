@@ -32,7 +32,7 @@ const SESSION_NOT_FOUND_CODE = -32001;
 
 function platform(): Platform {
   return scriptPlatform({
-    databases: () => [200, { databases: [{ name: "cxbench", state: "registered" }, { name: DATA_DB, state: "registered" }] }],
+    databases: () => [200, { databases: [{ name: "testdb", state: "registered" }, { name: DATA_DB, state: "registered" }] }],
     list_tables: (_body, request) => (request.path.endsWith(`/${DATA_DB}`) ? [200, [TRANS]] : [200, ["chunks"]]),
     schema: () => [200, [{ name: "trans_id", nullable: true, type: "i64" }, { name: "amount", nullable: true, type: "f64" }]],
     table_card: (body) => [404, { error: `no lean card for table ${String(body?.table)}` }],
@@ -50,7 +50,7 @@ async function connect(url: string): Promise<{ client: Client; transport: Stream
 }
 
 beforeAll(() => {
-  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/cxbench" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
+  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/testdb" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
 });
 
 afterAll(() => {
