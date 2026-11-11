@@ -166,7 +166,7 @@ describe("cx login: agreeing to uploads", () => {
       { stdin: () => KEY, fetch: impl, consent: { interactive: true, ask: async (q) => (asked.push(q), "y") } },
     );
     expect(result.uploadAgreed).toBe(true);
-    expect(asked[0]).toMatch(/directories you use search and ask in/);
+    expect(asked[0]).toMatch(/directories you use search in/);
     expect(readStoredAccount()?.uploadConsentAt).toBeDefined();
   });
 

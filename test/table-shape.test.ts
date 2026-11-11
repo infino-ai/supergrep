@@ -8,7 +8,7 @@
 // the one client call is against a scripted fetch.
 
 import { describe, expect, it } from "vitest";
-import { TABLE, configuredTextColumn } from "../src/core/config.js";
+import { TABLE } from "../src/core/config.js";
 import { HostedDb, HostedError, type RowRecord } from "../src/core/hosted.js";
 import {
   ENGINE_ID_COLUMN,
@@ -25,6 +25,10 @@ import {
   sqlLiteral,
   tableShapeFrom,
   vectorCandidate,
+  cardLayouts,
+  databaseTables,
+  familiesAllowance,
+  wholeAllowances,
   type SchemaField,
 } from "../src/core/table-shape.js";
 import { embedsAQuery, findRows, findRowsSql, foldEmbeds, normalizeQueryPlaceholders, searchRows } from "../src/core/searcher.js";
@@ -32,15 +36,27 @@ import { topKAggregateRefusal } from "../src/core/topk-aggregate.js";
 import { rowFindEntry, rowSearchEntry, formatReceipt } from "../src/core/usage.js";
 import {
   COUNTS_IN_THE_ANSWER,
+  READING_HABITS,
+  ARITHMETIC_SENTENCE,
   JOIN_KEYS_RULE,
   KEEP_CONDITIONS_SENTENCE,
+  LANGUAGE_KIND_SENTENCE,
   ONE_STATEMENT_SENTENCE,
-  PREFER_SEVERAL_ASKS,
   RELATED_TO_SENTENCE,
+  SEARCH_RULE_SENTENCE,
+  SEVERAL_TABLES_SENTENCE,
   SQL_DESCRIPTION,
-  TARGETED_ASKS,
+  SWEEP_TO_A_TOOL,
+  TEXT_COLUMNS_LISTED,
+  DESCRIBE_COLUMNS_LINE,
+  cardMapsColumns,
+  cardNamesKinds,
+  codeInstructions,
+  instructionsFor,
+  rowsSurface,
+  columnList,
+  logIndexInstructions,
   rowCitation,
-  rowsAskDescription,
   rowsFindDescription,
   rowsInstructions,
   rowsProjection,
@@ -50,6 +66,7 @@ import {
   siblingsInstruction,
   siblingsNote,
   siblingsSearchable,
+  unresolvedInstructions,
 } from "../src/mcp/server.js";
 
 /** The chunks table as `POST /v1/schema` describes the one this client loads. */
@@ -63,7 +80,7 @@ const CHUNKS_SCHEMA: SchemaField[] = [
   { name: "embedding", type: "embedding", source: ["content"] },
 ];
 
-/** The live job-postings table (cxbench.chunks_jobs), as its schema came
+/** The live job-postings table (testdb.chunks_jobs), as its schema came
  * back on 2026-09-11: hydrate cast the indexed and embedded text columns to
  * large_utf8 and left the rest utf8. */
 const JOBS_SCHEMA: SchemaField[] = [
@@ -93,25 +110,6 @@ describe("tableShapeFrom", () => {
     expect(shape.isChunks).toBe(true);
     expect(shape.vectorColumn).toBe("embedding");
     expect(shape.primaryText).toBe("content");
-  });
-
-  it("searches the column the table's configuration names when it is indexed, and guesses otherwise", () => {
-    // Every text column indexed, as the Wikipedia table is loaded since
-    // 2026-09-27: the guess would land on `abstract` (a hinted name) and
-    // every search would see the lede; the configuration names the body.
-    const fields: SchemaField[] = [
-      { name: "name", nullable: true, type: "utf8" },
-      { name: "abstract", nullable: true, type: "large_utf8" },
-      { name: "sections", nullable: true, type: "large_utf8" },
-      { name: "references", nullable: true, type: "large_utf8" },
-    ];
-    const card = { schema: [{ name: "abstract", index: "fts" }, { name: "sections", index: "fts" }, { name: "references", index: "fts" }] };
-    expect(tableShapeFrom("chunks_wikipedia", fields, card).primaryText).toBe("abstract");
-    const named = (textColumn: string) => tableShapeFrom("chunks_wikipedia", fields, card, null, { textColumn, onNote: () => {} });
-    expect(named("sections").primaryText).toBe("sections");
-    // A name that is not an indexed text column is ignored: the guess stands.
-    expect(named("name").primaryText).toBe("abstract");
-    expect(named("nowhere").primaryText).toBe("abstract");
   });
 
   it("reads the jobs table from its schema alone: the embedded column, the LargeUtf8 text, the key", () => {
@@ -233,16 +231,19 @@ describe("tableShapeFrom", () => {
     expect(shape.projection[0]).toBe(ENGINE_ID_COLUMN);
   });
 
-  it("has no vector column for a table that only carries a client-filled vector", () => {
-    // Text cannot be sent against such a column: the platform did not embed
-    // it, so it has no model to embed the query with. The schema spells it
-    // `vector` as it spells the platform's own; with no record of a load
-    // that embedded it, nothing says which this is, and it is not offered.
+  it("nominates a table's one vector column with nothing to say who filled it, for the platform's check to accept or refuse", () => {
+    // The schema spells a vector a caller filled as it spells the platform's
+    // own, and with no record of a load that embedded it nothing here says
+    // which this is. The shape alone offers the one such column;
+    // resolveTableShape then asks the platform to embed a query for it, and
+    // a column the platform did not fill is refused there (the checks
+    // below). The projection never carries it either way.
     const shape = tableShapeFrom("t", [
       { name: "body", type: "large_utf8" },
       { name: "v", type: "vector", dim: 16 },
     ]);
-    expect(shape.vectorColumn).toBeNull();
+    expect(shape.vectorColumn).toBe("v");
+    expect(shape.vectorSource).toEqual([]);
     expect(shape.projection).not.toContain("v");
     expect(shape.columns.find((c) => c.name === "v")?.type).toBe("vector<16>");
   });
@@ -260,7 +261,7 @@ describe("snippet", () => {
   });
 
   it("caps the text at SNIPPET_CHARS and marks the cut", () => {
-    const long = "word ".repeat(400);
+    const long = "word ".repeat(SNIPPET_CHARS);
     const out = snippet(long);
     expect(out.length).toBe(SNIPPET_CHARS + "...".length);
     expect(out.endsWith("...")).toBe(true);
@@ -332,6 +333,34 @@ describe("the doors over rows", () => {
     expect(result.hits).toEqual([{ score: 1, id: "a", title: "T", description_html: "x" }]);
   });
 
+  it("search with the question asks the platform to rerank its pool for it, and returns k", async () => {
+    const calls: unknown[][] = [];
+    const hosted = {
+      hybridSearch: async (...args: unknown[]) => {
+        calls.push(args);
+        return [{ id: "a", title: "T", description_html: "x", score: 1 }];
+      },
+      bm25Search: async () => [],
+    };
+    await searchRows(hosted, JOBS, "rust jobs", 3, "  which jobs want rust?  ");
+    expect(calls).toEqual([
+      ["chunks_jobs", "description_html", "emb", "rust jobs", 3, JOBS.projection, { question: "which jobs want rust?", k: 3 }],
+    ]);
+  });
+
+  it("find with the question asks the platform to rerank its matches; without one it asks nothing of them", async () => {
+    const checks: unknown[] = [];
+    const hosted = {
+      querySqlChecked: async (_sql: string, asked: unknown) => {
+        checks.push(asked);
+        return { rows: [{ __cx_total: 1, id: "a", title: "A" }] };
+      },
+    };
+    await findRows(hosted, JOBS, "rust", { limit: 2, question: "which jobs want rust?" });
+    await findRows(hosted, JOBS, "rust", { limit: 2 });
+    expect(checks).toEqual([{ rerank: { question: "which jobs want rust?" } }, {}]);
+  });
+
   it("search falls back to the keyword route when the table has no embedding column", async () => {
     const shape = tableShapeFrom("t", [{ name: "body", type: "large_utf8" }, { name: "n", type: "i64" }]);
     const calls: unknown[][] = [];
@@ -363,12 +392,14 @@ describe("the doors over rows", () => {
   it("find blanks the query grammar, reads the total off the rows, and marks a cut", async () => {
     const sent: string[] = [];
     const hosted = {
-      querySql: async (sql: string) => {
+      querySqlChecked: async (sql: string) => {
         sent.push(sql);
-        return [
-          { __cx_total: 7, id: "a", title: "A" },
-          { __cx_total: 7, id: "b", title: "B" },
-        ];
+        return {
+          rows: [
+            { __cx_total: 7, id: "a", title: "A" },
+            { __cx_total: 7, id: "b", title: "B" },
+          ],
+        };
       },
     };
     const result = await findRows(hosted, JOBS, 'senior -rust "engineer"', { limit: 2 });
@@ -394,14 +425,14 @@ describe("the doors over rows", () => {
     expect(findRowsSql(shape, "x", 5)).toBe(
       'SELECT COUNT(*) OVER () AS __cx_total, "id", "total", "score", "body" FROM token_match(\'t\', \'body\', \'x\', \'and\') LIMIT 5',
     );
-    const hosted = { querySql: async () => [{ __cx_total: 2, id: "a", total: 9, score: 0.5, body: "x" }] };
+    const hosted = { querySqlChecked: async () => ({ rows: [{ __cx_total: 2, id: "a", total: 9, score: 0.5, body: "x" }] }) };
     const result = await findRows(hosted, shape, "x");
     expect(result.total).toBe(2);
     expect(result.matches).toEqual([{ score: 0.5, id: "a", total: 9, body: "x" }]);
   });
 
   it("find refuses what the chunks find refuses, and reports no rows as zero", async () => {
-    const hosted = { querySql: async () => [] };
+    const hosted = { querySqlChecked: async () => ({ rows: [] }) };
     await expect(findRows(hosted, JOBS, "")).rejects.toThrow(/non-empty/);
     await expect(findRows(hosted, JOBS, "a\nb")).rejects.toThrow(/newline/);
     await expect(findRows(hosted, JOBS, "->")).rejects.toThrow(/regexp_like\(description_html/);
@@ -613,6 +644,14 @@ describe("the tool text for a table of another shape", () => {
     expect(rowsSqlDescription(shape)).toContain("has no regexp_extract");
   });
 
+  it("tells the caller to compare a row id as a string, as the loop's dialect note does", () => {
+    // A bare 32-digit id is read as a float and the statement fails on overflow.
+    const plain = rowsSqlDescription(tableShapeFrom("t", [{ name: "n", type: "i64" }, { name: "label", type: "utf8" }]));
+    for (const text of [rowsSqlDescription(JOBS), plain]) {
+      expect(text).toContain("A row id is too wide for a number: compare it as a string, _id = '32995980872922260363525666898294'");
+    }
+  });
+
   it("tells the caller to put the whole question into one statement, and to count several terms one token_match each", () => {
     const text = rowsSqlDescription(JOBS);
     expect(text).toContain(ONE_STATEMENT_SENTENCE);
@@ -628,12 +667,6 @@ describe("the tool text for a table of another shape", () => {
     // The chunks text says both.
     expect(SQL_DESCRIPTION).toContain(ONE_STATEMENT_SENTENCE);
     expect(SQL_DESCRIPTION).toContain(severalTermsSentence(TABLE, "content"));
-  });
-
-  it("tells the caller an ask is a targeted question, beside the preference for several", () => {
-    for (const text of [rowsAskDescription(JOBS, ""), rowsInstructions(JOBS, true)]) {
-      expect(text).toContain(`${PREFER_SEVERAL_ASKS} ${TARGETED_ASKS}`);
-    }
   });
 
   it("says terms alone when the table has no embedding column", () => {
@@ -660,7 +693,7 @@ describe("the tool text for a table of another shape", () => {
   });
 
   it("says table and row and names the key where the chunks text says repository and path:line", () => {
-    for (const text of [rowsInstructions(JOBS, true), rowsSearchDescription(JOBS), rowsFindDescription(JOBS)]) {
+    for (const text of [rowsInstructions(JOBS), rowsSearchDescription(JOBS), rowsFindDescription(JOBS)]) {
       expect(text).toContain("chunks_jobs");
       expect(text).toMatch(/\brow/);
       expect(text).not.toContain("path:line");
@@ -668,8 +701,7 @@ describe("the tool text for a table of another shape", () => {
     }
     expect(rowsSearchDescription(JOBS)).toContain("Cite a row as a markdown link to its apply_url");
     expect(rowsFindDescription(JOBS)).toContain("ignoreCase, defines and under describe a code index and do nothing here");
-    expect(rowsInstructions(JOBS, true)).toContain("- ask -");
-    expect(rowsInstructions(JOBS, false)).not.toContain("- ask -");
+    expect(rowsInstructions(JOBS)).not.toContain("- ask -");
   });
 
   it("holds the caller's statements and answers to the rules the platform's loop writes under", () => {
@@ -678,16 +710,50 @@ describe("the tool text for a table of another shape", () => {
     const withVector = rowsSqlDescription(JOBS);
     expect(withVector).toContain(KEEP_CONDITIONS_SENTENCE);
     expect(withVector).toContain(RELATED_TO_SENTENCE);
-    // Related-to ranks by meaning, so it is said only where there is a vector.
+    expect(withVector).toContain(LANGUAGE_KIND_SENTENCE);
+    // Related-to and a kind of language rank by meaning, so they are said
+    // only where there is a vector.
     const termsOnly = rowsSqlDescription(tableShapeFrom("t", [{ name: "body", type: "large_utf8" }, { name: "n", type: "i64" }]));
     expect(termsOnly).toContain(KEEP_CONDITIONS_SENTENCE);
     expect(termsOnly).not.toContain(RELATED_TO_SENTENCE);
+    expect(termsOnly).not.toContain(LANGUAGE_KIND_SENTENCE);
     // The code table's text says both too.
     expect(SQL_DESCRIPTION).toContain(KEEP_CONDITIONS_SENTENCE);
     expect(SQL_DESCRIPTION).toContain(RELATED_TO_SENTENCE);
+    // The one rule for hybrid against keyword, in the sql text and the
+    // instructions wherever a vector can rank, and nowhere a table has none
+    // to rank by: keyword matching only to count or list every exact
+    // occurrence. The platform loop's text carries the same words.
+    expect(withVector).toContain(SEARCH_RULE_SENTENCE);
+    expect(SQL_DESCRIPTION).toContain(SEARCH_RULE_SENTENCE);
+    expect(rowsInstructions(JOBS)).toContain(SEARCH_RULE_SENTENCE.trimEnd());
+    expect(rowsInstructions(JOBS)).toContain(SEARCH_RULE_SENTENCE.trimEnd());
+    expect(termsOnly).not.toContain("Finding rows is a hybrid_search");
+    const termsOnlyShape = tableShapeFrom("t", [{ name: "body", type: "large_utf8" }, { name: "n", type: "i64" }]);
+    expect(rowsInstructions(termsOnlyShape)).not.toContain("Finding rows is a hybrid_search");
+    // Hybrid is named before any keyword function in the rule itself.
+    expect(SEARCH_RULE_SENTENCE.indexOf("hybrid_search")).toBeLessThan(SEARCH_RULE_SENTENCE.indexOf("token_match"));
     // A count question's answer states the counts.
-    expect(rowsInstructions(JOBS, true)).toContain(COUNTS_IN_THE_ANSWER);
-    expect(rowsInstructions(JOBS, false)).toContain(COUNTS_IN_THE_ANSWER);
+    expect(rowsInstructions(JOBS)).toContain(COUNTS_IN_THE_ANSWER);
+    expect(rowsInstructions(JOBS)).toContain(COUNTS_IN_THE_ANSWER);
+    // How a figure is read out of documents, with or without the platform's tools.
+    expect(rowsInstructions(JOBS)).toContain(READING_HABITS);
+    expect(rowsInstructions(JOBS)).toContain(READING_HABITS);
+    // The latest printing wins only when it is a revision: a misprint its own
+    // totals contradict, a reclassification or another period leaves the
+    // earlier printing standing.
+    expect(READING_HABITS).toContain("latest document that revises it");
+    expect(READING_HABITS).toContain("is not a revision, and the earlier printing stands");
+    // Parts under a named heading are summed, lines by period are chosen; a
+    // named series and a named grain are kept; a value keeps its printed sign.
+    expect(READING_HABITS).toContain("sub-columns printed under its heading");
+    expect(READING_HABITS).toContain("the period the question names picks one");
+    expect(READING_HABITS).toContain("never another standing in for it");
+    expect(READING_HABITS).toContain("never merged into a coarser group");
+    expect(READING_HABITS).toContain("a value keeps the sign it is printed with");
+    // Arithmetic goes through a statement, in the instructions and the sql text.
+    expect(rowsInstructions(JOBS)).toContain(ARITHMETIC_SENTENCE);
+    expect(rowsSqlDescription(JOBS)).toContain(ARITHMETIC_SENTENCE);
   });
 });
 
@@ -737,13 +803,14 @@ const PASSAGES_CARD = {
 
 // The platform reports the vector column it embedded as `vector`, as it
 // reports a vector a caller filled; the build before the seam said
-// `embedding`. A column is a candidate for search by meaning only on the
-// platform's own word that it embedded it: the `embedding` type, or the
-// hydrate job's record naming a `vector` column - the client cannot read
-// the model the column was embedded with, so it takes the inner loop's
-// conservative rule and offers no other vector column. Whether the platform
-// embeds queries for the candidate with that model is the platform's to say
-// (the check below).
+// `embedding`. A column is a candidate for search by meaning on the
+// platform's word that it embedded it - the `embedding` type, or the hydrate
+// job's record naming a `vector` column - and, with no such record, when it
+// is the table's one vector column or the one its card names (a table copied
+// from a hydrated one carries its vectors and no record); of several that
+// nothing names, none. The client cannot read the model a column was
+// embedded with, so whether the platform embeds queries for the candidate
+// is the platform's to say (the check below).
 describe("a vector column the platform embedded", () => {
   const notes = (fields: SchemaField[], card?: object | null, load?: object | null) => {
     const heard: string[] = [];
@@ -795,20 +862,36 @@ describe("a vector column the platform embedded", () => {
     }
   });
 
-  it("offers no other vector column, and says why", () => {
-    // No record: nothing the client reads says the platform embedded it.
+  it("with no record naming one, offers the table's one vector column, or the one its card names, and of several unnamed none - and says why", () => {
+    // No record: a table copied from a hydrated one carries its vectors and
+    // no record. The one vector column is
+    // the candidate, with no source to name; the platform's check decides.
     let { shape, heard } = notes(PASSAGES_SCHEMA, PASSAGES_CARD, null);
-    expect(shape.vectorColumn).toBeNull();
+    expect(shape.vectorColumn).toBe("emb");
     expect(shape.vectorSource).toEqual([]);
-    expect(heard).toEqual(["vector column emb is not searched by meaning: no record of the load that made the table says the platform embedded it"]);
+    expect(heard).toEqual([]);
+    ({ shape, heard } = notes(PASSAGES_SCHEMA, null, null));
+    expect(shape.vectorColumn).toBe("emb");
+    expect(heard).toEqual([]);
     // Of two vector columns, the one the record says the load embedded, and
     // not the other.
     ({ shape, heard } = notes([...PASSAGES_SCHEMA, { name: "own", type: "vector", dim: 16 }], null, { schema: { embed: { column: "own", source: ["sections"] } } }));
     expect(shape.vectorColumn).toBe("own");
-    // A load that embedded nothing.
-    ({ shape, heard } = notes(PASSAGES_SCHEMA, null, { request: { no_embed: true }, schema: {} }));
+    // Of two that no record names: the one the card gives the vector role;
+    // with no card either, neither, and why.
+    ({ shape, heard } = notes([...PASSAGES_SCHEMA, { name: "own", type: "vector", dim: 16 }], PASSAGES_CARD, null));
+    expect(shape.vectorColumn).toBe("emb");
+    ({ shape, heard } = notes([...PASSAGES_SCHEMA, { name: "own", type: "vector", dim: 16 }], null, null));
     expect(shape.vectorColumn).toBeNull();
-    expect(heard).toHaveLength(1);
+    expect(heard).toEqual([
+      "vector column emb, own is not searched by meaning: no record of the load that made the table says the platform embedded it, and nothing names one of them",
+    ]);
+    // A load that embedded nothing: the one vector column is still the
+    // candidate - whoever filled it, the check says whether the platform
+    // embeds queries for it.
+    ({ shape, heard } = notes(PASSAGES_SCHEMA, null, { request: { no_embed: true }, schema: {} }));
+    expect(shape.vectorColumn).toBe("emb");
+    expect(heard).toEqual([]);
     // A width the schema does not give.
     ({ shape, heard } = notes([...PASSAGES_COLUMNS, { name: "emb", type: "vector" }], null, PASSAGES_LOAD));
     expect(shape.vectorColumn).toBeNull();
@@ -847,7 +930,7 @@ describe("a vector column the platform embedded", () => {
     // nothing else.
     expect(sql).toBe(rowsSqlDescription(before).replace("emb embedding", `emb vector<${PASSAGES_DIM}>`));
     expect(rowsSearchDescription(live)).toBe(rowsSearchDescription(before));
-    expect(rowsInstructions(live, true)).toBe(rowsInstructions(before, true));
+    expect(rowsInstructions(live)).toBe(rowsInstructions(before));
   });
 });
 
@@ -857,7 +940,7 @@ describe("a vector column the platform embedded", () => {
 // own - and nothing the client reads names the model. So the platform is
 // asked, the one place the model can be read: a search by meaning for one
 // row, which it runs only for an embedding column of the model it embeds
-// queries with (ask/src/worker/query_text.rs). A column it did not embed a
+// queries with (the platform's query embedder). A column it did not embed a
 // query for is not searched by meaning, whatever stopped it.
 describe("the platform's check of a vector column's model", () => {
   /** The platform's words for a column filled under another model. */
@@ -866,14 +949,22 @@ describe("the platform's check of a vector column's model", () => {
   /** What the platform answers a check it ran: the nearest row. */
   const NEAREST = [{ _id: 1, score: 0.26 }];
   const TABLE = "chunks_wikipedia_v5";
+  /** An articles table's card naming `sections`, the passages the platform
+   * embeds, as the table's prose: the column the doors search. */
+  const SECTIONS_CARD = { ...PASSAGES_CARD, text_column: "sections" };
 
   /** The Wikipedia table on a platform whose check answers as `check` does,
    * every check it was asked recorded. */
-  const platform = (check: () => Promise<RowRecord[]>, fields: SchemaField[] = PASSAGES_SCHEMA, load: object | null = PASSAGES_LOAD) => {
+  const platform = (
+    check: () => Promise<RowRecord[]>,
+    fields: SchemaField[] = PASSAGES_SCHEMA,
+    load: object | null = PASSAGES_LOAD,
+    card: object = PASSAGES_CARD,
+  ) => {
     const checks: unknown[][] = [];
     const hosted = {
       schema: async () => fields as unknown as RowRecord,
-      tableCard: async () => ({ card: PASSAGES_CARD }) as RowRecord,
+      tableCard: async () => ({ card }) as RowRecord,
       hydrateJob: async () => {
         if (load === null) throw new HostedError("hydrate", 404, `no hydrate job for ${TABLE}`);
         return load as RowRecord;
@@ -895,8 +986,8 @@ describe("the platform's check of a vector column's model", () => {
   };
 
   it("searches by meaning a column the platform embedded a query for, asked once for one row", async () => {
-    const { hosted, checks } = platform(async () => NEAREST);
-    const { shape, heard } = await resolve(hosted, { textColumn: "sections" });
+    const { hosted, checks } = platform(async () => NEAREST, PASSAGES_SCHEMA, PASSAGES_LOAD, SECTIONS_CARD);
+    const { shape, heard } = await resolve(hosted);
     expect(shape.vectorColumn).toBe("emb");
     expect(shape.vectorSource).toEqual(["name", "sections"]);
     expect(shape.primaryText).toBe("sections");
@@ -908,17 +999,28 @@ describe("the platform's check of a vector column's model", () => {
     expect(rowsSqlDescription(shape)).toContain(`hybrid_search('${TABLE}','sections','terms','emb', {{q:"..."}}, k)`);
   });
 
+  // The other tables of a database are described with no check: each check
+  // is a search by meaning that loads the table's vector index, and one per
+  // table of a database of dozens of tables at startup stalls the worker.
+  it("asks the platform nothing when told not to check, and offers the column the load and card describe", async () => {
+    const { hosted, checks } = platform(refused(400, MISMATCH), PASSAGES_SCHEMA, PASSAGES_LOAD, SECTIONS_CARD);
+    const { shape, heard } = await resolve(hosted, { checkVector: false });
+    expect(checks).toHaveLength(0);
+    expect(shape.vectorColumn).toBe("emb");
+    expect(heard).toEqual([]);
+  });
+
   it("offers no column the platform refuses to embed a query for - filled under another model - and says so in its words", async () => {
     for (const fields of [PASSAGES_SCHEMA, PASSAGES_EMBEDDING_SCHEMA]) {
-      const { hosted, checks } = platform(refused(400, MISMATCH), fields);
-      const { shape, heard } = await resolve(hosted, { textColumn: "sections" });
+      const { hosted, checks } = platform(refused(400, MISMATCH), fields, PASSAGES_LOAD, SECTIONS_CARD);
+      const { shape, heard } = await resolve(hosted);
       expect(checks).toHaveLength(1);
       expect(shape.vectorColumn).toBeNull();
       expect(shape.vectorSource).toEqual([]);
       expect(heard).toEqual([
         `vector column emb is not searched by meaning: the platform did not embed a query for it (vector_search: server returned 400: ${MISMATCH})`,
       ]);
-      // Nothing else of the shape moves: the named text column, the rows.
+      // Nothing else of the shape moves: the card's text column, the rows.
       expect(shape.primaryText).toBe("sections");
       expect(shape.projection).not.toContain("emb");
       const sql = rowsSqlDescription(shape);
@@ -975,12 +1077,14 @@ describe("the platform's check of a vector column's model", () => {
     const { shape } = await resolve(hosted, { checkWith });
     expect(shape.vectorColumn).toBe("emb");
     expect(viaCheck).toHaveLength(1);
-    // No record of the load: no candidate, so no check, and the reason is the record's.
+    // No record of the load: the card names the one vector column, so it is
+    // the candidate all the same, checked once, with no source to name.
     const unrecorded = platform(async () => NEAREST, PASSAGES_SCHEMA, null);
     const { shape: bare, heard } = await resolve(unrecorded.hosted);
-    expect(unrecorded.checks).toEqual([]);
-    expect(bare.vectorColumn).toBeNull();
-    expect(heard).toEqual(["vector column emb is not searched by meaning: no record of the load that made the table says the platform embedded it"]);
+    expect(unrecorded.checks).toHaveLength(1);
+    expect(bare.vectorColumn).toBe("emb");
+    expect(bare.vectorSource).toEqual([]);
+    expect(heard).toEqual([]);
     // A table with no vector column at all: nothing asked, nothing said.
     const berka = platform(async () => NEAREST, BERKA_TRANS_SCHEMA, { state: "succeeded", request: {} });
     const { shape: trans, heard: quiet } = await resolve(berka.hosted);
@@ -1039,63 +1143,28 @@ describe("HostedDb.vectorSearchText", () => {
   });
 });
 
-// The text column the doors search is the deployment's to name
-// (CX_TEXT_COLUMN) on a table with several full-text columns. Picked by
-// name, the Wikipedia table's was `abstract`, filled on an article's first
-// passage alone, while the platform embeds `name` and `sections`: a hybrid
-// search paired keywords on abstracts with meaning on passages.
-describe("the text column named for search", () => {
-  const shapeWith = (textColumn: string | undefined) => {
-    const heard: string[] = [];
-    const shape = tableShapeFrom("chunks_wikipedia_v5", PASSAGES_SCHEMA, PASSAGES_CARD, PASSAGES_LOAD, { textColumn, onNote: (line) => heard.push(line) });
-    return { shape, heard };
-  };
+// The text column the doors search on a table with several full-text
+// columns is the one the table's card names as its prose (`text_column`).
+// Picked by name, an articles table's was `abstract`, filled on an
+// article's first passage alone, while the platform embeds `name` and
+// `sections`: a hybrid search paired keywords on abstracts with meaning on
+// passages.
+describe("the text column the card names for search", () => {
+  const shapeWith = (textColumn: string | undefined) =>
+    tableShapeFrom("chunks_wikipedia_v5", PASSAGES_SCHEMA, { ...PASSAGES_CARD, text_column: textColumn }, PASSAGES_LOAD);
 
-  it("is read from CX_TEXT_COLUMN, trimmed, and absent when unset or blank", () => {
-    const saved = process.env.CX_TEXT_COLUMN;
-    try {
-      process.env.CX_TEXT_COLUMN = " sections ";
-      expect(configuredTextColumn()).toBe("sections");
-      process.env.CX_TEXT_COLUMN = "  ";
-      expect(configuredTextColumn()).toBeUndefined();
-      delete process.env.CX_TEXT_COLUMN;
-      expect(configuredTextColumn()).toBeUndefined();
-    } finally {
-      if (saved === undefined) delete process.env.CX_TEXT_COLUMN;
-      else process.env.CX_TEXT_COLUMN = saved;
-    }
-  });
-
-  it("is the column the doors search when it is full-text indexed, ahead of the pick by name", () => {
-    // Unnamed, the pick by name stands, and nothing is said.
-    expect(shapeWith(undefined)).toEqual({ shape: expect.objectContaining({ primaryText: "abstract" }), heard: [] });
-    const { shape, heard } = shapeWith("sections");
+  it("is the card's full-text column ahead of the pick by name, and the pick by name where the card names none it can search", () => {
+    expect(shapeWith(undefined).primaryText).toBe("abstract");
+    expect(shapeWith("url").primaryText).toBe("abstract");
+    const shape = shapeWith("sections");
     expect(shape.primaryText).toBe("sections");
-    expect(heard).toEqual([]);
     // The rest of the shape does not move: the same text columns, the same vector.
-    expect(shape.textColumns).toEqual(shapeWith(undefined).shape.textColumns);
+    expect(shape.textColumns).toEqual(shapeWith(undefined).textColumns);
     expect(shape.vectorColumn).toBe("emb");
   });
 
-  it("falls back to the pick by name, and says why, when the name is no full-text column of the table", () => {
-    let { shape, heard } = shapeWith("url");
-    expect(shape.primaryText).toBe("abstract");
-    expect(heard).toEqual([
-      "the text column named for search (CX_TEXT_COLUMN=url) is not full-text indexed - full-text indexed: name, abstract, sections, references; searching abstract instead",
-    ]);
-    ({ shape, heard } = shapeWith("body"));
-    expect(shape.primaryText).toBe("abstract");
-    expect(heard).toEqual([
-      "the text column named for search (CX_TEXT_COLUMN=body) is no column of the table - full-text indexed: name, abstract, sections, references; searching abstract instead",
-    ]);
-    // A table with no full-text column searches nothing, named or not.
-    const none = tableShapeFrom("berka_trans", BERKA_TRANS_SCHEMA, null, null, { textColumn: "type", onNote: (line) => heard.push(line) });
-    expect(none.primaryText).toBe("");
-    expect(heard.at(-1)).toBe("the text column named for search (CX_TEXT_COLUMN=type) is not full-text indexed - full-text indexed: none; searching no column instead");
-  });
-
   it("pairs the keyword half of search and of the sql text's hybrid with the meaning half's own text", async () => {
-    const { shape } = shapeWith("sections");
+    const shape = shapeWith("sections");
     const calls: unknown[][] = [];
     const hosted = {
       hybridSearch: async (...args: unknown[]) => {
@@ -1142,10 +1211,10 @@ describe("a table cut into passages", () => {
     expect(sql).toContain("passages of up to 512 tokens, one row each, numbered by chunk from 0");
     expect(sql).toContain("SUM(LENGTH(sections))");
     expect(sql).toContain("a record is counted once with chunk = 0");
-    expect(rowsInstructions(shape, true)).toContain("an index of the chunks_wikipedia_v5 table, one row per passage of a record's sections.");
+    expect(rowsInstructions(shape)).toContain("an index of the chunks_wikipedia_v5 table, one row per passage of a record's sections.");
     // one row per record where nothing was cut
     expect(rowsSqlDescription(tableShapeFrom("t", PASSAGES_SCHEMA))).not.toContain("one passage of a record");
-    expect(rowsInstructions(tableShapeFrom("t", PASSAGES_SCHEMA), true)).toContain("one row per record.");
+    expect(rowsInstructions(tableShapeFrom("t", PASSAGES_SCHEMA))).toContain("one row per record.");
   });
 });
 
@@ -1180,7 +1249,7 @@ describe("a row's citation", () => {
       "Cite a row as a markdown link to its url, with its name as the text - [<name>](<url>) - never by an id such as its _id. " +
       "A row that came without its url is named by its name, never given a link it did not carry.";
     expect(rowCitation(passages)).toBe(cite);
-    for (const text of [rowsInstructions(passages, true), rowsSearchDescription(passages), rowsAskDescription(passages, "")]) {
+    for (const text of [rowsInstructions(passages), rowsSearchDescription(passages)]) {
       expect(text).toContain(cite);
       expect(text).not.toMatch(/cite (a row|them) by/i);
     }
@@ -1210,16 +1279,6 @@ describe("a row's citation", () => {
     const tickets = tableShapeFrom("tickets", [{ name: "ticket_id", type: "utf8" }, { name: "name", type: "utf8" }, { name: "body", type: "large_utf8" }]);
     expect(rowsProjection(tickets)).toEqual(["ticket_id"]);
     expect(rowsProjection(tableShapeFrom("t", [{ name: "body", type: "large_utf8" }]))).toEqual([]);
-    // The ask text says what a fact carries - the projected columns and the
-    // matched text, never "its scalar and list columns" - and looks a row up
-    // by the first of them, the one every such fact holds.
-    const ask = rowsAskDescription(passages, "");
-    expect(ask).toContain("each with the columns its statement selected, a search's or a find's with the row's url, name and the text it matched");
-    expect(ask).toContain("for a row you already know, sql by its url.");
-    expect(ask).not.toContain("scalar and list columns");
-    expect(rowsAskDescription(JOBS, "")).toContain("with the row's id, apply_url, title and the text it matched");
-    expect(rowsAskDescription(JOBS, "")).toContain("sql by its id.");
-    expect(rowsAskDescription(tableShapeFrom("t", [{ name: "body", type: "large_utf8" }]), "")).toContain("with the row's _id and the text it matched");
   });
 
   it("cites no row by an id on a table with no link column", () => {
@@ -1229,7 +1288,7 @@ describe("a row's citation", () => {
     ]);
     const cite = "Cite no row by an id: its ticket_id or _id looks a row up and never goes in the answer as a reference - answer with the rows' own values.";
     expect(rowCitation(tickets)).toBe(cite);
-    expect(rowsInstructions(tickets, true)).toContain(cite);
+    expect(rowsInstructions(tickets)).toContain(cite);
     expect(rowsSqlDescription(tickets)).toContain("select ticket_id beside it so the row can be looked up");
     expect(rowsSqlDescription(tickets)).not.toContain("so a row can be cited");
   });
@@ -1261,7 +1320,7 @@ const BERKA_ACCOUNT_SCHEMA: SchemaField[] = [
 const FULL_TEXT_FUNCTIONS = ["hybrid_search", "bm25_search", "token_match", "exact_match"];
 
 // A table with no full-text column offers no search and no find, and no text
-// names a function it cannot run; sql and ask stay, and say so.
+// names a function it cannot run; sql stays, and says so.
 describe("a table with no full-text column", () => {
   const trans = tableShapeFrom("berka_trans", BERKA_TRANS_SCHEMA);
   // The optimizer's card for such a table names every column scalar.
@@ -1280,12 +1339,12 @@ describe("a table with no full-text column", () => {
     }
   });
 
-  it("routes to sql and ask alone, and says why there is no find or search", () => {
-    const text = rowsInstructions(trans, true);
+  it("routes to sql alone, and says why there is no find or search", () => {
+    const text = rowsInstructions(trans);
     expect(text).not.toContain("- find -");
     expect(text).not.toContain("- search -");
     expect(text).toContain("- sql - one statement you already know");
-    expect(text).toContain("- ask -");
+    expect(text).not.toContain("- ask -");
     expect(text).toContain(
       "No column of berka_trans is full-text indexed, so there is no find or search over it and no search function in a statement: filter, group and join its columns.",
     );
@@ -1308,16 +1367,6 @@ describe("a table with no full-text column", () => {
     }
   });
 
-  it("asks without a find to hand off to or text to cut", () => {
-    const text = rowsAskDescription(trans, "");
-    expect(text).toContain("chooses and runs the statements itself");
-    // A fact is what the loop's statement selected, not the whole row.
-    expect(text).toContain("returns the rows it found, never hits - each with the columns its statement selected - plus aggregate rows");
-    expect(text).toContain("For a row you already know, sql by its trans_id.");
-    expect(text).not.toContain("use find");
-    expect(text).not.toContain("snippet");
-  });
-
   it("names vector_search alone where the platform embeds a column but indexes none", () => {
     const vectorOnly = tableShapeFrom(
       "t",
@@ -1332,7 +1381,7 @@ describe("a table with no full-text column", () => {
     const sql = rowsSqlDescription(vectorOnly);
     expect(sql).toContain(`only vector_search('t','emb', {{q:"..."}}, k) applies, ranking rows by meaning alone`);
     for (const name of FULL_TEXT_FUNCTIONS) expect(sql, name).not.toContain(name);
-    expect(rowsInstructions(vectorOnly, true)).toContain(`vector_search('t','emb', {{q:"..."}}, k) ranks its rows by meaning alone`);
+    expect(rowsInstructions(vectorOnly)).toContain(`vector_search('t','emb', {{q:"..."}}, k) ranks its rows by meaning alone`);
   });
 
   it("writes the JOIN across such tables over the tables themselves, with no search inside it", () => {
@@ -1342,7 +1391,7 @@ describe("a table with no full-text column", () => {
     expect(siblingsSearchable(trans, [account, JOBS], [])).toBe(true);
     expect(siblingsSearchable(trans, [account], ["berka_loan"])).toBe(true);
     expect(siblingsSearchable(null, [account], [])).toBe(true);
-    const note = siblingsNote("berka_trans", [account], [], "", false);
+    const note = siblingsNote("berka_trans", [account], [], false);
     expect(note).toContain(JOIN_KEYS_RULE);
     expect(note).toContain("berka_account(account_id i64, district_id i64, frequency utf8, date i64)");
     expect(note).toContain(
@@ -1352,23 +1401,208 @@ describe("a table with no full-text column", () => {
     expect(note).not.toContain("hybrid_search");
     expect(note).not.toContain("search functions");
     // Where a table can be searched, the shape is the one it always was.
-    expect(siblingsNote("chunks", [JOBS], [], "")).toContain(
+    expect(siblingsNote("chunks", [JOBS], [])).toContain(
       "and the search functions take any of them as their first argument and their rows join like a table's: write the JOIN - " +
         "FROM hybrid_search('chunks_jobs', '<text column>', '<terms>', 'embedding', {{q}}, 50) AS chunks_jobs JOIN chunks ON",
     );
     // Where the keys come from, said both ways: the lean text says no key
     // is written in it; the text carrying the semantic layer (the server's
     // default since 2026-10-01) says only to call join_keys first.
-    expect(siblingsNote("chunks", [JOBS], [], "")).toContain("The keys are not written here: call join_keys with the tables first and paste its predicate into ON.");
-    const withMeanings = siblingsNote("chunks", [JOBS], [], "", true, true);
+    expect(siblingsNote("chunks", [JOBS], [])).toContain("The keys are not written here: call join_keys with the tables first and paste its predicate into ON.");
+    const withMeanings = siblingsNote("chunks", [JOBS], [], true, true);
     expect(withMeanings).toContain("Call join_keys with the tables first and paste its predicate into ON.");
     expect(withMeanings).not.toContain("The keys are not written here");
-    const routing = siblingsInstruction("berka_trans", ["berka_account"], false, false);
+    const routing = siblingsInstruction("berka_trans", ["berka_account"], false);
     expect(routing).toContain("is one JOIN, not one query per table");
     expect(routing).not.toContain("search functions");
-    expect(siblingsInstruction("chunks", ["swe_issues"], false)).toContain("is one JOIN, with the search functions inside it, not one query per table");
-    // The ask routing counts no tables: there are eight here, three elsewhere.
-    expect(siblingsInstruction("berka_trans", ["berka_account", "berka_loan"], true, false)).toContain("the loop sees every one of them");
+    expect(siblingsInstruction("chunks", ["swe_issues"])).toContain("is one JOIN, with the search functions inside it, not one query per table");
+    // The graph's routing form rides beside the join rule in both shapes
+    // of the instructions, and the sql text carries the rule for when.
+    expect(routing).toContain("is graph_walk in sql, not a chain of joins");
+    expect(siblingsInstruction("berka_trans", ["berka_account", "berka_loan"], false)).toContain("is graph_rank");
+    expect(siblingsNote("chunks", [JOBS], [])).toContain("USE graph_walk, NOT A JOIN, WHEN THE QUESTION STARTS FROM PARTICULAR ROWS");
+    // The graph's own addition to a result is named, so the model reads it.
+    expect(siblingsNote("chunks", [JOBS], [])).toContain("also carries `connected`");
+  });
+});
+
+describe("a wide table's card, laid out within the loop's budget", () => {
+  /** A table of events: a few plain columns, a family of hundreds of
+   * `property_<n>` columns, and a list column of tools with no value in any
+   * row - the shape that put 2.4 million characters into the sql text. */
+  const EVENT_COLUMNS = 400;
+  const EVENTS_SCHEMA: SchemaField[] = [
+    { name: "visitorid", type: "utf8" },
+    { name: "eventtype", type: "utf8" },
+    { name: "title", type: "large_utf8" },
+    { name: "title_visitor_permission_summary", type: "large_utf8" },
+    { item: "utf8", name: "toolsused", type: "list" },
+    ...Array.from({ length: EVENT_COLUMNS }, (_, i) => ({ name: `property_${i}`, type: "utf8" })),
+    { name: "emb", type: "embedding", source: ["title"] },
+  ];
+  /** The card as the platform lays it out within a budget of four whole
+   * columns and one family: the plain columns whole, the family and the
+   * empty column as entries, and the table's prose column named. */
+  const EVENTS_CARD = {
+    table: "events",
+    rows: 100,
+    text_column: "title",
+    schema: [
+      { name: "visitorid", type: "Utf8", index: "scalar", count: 100 },
+      { name: "eventtype", type: "Utf8", index: "scalar", count: 100 },
+      { name: "title_visitor_permission_summary", type: "LargeUtf8", index: "fts", count: 90 },
+      { name: "title", type: "LargeUtf8", index: "fts", count: 10 },
+      { name: "property_*", type: "Utf8", index: "scalar", description: `${EVENT_COLUMNS} columns named property_<n>; describe_columns("events", "property_*") lists them` },
+      { name: "(empty columns)", type: "List(Utf8)", index: "scalar", count: 0, description: "1 columns with no value in any row: toolsused" },
+    ],
+  };
+  const events = tableShapeFrom("events", EVENTS_SCHEMA, EVENTS_CARD);
+
+  it("shares the whole columns among the tables as the loop does, floors included", () => {
+    // Two wide tables: an even share. A narrow table beside a wide one
+    // takes what it has and leaves the rest. Floors past the budget grow
+    // the text by a floor a table.
+    expect(wholeAllowances([4865, 4692], 200, 20)).toEqual([100, 100]);
+    expect(wholeAllowances([3, 4865], 200, 20)).toEqual([3, 197]);
+    expect(wholeAllowances(Array(12).fill(5000), 200, 20)).toEqual(Array(12).fill(20));
+    expect(familiesAllowance(5, 20, 4)).toBe(4);
+    expect(familiesAllowance(1, 20, 4)).toBe(20);
+    expect(familiesAllowance(12, 20, 4)).toBe(4);
+  });
+
+  it("reads every table's schema first and asks each card for its share", async () => {
+    const asked: string[] = [];
+    const hosted = {
+      schema: async (table: string) => {
+        asked.push(table);
+        if (table === "unreadable") throw new Error("no such table");
+        return table === "wide" ? EVENTS_SCHEMA : EVENTS_SCHEMA.slice(0, 3);
+      },
+    };
+    const { layouts, failures } = await cardLayouts(hosted, ["wide", "narrow", "unreadable"]);
+    expect(asked).toEqual(["wide", "narrow", "unreadable"]);
+    expect(layouts.get("narrow")).toMatchObject({ whole: 3, families: 10 });
+    expect(layouts.get("wide")).toMatchObject({ whole: 197, families: 10 });
+    expect(layouts.get("wide")?.fields).toBe(EVENTS_SCHEMA);
+    expect(layouts.has("unreadable")).toBe(false);
+    // The one read's error, for the caller to report; the schema is not
+    // asked for a second time.
+    expect(failures.get("unreadable")?.message).toBe("no such table");
+  });
+
+  it("lists a laid-out card's entries in the sql text, never every column of the table", () => {
+    const list = columnList(events);
+    expect(list).toContain("visitorid utf8");
+    expect(list).toContain(`property_*: ${EVENT_COLUMNS} columns named property_<n>`);
+    expect(list).toContain("(empty columns): 1 columns with no value in any row: toolsused");
+    expect(list).not.toContain("property_7 ");
+    expect(list.length).toBeLessThan(600);
+    // The search text names the scalar columns the card names whole, and
+    // the sql text opens on the same list; the empty list column, in the
+    // card's empty entry, is not named as a list to unnest.
+    expect(rowsSearchDescription(events)).toContain("the scalar columns (visitorid, eventtype)");
+    expect(rowsSqlDescription(events)).toContain(`over events(${list})`);
+    expect(rowsSqlDescription(events)).not.toContain("A list column (toolsused)");
+    expect(rowsSqlDescription(JOBS)).toContain("A list column (locations)");
+    // A card listing every column changes nothing: the schema is the list.
+    expect(columnList(JOBS)).toContain("locations list<utf8>");
+  });
+
+  it("searches the column the card names as the table's prose, over one named like text", () => {
+    // The pick by name would take the column named like a summary; the
+    // card names `title` as the table's prose, and that is the one searched.
+    expect(events.textColumns).toEqual(["title", "title_visitor_permission_summary"]);
+    expect(events.primaryText).toBe("title");
+    expect(tableShapeFrom("events", EVENTS_SCHEMA, { ...EVENTS_CARD, text_column: undefined }).primaryText).toBe("title_visitor_permission_summary");
+    expect(events.vectorColumn).toBe("emb");
+  });
+
+  it("names the first text columns and counts the rest", () => {
+    const many: SchemaField[] = [
+      { name: "id", type: "utf8" },
+      ...Array.from({ length: TEXT_COLUMNS_LISTED + 5 }, (_, i) => ({ name: `note_${i}`, type: "large_utf8" })),
+    ];
+    const shape = tableShapeFrom("notes", many);
+    const phrase = rowsSqlDescription(shape);
+    expect(phrase).toContain(`and 5 more (describe_columns("notes", "*") lists them)`);
+    expect(rowsSqlDescription(JOBS)).toContain("Full-text indexed: title, description_html");
+  });
+
+  it("tells the model over several tables what the loop is told, in the loop's words", () => {
+    const text = instructionsFor(rowsSurface(events, ["events_track"], { describeColumns: true }), ["events_track"]);
+    expect(text).toContain("code-context is an index of the tables events, events_track, one database, one row per record in each.");
+    expect(text).toContain(SEVERAL_TABLES_SENTENCE.trim());
+    expect(text).toContain("- describe_columns -");
+    expect(rowsInstructions(events)).toContain("code-context is an index of the events table, one row per record.");
+    expect(rowsInstructions(events)).not.toContain(SEVERAL_TABLES_SENTENCE.trim());
+    expect(rowsInstructions(events)).not.toContain("- describe_columns -");
+    expect(siblingsNote("events", [JOBS], [])).toContain(SEVERAL_TABLES_SENTENCE.trim());
+    expect(siblingsInstruction("events", ["events_track"], true)).toContain("A question about one of these tables alone is answered over that table alone");
+  });
+});
+
+// The tables a statement may join with the primary are the database's own,
+// as the platform lists them: never a list a deployment typed.
+describe("the database's other tables", () => {
+  it("are every table the platform lists but the given one, and none, with the reason said, when it cannot list them", async () => {
+    const listed = { listTables: async () => ["berka_account", "berka_trans", "berka_loan", "berka_district"] };
+    const heard: string[] = [];
+    expect(await databaseTables(listed, "berka_trans", (line) => heard.push(line))).toEqual(["berka_account", "berka_loan", "berka_district"]);
+    expect(heard).toEqual([]);
+    const refusing = {
+      listTables: async (): Promise<string[]> => {
+        throw new HostedError("list_tables", 503, "the database is starting");
+      },
+    };
+    expect(await databaseTables(refusing, "berka_trans", (line) => heard.push(line))).toEqual([]);
+    expect(heard).toEqual(["the database's tables could not be listed, so berka_trans is described alone: list_tables: server returned 503: the database is starting"]);
+  });
+});
+
+describe("the one instructions builder over every shape of index", () => {
+  const code = codeInstructions("chunks", ["swe_issues"], { describeColumns: true });
+  const rows = rowsInstructions(JOBS, ["chunks_other"]);
+  const logs = logIndexInstructions(35, 4903);
+
+  it("lays every shape out the same way: the frame, the tool lines, the sweep, the hits, the closing", () => {
+    for (const text of [code, rows, logs]) {
+      expect(text).toContain(" Which tool for which question:\n");
+      // The sweep sentence ends its line, or carries the batch sentence on it.
+      expect(text).toMatch(new RegExp(`${SWEEP_TO_A_TOOL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}( [^\n]*)?\n`));
+      expect(text).toContain(COUNTS_IN_THE_ANSWER);
+      expect(text.endsWith(".")).toBe(true);
+    }
+    // A table the platform could not describe routes nothing: the notice alone.
+    const unresolved = unresolvedInstructions("tickets", "no platform");
+    expect(unresolved).not.toContain("Which tool for which question");
+    expect(unresolved).toContain("find, search and sql each return that error");
+  });
+
+  it("reaches every shape with what they share: the choosing sentence and describe_columns", () => {
+    // The code text with tables beside it says the question may be about any
+    // of them, in the loop's words, as the rows text does.
+    expect(code).toContain("and beside it in the same database the tables swe_issues, which one sql statement joins with it");
+    expect(code).toContain(SEVERAL_TABLES_SENTENCE.trim());
+    expect(codeInstructions("chunks", [])).not.toContain(SEVERAL_TABLES_SENTENCE.trim());
+    expect(code).toContain(DESCRIBE_COLUMNS_LINE);
+    expect(codeInstructions("chunks", [])).not.toContain("- describe_columns -");
+  });
+
+  it("keeps each shape's own sentences: find first on code and logs, the table's columns on rows", () => {
+    expect(code.indexOf("- find -")).toBeLessThan(code.indexOf("- sql -"));
+    expect(logs.indexOf("- find -")).toBeLessThan(logs.indexOf("- sql -"));
+    expect(logs).toContain("Start with find or sql - a literal, a count, a ranking across the logs. ");
+    expect(rows).toContain("- sql - one statement you already know: a count, a filter, a lookup by id, a ranking in one SELECT.");
+    expect(rows).toContain("Hits are rows: a score, the row's id, its scalar columns");
+    expect(code).toContain("Hits carry the code: when a hit answers the question, answer from it.");
+  });
+
+  it("routes to no ask and no answer tool on any shape", () => {
+    for (const text of [code, rows, logs]) {
+      expect(text).not.toContain("- ask -");
+      expect(text).not.toContain("- answer -");
+      expect(text).not.toMatch(/\bask first\b|is ask's|an ask\b/);
+    }
   });
 });
 
@@ -1417,5 +1651,33 @@ describe("HostedDb.bm25Search", () => {
       mode: "Or",
       projection: ["id", "title", "score"],
     });
+  });
+});
+
+// The wide-table text (the card preamble's map sentences, the table's name
+// before its card, the describe_columns tool and line) is for a card that
+// maps columns. A narrow table's card lists every column whole, and the text
+// about maps only confuses a model reading it, so a card with no map entry
+// is introduced as before.
+describe("cardMapsColumns", () => {
+  it("is true only for a card that lays out a column as a map entry", () => {
+    expect(cardMapsColumns({ schema: [{ name: "path" }, { name: "text" }, { name: "year" }] })).toBe(false);
+    expect(cardMapsColumns({ schema: [{ name: "id" }, { name: "property_*" }] })).toBe(true);
+    expect(cardMapsColumns({ schema: [{ name: "id" }, { name: "(other columns)" }] })).toBe(true);
+    expect(cardMapsColumns({ schema: [{ name: "id" }, { name: "(empty columns)" }] })).toBe(true);
+    expect(cardMapsColumns({})).toBe(false);
+    expect(cardMapsColumns(undefined)).toBe(false);
+  });
+});
+
+// A card naming its table's kind column has every column's rows by kind
+// behind describe_columns, which a laid-out card leaves out: the tool is
+// offered for it however narrow the card, and for no other narrow card.
+describe("cardNamesKinds", () => {
+  it("is true only for a card naming a kind column", () => {
+    expect(cardNamesKinds({ kind_column: "elementpath", schema: [{ name: "elementpath" }] })).toBe(true);
+    expect(cardNamesKinds({ schema: [{ name: "path" }, { name: "text" }] })).toBe(false);
+    expect(cardNamesKinds({ kind_column: "" })).toBe(false);
+    expect(cardNamesKinds(undefined)).toBe(false);
   });
 });

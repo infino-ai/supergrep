@@ -18,7 +18,7 @@
 // every constant and every code path the doors had, byte for byte; what is
 // here is for the other kind.
 
-import { HostedError, type HostedDb, type RowRecord } from "./hosted.js";
+import { HostedError, type HostedDb, type RowRecord, type TableCardOptions } from "./hosted.js";
 import { CONTENT_COLUMN } from "./context.js";
 import { LEAN_CARD_TIER } from "./config.js";
 
@@ -45,10 +45,25 @@ export interface SchemaField {
 }
 
 /** One column of a table card's `schema`, the part the shape reads: the
- * index role the optimizer assigned it. */
+ * index role the optimizer assigned it; and, for the tool text, its type as
+ * the card spells it, how many rows hold a value, and what an entry says -
+ * a card laid out within a budget carries entries that stand for many
+ * columns (`<head>_*`, `(other columns)`, `(empty columns)`), whose
+ * description is all the text has of them. */
 export interface CardColumn {
   name: string;
   index?: string;
+  type?: string;
+  count?: number;
+  description?: string;
+}
+
+/** Whether a card entry stands for a set of columns rather than naming one:
+ * a name family's entry (`property_*`) or one of the two catch-all entries
+ * a laid-out card ends with. Such an entry is never a column a statement
+ * names; describe_columns lists what it stands for. */
+export function isMapEntry(column: Pick<CardColumn, "name">): boolean {
+  return column.name.endsWith("_*") || column.name.startsWith("(");
 }
 
 /** How the load cut a table's rows, when the hydrate job that loaded it cut
@@ -71,6 +86,29 @@ export interface TableChunking {
  * request names none (the pipeline's `DEFAULT_CHUNK_INDEX_COLUMN`). */
 const DEFAULT_CHUNK_INDEX_COLUMN = "chunk";
 
+/** How a whole document is read back from a table of rows (the `read`
+ * tool): the column naming the document each row belongs to, the text
+ * column holding the document's text, and the column ordering its rows when
+ * the load cut it into several. A table of files loaded as passages - one
+ * row per passage of a file, every passage carrying the file's `path` -
+ * holds each file as the rows sharing that path, and a caller with no way to
+ * read one whole pages it through `sql` a few passages a statement, many
+ * calls a document. */
+export interface TableDocument {
+  /** The text column naming a row's document: the table's own `path`, or a
+   * name ending in `_path`. */
+  pathColumn: string;
+  /** The text column holding the document: the one the load cut into
+   * passages (`TableChunking.column`), else the one the doors search. */
+  textColumn: string;
+  /** The column numbering a document's passages in order: the load's own
+   * numbering column (`TableChunking.indexColumn`), else - for a table whose
+   * load left no record - the column a hydrate load numbers passages with by
+   * default, when the table has it; null for a table with neither, whose rows
+   * are read in the order the platform returns them. */
+  orderColumn: string | null;
+}
+
 /** The chunking a hydrate job's record says it loaded `fields` with, or null
  * when it cut nothing - or when the table lacks the chunked or the numbering
  * column, which is a record of some other load under the name, or a
@@ -88,13 +126,11 @@ export function chunkingFrom(record: RowRecord | null | undefined, fields: Schem
 }
 
 /** The one sentence a table cut into passages carries: what a row is, and
- * how a whole record is read from its rows. Measured 2026-09-30 on the
- * Wikipedia table: told nothing, the caller took a first passage for the
- * article, answered "which kinds of article run longest" from the first 512
- * tokens of each, and spent four of its eleven calls sampling columns to learn
- * what a row was. Both loops read it - the caller in the `sql` text, the
- * platform's retrieval loop in the context of every ask (the owner,
- * 2026-09-30: a prompt change goes to the inner loop and the outer one alike).
+ * how a whole record is read from its rows. Told nothing, a caller takes a
+ * first passage for the whole record - answering "which records run
+ * longest" from each one's first passage - and spends calls sampling columns
+ * to learn what a row is. The caller reads it in the `sql` text; the
+ * platform's retrieval loop carries the same sentence in its own context.
  * Empty for a table loaded one row per record. */
 export function chunkingNote(chunking: TableChunking | undefined): string {
   if (!chunking) return "";
@@ -171,8 +207,8 @@ export interface TableShape {
   textColumnsInferred: boolean;
   /** The text column the doors search by default - one of `textColumns`
    * whenever there is one, since a search or token match over a column with
-   * no full-text index is refused by the engine: the one the deployment
-   * named (`ShapeOptions.textColumn`) when it is among them, else one picked
+   * no full-text index is refused by the engine: the one the card names as
+   * the table's prose (`text_column`) when it is among them, else one picked
    * by its name; "" when the table has no full-text column, and then no
    * search or find is offered over it. */
   primaryText: string;
@@ -194,7 +230,7 @@ export interface TableShape {
    * them on non-code corpora"): on the Wikipedia table, keyed by the
    * engine's `_id`, the answer cited rows by 32-digit ids that meant nothing
    * to a reader. Read off the name because nothing else marks it: a card's
-   * roles are fts, scalar and vector (ask/src/card/build.rs), none a link. */
+   * roles are fts, scalar and vector (the platform's card builder), none a link. */
   linkColumn: string | null;
   /** The text column naming what a row is (`name`, `title`, or a name ending
    * in one after an underscore), the text of a row's link; null when no
@@ -217,10 +253,19 @@ export interface TableShape {
    * here for its roles and kept so the tool text can fold it in without a
    * second fetch. Absent for a table the optimizer has not swept yet. */
   card?: RowRecord;
+  /** Whether the deployment knows where the documents the table's rows were
+   * made from lie, so the platform answers a row's page (`pages` beside the
+   * card on the table_card route, from the platform's
+   * `gateway_settings.pages`). Absent for a table with no pages or no card. */
+  pages?: boolean;
   /** How the load cut the table's rows into passages, from the hydrate job
    * that loaded it (`chunkingFrom`). Absent for a table loaded one row per
    * record, or whose load left no record. */
   chunking?: TableChunking;
+  /** How a whole document is read back from the table (`TableDocument`).
+   * Absent for a table with no path column or no text column: its rows are
+   * records, read by their key with `sql`. */
+  document?: TableDocument;
 }
 
 /** The platform's type spellings for the three non-scalar column kinds. */
@@ -281,6 +326,9 @@ const LINK_WORDS = ["url", "link", "href", "uri"];
 /** The words a column naming what a row is goes by, alone or after an
  * underscore (`title`, `display_name`). */
 const TITLE_WORDS = ["name", "title"];
+/** The word a column naming the document a row belongs to goes by, alone or
+ * after an underscore (`path`, `file_path`). */
+const PATH_WORDS = ["path"];
 
 /** The first text column named by one of `words`: a name that is the word
  * itself before one that ends in `_word`, so a table with `url` and
@@ -321,7 +369,7 @@ function cardRoles(card: RowRecord | null | undefined): {
  * platform is asked whether it embeds a query for it
  * (`platformEmbedsQueriesFor`), or null. The inner loop offers a vector
  * column only where the column's embedding spec names the model the worker
- * embeds queries with (ask/src/worker/ask.rs `embeddable_vectors`); any
+ * embeds queries with (the platform's worker `embeddable_vectors`); any
  * other vector column - filled by a caller, or under another model - is not
  * offered, since a query embedded by this deployment would rank against it
  * meaninglessly.
@@ -335,8 +383,11 @@ function cardRoles(card: RowRecord | null | undefined): {
  * record of the hydrate job that loaded the table says the job embedded,
  * with a width, and with the card's `vector` role where there is a card -
  * and whether the model that filled it is the one the platform embeds
- * queries with is the platform's to say. Any other vector column is no
- * candidate, and `onNote` hears why. */
+ * queries with is the platform's to say. With no such record, the table's
+ * one vector column, or the one its card names, is the candidate and that
+ * same check decides (a table copied from a hydrated one carries its
+ * vectors and no record). Any other vector column is no candidate, and
+ * `onNote` hears why. */
 export function vectorCandidate(
   fields: SchemaField[],
   card: RowRecord | null | undefined,
@@ -349,19 +400,31 @@ export function vectorCandidate(
   const vectors = fields.filter(isVectorField);
   if (vectors.length === 0) return null;
   const embedded = loadEmbeddingFrom(load, fields);
-  const field = embedded ? vectors.find((f) => f.name === embedded.column) : undefined;
+  let field = embedded ? vectors.find((f) => f.name === embedded.column) : undefined;
   const refuse = (name: string, why: string): null => {
     onNote(`vector column ${name} is not searched by meaning: ${why}`);
     return null;
   };
   if (!embedded || !field) {
-    return refuse(vectors.map((f) => f.name).join(", "), "no record of the load that made the table says the platform embedded it");
+    // No record of a load that embedded a column: a table made by a copy or
+    // a statement rather than a hydrate job - one copied from a hydrated
+    // table, vectors and all - and without this such a table is searched by
+    // keyword alone. The platform's check of the
+    // column (`platformEmbedsQueriesFor`) is what says whether it embeds
+    // queries for it, so the column is a candidate all the same when the
+    // table has one vector column, or its card names one; of several that
+    // nothing names, none is guessed at.
+    const named = hasCard ? vectors.find((f) => roles.get(f.name) === ROLE_VECTOR) : undefined;
+    field = named ?? (vectors.length === 1 ? vectors[0] : undefined);
+    if (!field) {
+      return refuse(vectors.map((f) => f.name).join(", "), "no record of the load that made the table says the platform embedded it, and nothing names one of them");
+    }
   }
   if (!(typeof field.dim === "number" && field.dim > 0)) return refuse(field.name, "the schema gives it no width");
   if (hasCard && roles.get(field.name) !== ROLE_VECTOR) {
     return refuse(field.name, `the table's card gives it the role ${roles.get(field.name) ?? "none"}, not ${ROLE_VECTOR}`);
   }
-  return { name: field.name, source: embedded.source };
+  return { name: field.name, source: embedded?.column === field.name ? embedded.source : [] };
 }
 
 /** The text the vector check embeds. Any text serves: the platform checks
@@ -375,14 +438,12 @@ const VECTOR_CHECK_K = 1;
  * filled it, asked of the platform itself: one search by meaning for one row
  * (`vector_search` with `query_text`). The platform runs it only for an
  * embedding column of the model it embeds queries with, and refuses any
- * other, naming both models when they differ (ask/src/worker/query_text.rs
- * `embed_against_column`) - the inner loop's own check, made by the code that
- * embeds every `search` and every `{{q:"..."}}`, and the one place the
- * column's model can be read: a `vector` column the load's record names was
- * filled with the model the platform embedded with then, which need not be
- * the one it embeds with now, and a table can be loaded under a model of
- * its own. The demo's checks send the same search before every run
- * (demo/platform-health.mjs `requireTextQuery`).
+ * other, naming both models when they differ - the platform loop's own
+ * check, made by the code that embeds every `search` and every
+ * `{{q:"..."}}`, and the one place the column's model can be read: a
+ * `vector` column the load's record names was filled with the model the
+ * platform embedded with then, which need not be the one it embeds with
+ * now, and a table can be loaded under a model of its own.
  *
  * Any failure leaves the column unoffered, said to `onNote` in the
  * platform's words: a refusal is the platform's no, and anything else - an
@@ -412,14 +473,8 @@ export async function platformEmbedsQueriesFor(
 /** What a caller of `tableShapeFrom` can ask of the choices it makes, and
  * hear about them. */
 export interface ShapeOptions {
-  /** The text column the deployment named for the doors to search
-   * (CX_TEXT_COLUMN): taken as `primaryText` when it is one of the table's
-   * full-text columns, since a search or token match over any other is
-   * refused by the engine; otherwise the pick by name stands. */
-  textColumn?: string;
   /** Hears each column the shape could have used and did not, and why - a
-   * vector column it does not search by meaning, a named text column it
-   * could not take. For a log line. */
+   * vector column it does not search by meaning. For a log line. */
   onNote?: (line: string) => void;
   /** The vector column the shape takes, when the caller has settled it:
    * `resolveTableShape` passes the candidate the platform embedded a query
@@ -450,8 +505,8 @@ export function tableShapeFrom(
   // hydrate casts exactly the columns it indexes or embeds to LargeUtf8.
   //
   // A plain Utf8 column no longer stands in when nothing is LargeUtf8: the
-  // optimizer probes LargeUtf8 columns alone for an index (ask/src/card/
-  // build.rs), so the platform's own card never calls a Utf8 column
+  // optimizer probes LargeUtf8 columns alone for an index (the platform's card
+  // builder), so the platform's own card never calls a Utf8 column
   // full-text, and standing one in sent a search and a find the engine
   // refuses - the Berka tables (2026-10-01), hydrated with no full-text
   // index, would have been searched on a transaction's `type`. Such a table
@@ -471,27 +526,22 @@ export function tableShapeFrom(
   const vector = options.vector !== undefined ? options.vector : vectorCandidate(fields, card, load, onNote);
   const vectorColumn = vector?.name ?? null;
   const vectorSource = vector?.source ?? [];
-  // The embedding's source is preferred only when it is itself indexed: a
+  // The column the card names as the table's prose (`text_column`: what the
+  // platform embeds and its own loop searches) comes first, when the engine
+  // can search it; the pick by name stood in for it on a table of thousands
+  // of columns and picked one named like the text that holds none. Then
+  // the embedding's source, preferred only when it is itself indexed: a
   // table can embed a column it does not index (the jobs table embeds
   // `title` and indexes `description_html`), and a search sent against the
   // unindexed one is refused by the engine.
-  const picked =
+  const prose = card?.text_column;
+  const cardProse = typeof prose === "string" && textColumns.includes(prose) ? prose : undefined;
+  const primaryText =
+    cardProse ??
     textColumns.find((name) => TEXT_NAME_HINT.test(name)) ??
     vectorSource.find((name) => textColumns.includes(name)) ??
     textColumns[0] ??
     "";
-  // The column the deployment named comes before the pick by name, when the
-  // engine can search it.
-  const named = options.textColumn;
-  const takeNamed = named !== undefined && textColumns.includes(named);
-  if (named !== undefined && !takeNamed) {
-    const why = names.has(named) ? "is not full-text indexed" : "is no column of the table";
-    onNote(
-      `the text column named for search (CX_TEXT_COLUMN=${named}) ${why} - full-text indexed: ${textColumns.join(", ") || "none"}; ` +
-        `searching ${picked || "no column"} instead`,
-    );
-  }
-  const primaryText = takeNamed ? named : picked;
 
   const cardKey = cardColumns.find((c) => c.index === ROLE_KEY && names.has(c.name))?.name;
   const keyColumn = cardKey ?? fields.find((f) => KEY_NAME.test(f.name))?.name ?? ENGINE_ID_COLUMN;
@@ -503,6 +553,16 @@ export function tableShapeFrom(
   const projection = rowColumns.includes(SCORE_COLUMN) ? [...rowColumns] : [...rowColumns, SCORE_COLUMN];
 
   const chunking = chunkingFrom(load, fields);
+  const pathColumn = textColumnNamed(fields, PATH_WORDS);
+  const documentText = chunking?.column ?? primaryText;
+  const document: TableDocument | null =
+    pathColumn && documentText
+      ? {
+          pathColumn,
+          textColumn: documentText,
+          orderColumn: chunking?.indexColumn ?? (names.has(DEFAULT_CHUNK_INDEX_COLUMN) ? DEFAULT_CHUNK_INDEX_COLUMN : null),
+        }
+      : null;
   const text = new Set(textColumns);
   const listColumns = fields.filter((f) => f.type === LIST_TYPE).map((f) => f.name);
   const scalarColumns = fields
@@ -527,6 +587,7 @@ export function tableShapeFrom(
     projection,
     ...(card ? { card } : {}),
     ...(chunking ? { chunking } : {}),
+    ...(document ? { document } : {}),
   };
 }
 
@@ -539,6 +600,124 @@ export interface ResolveOptions extends Omit<ShapeOptions, "vector"> {
    * a cold start passes one that does not: an embedding server that is
    * starting takes longer than a session's startup can wait. */
   checkWith?: Pick<HostedDb, "vectorSearchText">;
+  /** Whether the platform is asked, here, to embed a query for the table's
+   * vector column. True when absent. False for the other tables of a
+   * database: each check is a search by meaning, which loads that table's
+   * vector index on the worker, and run at startup for every table of a
+   * database of dozens of tables they can fill the worker's memory and stall
+   * it. Unchecked, the column is offered as the card and the load
+   * describe it, and the platform embeds the query when a statement first
+   * searches it, answering with its own words if it cannot. */
+  checkVector?: boolean;
+  /** The table's schema, when the caller read it already (`cardLayouts`
+   * reads every table's for the shares); absent, it is read here. */
+  fields?: SchemaField[];
+  /** The budget the card is asked for within (`TableCardOptions`): the
+   * table's share of the whole columns and map families the tables of this
+   * server lay their cards out within, as the platform's own loop lays them
+   * out for one prompt. Absent, the card comes as stored. */
+  card?: CardBudget;
+}
+
+/** A table's share of the card budget: how many columns its card lists
+ * whole and how many name families its map holds. */
+export interface CardBudget {
+  whole: number;
+  families: number;
+}
+
+/** The whole columns the cards of one server share, and the least a table
+ * keeps when several share them; the map families likewise. The platform's
+ * own loop lays the cards of one prompt out within the same four figures, so the model outside the loop and the one inside read
+ * a wide table the same way. Sized per table, one table of 4,692 columns put
+ * 2.4 million characters into the sql tool's text. */
+export const WHOLE_COLUMNS = 200;
+export const WHOLE_COLUMNS_FLOOR = 20;
+export const MAP_FAMILIES = 20;
+export const MAP_FAMILIES_FLOOR = 4;
+
+/** Each table's share of `budget` whole columns when the tables of `sizes`
+ * (their column counts) share one text: an even share each, a table with
+ * fewer columns than its share taking only what it has and leaving the rest
+ * to the others, and none below `floor`. The loop's `whole_allowances`, the
+ * same arithmetic. */
+export function wholeAllowances(sizes: readonly number[], budget: number, floor: number): number[] {
+  const order = sizes.map((_, i) => i).sort((a, b) => sizes[a] - sizes[b]);
+  const allowances = sizes.map(() => 0);
+  let remaining = budget;
+  order.forEach((i, served) => {
+    const share = Math.floor(remaining / (sizes.length - served));
+    const take = Math.min(sizes[i], Math.max(share, floor));
+    allowances[i] = take;
+    remaining = Math.max(0, remaining - take);
+  });
+  return allowances;
+}
+
+/** Each table's share of `budget` map families when `tables` share one
+ * text, never below `floor`. The loop's `families_allowance`. */
+export function familiesAllowance(tables: number, budget: number, floor: number): number {
+  return Math.max(Math.floor(budget / Math.max(tables, 1)), floor);
+}
+
+/** The tables of the database other than `table`, as the platform lists
+ * them: what a statement over `table` may join. The platform is the one that
+ * knows a database's tables; a list typed into a deployment goes stale, and
+ * the model never learns of the tables left off it. A platform that cannot
+ * list them leaves `table` alone, said on `onNote`. */
+export async function databaseTables(
+  hosted: Pick<HostedDb, "listTables">,
+  table: string,
+  onNote: (line: string) => void = (line) => console.error(line),
+): Promise<string[]> {
+  try {
+    return (await hosted.listTables()).filter((name) => name !== table);
+  } catch (err) {
+    onNote(`the database's tables could not be listed, so ${table} is described alone: ${(err as Error).message}`);
+    return [];
+  }
+}
+
+/** A table's schema and its share of the card budget. */
+export interface CardLayout extends CardBudget {
+  fields: SchemaField[];
+}
+
+/** The schemas of `tables` and each one's share of the card budget
+ * (`layouts`), read before any card is asked for: the shares follow the
+ * tables' widths. A table whose schema could not be read is in `failures`
+ * with the error, for the caller to describe the table as it does any it
+ * cannot read - one read, not a second attempt. The schemas are read at
+ * once, each answer kept in the order the tables were given. */
+export async function cardLayouts(
+  hosted: Pick<HostedDb, "schema">,
+  tables: readonly string[],
+): Promise<{ layouts: Map<string, CardLayout>; failures: Map<string, Error> }> {
+  const answers = await Promise.all(
+    tables.map(async (table) => {
+      try {
+        const fields = (await hosted.schema(table)) as unknown;
+        if (!Array.isArray(fields)) throw new Error(`schema of ${table}: expected the platform's column descriptors, got ${typeof fields}`);
+        return { table, fields: fields as SchemaField[] };
+      } catch (err) {
+        return { table, error: err as Error };
+      }
+    }),
+  );
+  const read: { table: string; fields: SchemaField[] }[] = [];
+  const failures = new Map<string, Error>();
+  for (const answer of answers) {
+    if (answer.fields) read.push({ table: answer.table, fields: answer.fields });
+    else if (answer.error) failures.set(answer.table, answer.error);
+  }
+  const allowances = wholeAllowances(
+    read.map((r) => r.fields.length),
+    WHOLE_COLUMNS,
+    WHOLE_COLUMNS_FLOOR,
+  );
+  const families = familiesAllowance(read.length, MAP_FAMILIES, MAP_FAMILIES_FLOOR);
+  const layouts = new Map(read.map((r, i) => [r.table, { fields: r.fields, whole: allowances[i], families }]));
+  return { layouts, failures };
 }
 
 /** The stored card of `table` at `tier`, or the lean one where the
@@ -555,14 +734,15 @@ export async function fetchCard(
   table: string,
   tier: string | undefined,
   onNote?: (line: string) => void,
+  options: TableCardOptions = {},
 ): Promise<RowRecord> {
-  if (tier === undefined || tier === LEAN_CARD_TIER) return hosted.tableCard(table, tier);
+  if (tier === undefined || tier === LEAN_CARD_TIER) return hosted.tableCard(table, tier, options);
   try {
-    return await hosted.tableCard(table, tier);
+    return await hosted.tableCard(table, tier, options);
   } catch (err) {
     if (!(err instanceof HostedError && err.status === HTTP_NOT_FOUND)) throw err;
     onNote?.(`no ${tier} card for ${table} (${err.message}); folding in the ${LEAN_CARD_TIER} card`);
-    return hosted.tableCard(table, LEAN_CARD_TIER);
+    return hosted.tableCard(table, LEAN_CARD_TIER, options);
   }
 }
 
@@ -590,15 +770,18 @@ export async function resolveTableShape(
   readLoad = false,
   options: ResolveOptions = {},
 ): Promise<TableShape> {
-  const fields = (await hosted.schema(table)) as unknown;
+  const fields = options.fields ?? ((await hosted.schema(table)) as unknown);
   if (!Array.isArray(fields)) throw new Error(`schema of ${table}: expected the platform's column descriptors, got ${typeof fields}`);
   let card: RowRecord | null = null;
+  let pages = false;
   try {
     // The route answers the card bare or wrapped in a record, as the sql
-    // description's own fetch has always allowed for.
-    const record = await fetchCard(hosted, table, cardTier, options.onNote);
+    // description's own fetch has always allowed for. Whether the table has
+    // pages rides beside the card, on the record.
+    const record = await fetchCard(hosted, table, cardTier, options.onNote, options.card ?? {});
     const inner = record?.card ?? record;
     if (inner && typeof inner === "object") card = inner as RowRecord;
+    pages = record?.pages === true;
   } catch (err) {
     // no card yet: the schema alone stands
     onNoCard?.(err);
@@ -612,10 +795,12 @@ export async function resolveTableShape(
       // about passages, and no `vector` column is searched by meaning
     }
   }
-  const { textColumn, onNote } = options;
+  const { onNote } = options;
   const candidate = vectorCandidate(fields as SchemaField[], card, load, onNote);
-  const vector = candidate && (await platformEmbedsQueriesFor(options.checkWith ?? hosted, table, candidate, onNote)) ? candidate : null;
-  return tableShapeFrom(table, fields as SchemaField[], card, load, { textColumn, onNote, vector });
+  const checked = options.checkVector === false || !candidate || (await platformEmbedsQueriesFor(options.checkWith ?? hosted, table, candidate, onNote));
+  const vector = candidate && checked ? candidate : null;
+  const shape = tableShapeFrom(table, fields as SchemaField[], card, load, { onNote, vector });
+  return pages ? { ...shape, pages } : shape;
 }
 
 // --- rows as hits -----------------------------------------------------------------
@@ -624,8 +809,14 @@ export async function resolveTableShape(
  * snippet - enough to tell what the row is and whether it is the one - and
  * the whole value is one `sql` away by the row's key. A job description runs
  * to several thousand characters of HTML, and ten of those per search would
- * cost more than the answer. */
-export const SNIPPET_CHARS = 500;
+ * cost more than the answer.
+ *
+ * Long enough to hold a passage whole. Document passages typically run from
+ * about one to under three thousand characters; at 500 a hit showed a fifth
+ * of most of them, and the figure a question turned on was cut out of the
+ * text the caller read. At 3,000 they read whole; ten hits are about the
+ * 24,000 characters the loop allows one tool result. */
+export const SNIPPET_CHARS = 3_000;
 
 /** The named entities HTML text carries most - the five the escaping itself
  * produces, and the typographic ones a posting's editor writes - decoded so a

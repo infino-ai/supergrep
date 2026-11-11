@@ -4,7 +4,7 @@
 // The account's data through the MCP server, end to end on an in-memory
 // transport against a scripted platform: one server, started for a
 // repository with no CX_TABLE (the plugin's shape), reaches every database
-// of the account by the `database` argument - sql, search, find, ask and
+// of the account by the `database` argument - sql, search, find and
 // join_keys over a table of a named database, `tables` for what the account
 // holds, and `hydrate` for getting data in from a bucket or from files on
 // this machine. Nothing is asked of the platform at startup for any of it,
@@ -33,7 +33,7 @@ const { API_KEY_ENV, MANIFEST_NAME, configureHosted, hostedSettingsFromFlags } =
 /** The platform the server is started against, and the database its
  * `--db` named: the repository's own. */
 const PLATFORM = "http://127.0.0.1:9";
-const REPO_DB = "cxbench";
+const REPO_DB = "testdb";
 /** A data database of the account, and its tables: a bank's accounts and
  * transactions, as a hydrate loaded them - no full-text column on either,
  * a vector on neither. */
@@ -67,17 +67,6 @@ const NOTES_LOAD = {
 };
 const NOTE = { note_id: "n1", title: "Quarterly close", body: "The ledger closed on the third day.", score: 0.4 };
 
-/** The platform's loop answering over the data database. */
-const ASKED = {
-  facts: [{ table: TRANS, row: { account_id: 42, total: 1200.5 } }],
-  statement: `SELECT account_id, SUM(amount) AS total FROM ${TRANS} GROUP BY account_id ORDER BY total DESC LIMIT 1`,
-  coverage: { rows_total: 1, rows_returned: 1, truncated: false },
-  terminate: "answered",
-  turns: 1,
-  retries: 0,
-  model_tokens: 500,
-};
-
 /** The writes a call that named a database may never make: the table
  * routes are read, and only hydrate and the account plane write. */
 const FORBIDDEN_OPS = ["drop_table", "create_table", "append", "delete", "update"];
@@ -105,7 +94,6 @@ function account(): Platform {
     },
     validate: () => [200, { valid: true, check: "unchecked" }],
     join_keys: () => [200, { joins: [{ from_table: TRANS, to_table: ACCOUNTS, predicate: `${TRANS}.account_id = ${ACCOUNTS}.account_id` }] }],
-    sub_agent: () => [200, ASKED],
     hydrate: (body, request) => {
       if (request.method === "GET") return body?.table === NOTES ? [200, NOTES_LOAD] : [200, { job: `${String(body?.table)}-1`, state: "running", progress: { rows: 10 } }];
       if (request.method === "DELETE") return body?.table === "ended" ? [200, null] : [202, { job: `${String(body?.table)}-1`, state: "cancelling" }];
@@ -148,14 +136,17 @@ describe("the account's data through the server started for a repository", () =>
   });
 
   it("asks the platform nothing about the account's data at startup", () => {
-    expect(s.startup).toEqual(["table_card", "table_card"]);
+    // The repository's own database is listed (its tables are what a
+    // statement may join), and its cards read; no other database is asked.
+    expect(s.startup).toEqual(["list_tables", "table_card", "table_card"]);
   });
 
   it("registers tables, hydrate, hydrate_status and hydrate_cancel, and database on every query tool", async () => {
     const { tools } = await s.client.listTools();
     const byName = new Map(tools.map((t) => [t.name, t]));
     for (const name of ["tables", "hydrate", "hydrate_status", "hydrate_cancel"]) expect(byName.has(name), name).toBe(true);
-    for (const name of ["sql", "search", "find", "ask", "join_keys"]) {
+    expect(byName.has("ask")).toBe(false);
+    for (const name of ["sql", "search", "find", "join_keys"]) {
       const schema = byName.get(name)?.inputSchema as { properties?: Record<string, unknown> };
       expect(Object.keys(schema.properties ?? {}), name).toContain("database");
     }
@@ -165,7 +156,7 @@ describe("the account's data through the server started for a repository", () =>
     const instructions = s.client.getInstructions() ?? "";
     expect(instructions).toContain("- tables - the databases of this Infino account");
     expect(instructions).toContain("- hydrate - load a dataset");
-    for (const name of ["sql", "search", "find", "ask"]) expect(byName.get(name)?.description).toContain("With database (and table)");
+    for (const name of ["sql", "search", "find"]) expect(byName.get(name)?.description).toContain("With database (and table)");
   });
 
   it("tables lists the account's databases with their tables, a chunks table marking a repository's index", async () => {
@@ -220,15 +211,16 @@ describe("the account's data through the server started for a repository", () =>
     });
     expect(ok, String(value)).toBe(true);
     // The trans table's shape (no card, no load record for it, no vector),
-    // then the statement, then the verdict - every one on the data database.
-    expect(ops).toEqual(["schema", "table_card", "table_card", "hydrate", "query_sql", "validate"]);
+    // then the statement with its verdict asked on the same call - every one
+    // on the data database.
+    expect(ops).toEqual(["schema", "table_card", "table_card", "hydrate", "query_sql"]);
     expect(toDatabase(s.sent.slice(before), DATA_DB).length).toBe(ops.length);
     const result = value as { rows: unknown[]; index: string; database: string; validation?: { valid: boolean } };
     expect(result.index).toBe("platform");
     expect(result.database).toBe(DATA_DB);
     expect(result.rows).toEqual([{ account_id: 42, n: 7 }]);
     expect(result.validation?.valid).toBe(true);
-    expect(s.sent.find((x) => x.op === "validate")?.body).toMatchObject({ table_name: TRANS, field_name: "" });
+    expect(s.sent.at(-1)?.body?.validate).toMatchObject({ table_name: TRANS, field_name: "" });
     expectNothingBuilt(s, before);
   });
 
@@ -248,8 +240,8 @@ describe("the account's data through the server started for a repository", () =>
     // The keys were kept from the refusal. The verdict is judged against
     // the first of the database's tables the statement names - accounts,
     // in the database's own order - whose shape is read here, once.
-    expect(run.ops).toEqual(["schema", "table_card", "table_card", "hydrate", "query_sql", "validate"]);
-    expect(s.sent.at(-1)?.body).toMatchObject({ table_name: ACCOUNTS });
+    expect(run.ops).toEqual(["schema", "table_card", "table_card", "hydrate", "query_sql"]);
+    expect(s.sent.at(-1)?.body?.validate).toMatchObject({ table_name: ACCOUNTS });
   });
 
   it("search and find with a database and table run over that table's text column", async () => {
@@ -279,33 +271,6 @@ describe("the account's data through the server started for a repository", () =>
     // The shape was read when a statement named the table; no search ran.
     expect(ops).not.toContain("hybrid_search");
     expect(ops).not.toContain("bm25_search");
-  });
-
-  it("ask with a database runs the platform's loop over the whole database, or over the tables named", async () => {
-    const whole = await call(s, "ask", { database: DATA_DB, question: "which account moved the most money" });
-    expect(whole.ok, String(whole.value)).toBe(true);
-    expect(whole.ops).toEqual(["sub_agent"]);
-    const request = s.sent.at(-1)!;
-    expect(request.path).toBe(`sub_agent/${DATA_DB}`);
-    expect(request.body).not.toHaveProperty("table");
-    expect(request.body).not.toHaveProperty("tables");
-    // No projection: the chunks table's place columns name no column of a
-    // data table, and the platform refuses such a projection (live, 2026-10-11).
-    expect(request.body).not.toHaveProperty("projection");
-    const result = whole.value as { rows: unknown[]; database: string; statement?: string };
-    expect(result.database).toBe(DATA_DB);
-    expect(result.rows).toEqual([{ account_id: 42, total: 1200.5 }]);
-
-    const some = await call(s, "ask", { database: DATA_DB, question: "the same", tables: [TRANS, ACCOUNTS] });
-    expect(some.ok, String(some.value)).toBe(true);
-    expect(s.sent.at(-1)?.body).toMatchObject({ tables: [TRANS, ACCOUNTS] });
-    expect(s.sent.at(-1)?.body).not.toHaveProperty("projection");
-
-    const one = await call(s, "ask", { database: DATA_DB, question: "notes about the close", tables: [NOTES] });
-    expect(one.ok, String(one.value)).toBe(true);
-    // One table named: its shape (kept from before) places the facts.
-    expect(one.ops).toEqual(["sub_agent"]);
-    expect(s.sent.at(-1)?.body).toMatchObject({ table: NOTES, projection: ["note_id"] });
   });
 
   it("join_keys with a database asks that database", async () => {

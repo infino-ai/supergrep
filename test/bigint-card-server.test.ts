@@ -7,8 +7,7 @@
 // 2026-10-05 the server died at startup serializing that table's card into
 // the sql text ("Do not know how to serialize a BigInt"): the caller's model
 // was left with no tools and wrote its tool calls as prose. The server must
-// start, carry the card's integers exactly, and answer an ask whose facts
-// hold them.
+// start and carry the card's integers exactly.
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { scriptPlatform, start, stop, type Started } from "./mcp-harness.js";
@@ -54,23 +53,12 @@ const CARD = {
 /** One fact row, twice: the loop's facts may repeat a row, and the client
  * keys rows to keep one of each. */
 const FACT = { table: LOGS_TABLE, row: { timestamp: JSON.rawJSON(FIRST_NANOS), severity_text: "ERROR", body: "probe failed" } };
-const ASKED = {
-  facts: [FACT, FACT],
-  statement: `SELECT timestamp, severity_text, body FROM ${LOGS_TABLE} WHERE severity_text = 'ERROR'`,
-  coverage: { rows_total: 1, rows_returned: 1, truncated: false },
-  terminate: "answered",
-  turns: 1,
-  retries: 0,
-  model_tokens: 320,
-};
-
 const platform = () =>
   scriptPlatform({
     list_tables: () => [200, [LOGS_TABLE]],
     schema: () => [200, SCHEMA],
     table_card: (query) => (String(query?.tier ?? "lean") === "enriched" ? [200, { card: CARD, tier: "enriched" }] : [404, { error: "no lean card" }]),
     hydrate: () => [404, { error: "no hydrate job" }],
-    sub_agent: () => [200, ASKED],
   });
 
 beforeAll(() => {
@@ -93,7 +81,8 @@ describe("a table whose values run past 2^53", () => {
 
   it("starts, and serves its tools", async () => {
     const { tools } = await s.client.listTools();
-    expect(tools.map((t) => t.name)).toEqual(expect.arrayContaining(["sql", "ask"]));
+    expect(tools.map((t) => t.name)).toEqual(expect.arrayContaining(["sql", "search"]));
+    expect(tools.map((t) => t.name)).not.toContain("ask");
   });
 
   it("carries the card's integers into the sql text exactly", async () => {
@@ -103,18 +92,4 @@ describe("a table whose values run past 2^53", () => {
     expect(sql).toContain(`"max":${LAST_NANOS}`);
   });
 
-  it("answers an ask whose facts hold them, exactly and once", async () => {
-    const before = s.sent.length;
-    // The tool's own text, not `call`'s parse of it: JSON.parse would round
-    // the digits this checks.
-    const result = (await s.client.callTool({ name: "ask", arguments: { question: "Which errors did the pods log?" } })) as {
-      content: Array<{ type: string; text: string }>;
-      isError?: boolean;
-    };
-    const text = result.content[0].text;
-    expect(result.isError, text).not.toBe(true);
-    expect(s.sent.slice(before).map((x) => x.op)).toContain("sub_agent");
-    expect(text).toContain("probe failed");
-    expect(text.split(FIRST_NANOS).length - 1, "the timestamp, exactly, in the one row kept").toBe(1);
-  });
 });

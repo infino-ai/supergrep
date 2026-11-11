@@ -19,7 +19,7 @@ export const INDEX_DIR_NAME = ".infino";
 //
 // A platform database (--db <url>) holds the same repository's chunks table
 // beside the local index, reached over HTTPS: every build and sync writes
-// both, and the `ask` tool reads it. Its settings are
+// both, and `search` reads it. Its settings are
 // command-line flags: the CLI parses them once into a HostedSettings
 // (hostedSettingsFromFlags) and installs it with configureHosted(); every
 // layer below reads that object through the accessor functions. Nothing here
@@ -29,8 +29,8 @@ export const INDEX_DIR_NAME = ".infino";
 // machine's own stored account (keystore.ts), in that order.
 
 /** The environment variable holding the bearer key when --api-key-file is not
- * given. The engine's remote binding, the ask harness and the platform all
- * read this one name, so code-context does too. It is only ever read into a
+ * given. The engine's remote binding and the platform read this one name,
+ * so code-context does too. It is only ever read into a
  * HostedTarget - never logged or echoed. */
 export const API_KEY_ENV = "INFINO_API_KEY";
 
@@ -40,15 +40,6 @@ export const DEFAULT_DB_TIMEOUT_MS = DEFAULT_TIMEOUT_MS;
 
 /** Default cold-start budget: likewise the client's own default. */
 export const DEFAULT_DB_COLD_START_SECS = DEFAULT_COLD_START_SECS;
-
-/** Default turn cap for `ask`: a few search turns and a statement.
- * Measured against 8: half the inner tokens per call and a much shorter tail
- * for the same rate of empty results - the outer agent, not the inner loop,
- * decides how far to go. */
-export const DEFAULT_SUBAGENT_MAX_TURNS = 4;
-
-/** Default wall clock for `ask`, in seconds. */
-export const DEFAULT_SUBAGENT_MAX_WALL_SECS = 120;
 
 /** Spellings that turn a boolean env flag off (`CX_AUTO_INDEX=0`, ...). */
 const OFF_VALUES = ["0", "false", "no"];
@@ -64,15 +55,6 @@ export type EmbedProvider = "local" | "platform";
 
 /** The default provider for the platform table. */
 export const DEFAULT_HOSTED_EMBED_PROVIDER: EmbedProvider = "platform";
-
-export interface SubagentSettings {
-  /** Turn cap for one loop (the platform lowers a value above its own cap). */
-  maxTurns: number;
-  /** Wall clock for one loop, in seconds (likewise capped server-side). */
-  maxWallSecs: number;
-  /** Facts asked for and kept per call (the platform caps a value above its own). */
-  k: number;
-}
 
 /** The account this machine is signed in to, when the platform target came
  * from it rather than from `--db`: the base URL every repository's database
@@ -102,13 +84,11 @@ export interface HostedSettings {
    * already has (or HOSTED_DEFAULT_ANALYZER for a first load) and a sync
    * asks for nothing - only an explicit, differing request forces a rebuild. */
   analyzer?: Analyzer;
-  subagent: SubagentSettings;
 }
 
 /** The platform flags as commander parses them: camelCase of `--db`,
  * `--api-key-file`, `--embed-provider`, `--db-timeout-ms`, `--cold-start-secs`,
- * `--analyzer`, `--subagent-max-turns`, `--subagent-max-wall-secs`,
- * `--subagent-k`. Every value is the raw string; validation is here, in one
+ * `--analyzer`. Every value is the raw string; validation is here, in one
  * place, so a bad value is an error at startup and not on the first call. */
 export interface HostedFlags {
   db?: string;
@@ -117,9 +97,6 @@ export interface HostedFlags {
   dbTimeoutMs?: string;
   coldStartSecs?: string;
   analyzer?: string;
-  subagentMaxTurns?: string;
-  subagentMaxWallSecs?: string;
-  subagentK?: string;
   /** `cx mcp --sign-in <url>`: each session brings its own key, so `--db`
    * names the platform alone. */
   signIn?: string;
@@ -132,9 +109,6 @@ const HOSTED_ONLY_FLAGS: Array<[keyof HostedFlags, string]> = [
   ["dbTimeoutMs", "--db-timeout-ms"],
   ["coldStartSecs", "--cold-start-secs"],
   ["analyzer", "--analyzer"],
-  ["subagentMaxTurns", "--subagent-max-turns"],
-  ["subagentMaxWallSecs", "--subagent-max-wall-secs"],
-  ["subagentK", "--subagent-k"],
   ["signIn", "--sign-in"],
 ];
 
@@ -242,11 +216,6 @@ export function hostedSettingsFromFlags(
     timeoutMs: positiveIntFlag("--db-timeout-ms", flags.dbTimeoutMs, DEFAULT_DB_TIMEOUT_MS),
     coldStartSecs: positiveIntFlag("--cold-start-secs", flags.coldStartSecs, DEFAULT_DB_COLD_START_SECS),
     ...(flags.analyzer !== undefined ? { analyzer: flags.analyzer } : {}),
-    subagent: {
-      maxTurns: positiveIntFlag("--subagent-max-turns", flags.subagentMaxTurns, DEFAULT_SUBAGENT_MAX_TURNS),
-      maxWallSecs: positiveIntFlag("--subagent-max-wall-secs", flags.subagentMaxWallSecs, DEFAULT_SUBAGENT_MAX_WALL_SECS),
-      k: positiveIntFlag("--subagent-k", flags.subagentK, DEFAULT_SUBAGENT_K),
-    },
   };
 }
 
@@ -254,7 +223,7 @@ export function hostedSettingsFromFlags(
  * (null when no --db was given), read by every layer through the accessors
  * below. There is no "hosted mode": the local index is always the one `find`,
  * `search` and `sql` read, and these settings name the platform database
- * that holds the same repository's chunks table for the `ask` tool. Every
+ * that holds the same repository's chunks table for `search`. Every
  * build and every sync writes both, so the two are one index in two
  * places. */
 let hosted: HostedSettings | null = null;
@@ -321,19 +290,6 @@ export function hostedAnalyzer(): Analyzer | undefined {
   return hosted?.analyzer;
 }
 
-export function subagentMaxTurns(): number {
-  return hosted?.subagent.maxTurns ?? DEFAULT_SUBAGENT_MAX_TURNS;
-}
-
-export function subagentMaxWallSecs(): number {
-  return hosted?.subagent.maxWallSecs ?? DEFAULT_SUBAGENT_MAX_WALL_SECS;
-}
-
-/** Facts one ask call asks for and keeps (--subagent-k). */
-export function subagentK(): number {
-  return hosted?.subagent.k ?? DEFAULT_SUBAGENT_K;
-}
-
 /** Whether a first query on an unindexed repo builds the index (CX_AUTO_INDEX,
  * default on). A build writes both the local index and, when a platform
  * database is configured, its chunks table: the two are one index in two
@@ -350,28 +306,18 @@ export function autoSyncEnabled(): boolean {
   return !OFF_VALUES.includes((process.env.CX_AUTO_SYNC ?? "").toLowerCase());
 }
 
-/** Whether the MCP server registers the platform's `ask` when a platform
- * database is configured (CX_AGENT_TOOLS, default on). Off, it is neither
- * registered nor named in the server's instructions. A lane that hides it
- * through the SDK's disallowedTools removes it from the model's tool list but
- * not from those instructions, and a line for a tool that is not there made
- * the caller try it and lose the turn to the refusal; this switch takes the
- * line out at the source. */
-export function agentToolsEnabled(): boolean {
-  return !OFF_VALUES.includes((process.env.CX_AGENT_TOOLS ?? "").toLowerCase());
-}
+/** The switch for memory (core/memory.ts), and the value `cx install` sets it
+ * to on the server entry it writes beside the memory hook. */
+export const MEMORY_ENV = "CX_MEMORY";
+export const MEMORY_ON = "1";
 
-/** Whether the MCP server registers `answer` beside `ask` (CX_ANSWER_TOOL,
- * default off). Off, the model that called the tools writes the final answer
- * itself from the rows they returned: `ask` stays, `answer` is neither
- * registered nor named in the instructions, and nothing tells the model
- * "never write the answer yourself". That is the shipped shape: measured,
- * the caller writing from the rows kept counts the platform's writer lost.
- * On, the two writers can be measured against each other on one
- * deployment. Says nothing when CX_AGENT_TOOLS is off, which removes both
- * tools. */
-export function answerToolEnabled(): boolean {
-  return ON_VALUES.includes((process.env.CX_ANSWER_TOOL ?? "").toLowerCase());
+/** Whether the MCP server recalls the database's memory beside the
+ * platform's searches (CX_MEMORY, default off). On only where `cx install`
+ * wrote the memory hook, so a server that never wrote memory never reads
+ * any: a database shared by several people never shows one person
+ * another's turns unless it was set up to. */
+export function memoryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return ON_VALUES.includes((env[MEMORY_ENV] ?? "").toLowerCase());
 }
 
 /** Whether the MCP server offers the platform's own API routes as tools the
@@ -380,11 +326,8 @@ export function answerToolEnabled(): boolean {
  * verdict on its result - so the model reads the table's shape, checks a
  * result against the question, and checks its answer's citations by
  * choosing to, the way a caller driving its own retrieval against the
- * platform would. Off is the measured default: the card and the verdict
- * ride inside `sql`, because a check the model may call is a check it
- * declined when it was offered (the card tool, 2026-09-11). The owner,
- * 2026-09-23: "can we offer the full set of tools we built ... but without
- * hydrate and sub_agent ... let me see what happens." */
+ * platform would. Off by default: the card and the verdict ride inside
+ * `sql`, because a check the model may call is a check it often declines. */
 export function apiToolsEnabled(): boolean {
   return ON_VALUES.includes((process.env.CX_API_TOOLS ?? "").toLowerCase());
 }
@@ -419,24 +362,16 @@ export function siblingTables(): string[] {
 export function siblingNotes(): string {
   return (process.env.CX_SIBLING_NOTES ?? "").trim();
 }
+/** The variable that gives a run the platform's web page reads. */
+const WEB_FETCH_ENV = "CX_WEB_FETCH";
 
-/** The text column the doors search on a hosted table of rows
- * (CX_TEXT_COLUMN, default unset): the column `search` ranks by keyword -
- * beside the vector column, when the table has one - `find` matches in, and
- * the sql text's examples name. Read only for a table of another shape
- * (CX_TABLE naming a table this client did not build, with
- * CX_REMOTE_SEARCH); the chunks table searches its `content`. It is the
- * deployment's decision for a table with several full-text columns, kept
- * beside the table's name: the demo names `sections` for the Wikipedia
- * table, the passages the platform embeds, where the pick by column name
- * took `abstract`, which is filled on an article's first passage alone, so
- * a hybrid search paired keywords on abstracts with meaning on passages.
- * Unset, or naming no full-text column of the table, and the column is
- * picked as before (`tableShapeFrom`), the server saying on stderr why a
- * name it was given was not taken. */
-export function configuredTextColumn(): string | undefined {
-  const name = (process.env.CX_TEXT_COLUMN ?? "").trim();
-  return name === "" ? undefined : name;
+/** Whether the MCP server offers `web_fetch` (CX_WEB_FETCH, default off): the
+ * platform reads a web page a search named - a published series the database
+ * does not hold - and hands back its text. On where the deployment gives a
+ * run the web; the read itself runs on the platform, which reads only the
+ * public internet. */
+export function webFetchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return ON_VALUES.includes((env[WEB_FETCH_ENV] ?? "").toLowerCase());
 }
 
 /** The card tiers the platform serves, the lean one first: the card every
@@ -549,12 +484,6 @@ export const EMBED_MAX_CHARS = Number(process.env.CX_EMBED_MAX_CHARS ?? 8000);
 /** Default number of search hits. Configurable per call (the `k` tool param /
  * CLI `-k`) and via CX_SEARCH_K for config/CI-level defaults. */
 export const DEFAULT_SEARCH_K = Number(process.env.CX_SEARCH_K ?? 10);
-
-/** Default number of facts one `ask` call asks for and returns: as many
- * as a search returns, so an ask result costs the outer agent what a
- * search does. The platform retrieves and ranks more than this before
- * answering; `hitsTotal` says what was cut. */
-export const DEFAULT_SUBAGENT_K = DEFAULT_SEARCH_K;
 
 /** Hard cap on matching lines in one `find` result. At roughly fifty tokens
  * per returned line (path, line number, text) this is about 25k tokens: a

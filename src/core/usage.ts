@@ -9,8 +9,7 @@
 
 import { appendFileSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { jsonify, hostedTelemetry, type FindResult, type RowFindResult, type RowHit, type RowSearchResult, type SearchResult } from "./searcher.js";
-import type { RetrievalAgentResult, RetrievalAgentSpend } from "./retrieval-agent.js";
+import { jsonify, hostedTelemetry, type CallTelemetry, type FindResult, type RowFindResult, type RowHit, type RowSearchResult, type SearchResult } from "./searcher.js";
 import type { HostedDb } from "./hosted.js";
 
 /** Rough tokens-per-char - the standard heuristic for English + code. Kept
@@ -40,11 +39,8 @@ export const receiptEnabled = (): boolean =>
  * it doesn't duplicate the repo. */
 export interface UsageEntry {
   ts: string;
-  /** The tool as the model saw it. `subagent` is the name `ask` had before,
-   * and `explore` a second platform tool that was removed once measurement
-   * showed several asks issued together beat its loop; both appear in older
-   * ledgers only, and nothing writes either now. */
-  tool: "find" | "search" | "sql" | "read" | "card" | "ask" | "answer" | "explore" | "subagent";
+  /** The tool as the model saw it. */
+  tool: "find" | "search" | "sql" | "read" | "card";
   query: string;
   returnedTokens: number;
   /** search only: whole-file size of the distinct files the hits came from. */
@@ -65,31 +61,7 @@ export interface UsageEntry {
   rows?: number;
   /** sql only: a truncated preview of the returned rows (the answer itself). */
   rowsPreview?: string;
-  /** ask: what the platform's agent spent on the question - its turns, and
-   * the model tokens the platform metered for the call (prompt and
-   * completion together, every model call of the loop; the platform bills
-   * this number and reports no more of its costs). The receipt shows them,
-   * the tool result does not. */
-  agentTurns?: number;
-  agentInferenceTokens?: number;
-  /** Where the platform's own time on an ask went, as it reported it: its
-   * model calls and its retrieval, in milliseconds - the split its two
-   * charge lines are made of. Absent when the platform did not say. */
-  agentModelMs?: number;
-  agentRetrievalMs?: number;
-  /** ask: whether the platform ranked the facts against the question. */
-  agentRanked?: boolean;
-  /** answer: the model that wrote the answer on the platform, as its
-   * coverage named it, and how long the writing took - so a run's ledger
-   * says who wrote each answer rather than leaving it to the config. */
-  agentWriter?: string;
-  agentWriteMs?: number;
-  /** ask: the platform's account of an audit that could not run, when the
-   * answer stands unaudited; absent when the audit ran. */
-  agentUnaudited?: string;
-  /** Written by the removed `explore` tool; read only from older ledgers. */
-  agentAnswered?: boolean;
-  /** ask: what the platform call behind this entry cost on
+  /** What the platform call behind this entry cost on
    * the wire - the round trip of the answering request, the read/write
    * tokens the platform metered and the bytes its egress meter recorded
    * (from its response headers, when present). Lives in the ledger, never
@@ -198,14 +170,16 @@ export function rowFindEntry(result: RowFindResult): UsageEntry {
 
 /** A read returns the numbered lines of the files named, so what it cost is
  * those lines, and what it points at is each file's span. The files are the
- * query, since a read has no other. */
-export function readEntry(files: Array<{ path: string; from: number; to: number; lines: string }>): UsageEntry {
+ * query, since a read has no other. `table` is set for the documents of a
+ * hosted table of rows, as it is for a search or find over one. */
+export function readEntry(files: ReadonlyArray<{ path: string; from: number; to: number; lines: string }>, table?: string): UsageEntry {
   return {
     ts: new Date().toISOString(),
     tool: "read",
     query: files.map((f) => f.path).join(", "),
     returnedTokens: files.reduce((n, f) => n + estTokens(f.lines), 0),
     hits: files.map((f) => ({ path: f.path, startLine: f.from, endLine: f.to })),
+    ...(table !== undefined ? { table } : {}),
   };
 }
 
@@ -236,31 +210,6 @@ export function cardEntry(card: Record<string, unknown>): UsageEntry {
   };
 }
 
-/** An ask call returns facts - the statement, the hits and the aggregate
- * rows - so what it cost the outer agent is those serialized (an explore
- * call's written answer included); the hits are recorded as places like a
- * search's, and the loop's own spend (turns, tokens) is the platform's meter
- * and rides beside them in the ledger. `tool` names which of the two tools
- * made the call. */
-export function subagentEntry(result: RetrievalAgentResult, spend: RetrievalAgentSpend, tool: "ask" | "explore" | "answer" = "ask"): UsageEntry {
-  return {
-    ts: new Date().toISOString(),
-    tool,
-    query: result.question,
-    returnedTokens: estTokens(jsonify({ answer: result.answer, sql: result.sql, hits: result.hits, rows: result.rows })),
-    hits: result.hits.map((h) => ({ path: h.path, startLine: h.startLine, endLine: h.endLine })),
-    rows: result.rows.length,
-    agentTurns: result.turns,
-    // The count the platform bills inference on, under the platform's own
-    // name for it; the demo's charge reads this field first.
-    agentInferenceTokens: spend.modelTokens,
-    ...(result.timing ? { agentModelMs: result.timing.modelMs, agentRetrievalMs: result.timing.retrievalMs } : {}),
-    ...(result.coverage?.ranked ? { agentRanked: true } : {}),
-    ...(result.coverage?.answer ? { agentWriter: result.coverage.answer.model, agentWriteMs: result.coverage.answer.ms } : {}),
-    ...(result.unaudited ? { agentUnaudited: result.unaudited } : {}),
-  };
-}
-
 /** Attach the platform telemetry of the call that answered this entry's
  * question (its round trip and the tokens the platform metered) - read right
  * after the call, while the client's last call is that one. A no-op without a
@@ -269,6 +218,39 @@ export function subagentEntry(result: RetrievalAgentResult, spend: RetrievalAgen
 export function withPlatform(entry: UsageEntry, source: { hosted?: HostedDb }): UsageEntry {
   const platform = hostedTelemetry(source);
   if (platform) entry.platform = platform;
+  return entry;
+}
+
+/** `entry` with the telemetry of each platform call behind it added to its
+ * platform figures: the call that answered (captured with `callTelemetry`
+ * the moment it resolved, before any other await, so a concurrent tool call
+ * cannot have replaced the client's last call) and any made beside it
+ * through a client of its own - the `sql` verdict, a memory recall. Several
+ * platform reads, one ledger line, so the charge shows them all. Undefined
+ * calls are skipped. */
+export function withCalls(entry: UsageEntry, ...calls: Array<CallTelemetry | undefined>): UsageEntry {
+  const sum = (a: number | undefined, b: number | undefined) => (a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0));
+  for (const call of calls) {
+    if (!call) continue;
+    const own = entry.platform;
+    const readTokens = sum(own?.readTokens, call.readTokens);
+    const writeTokens = sum(own?.writeTokens, call.writeTokens);
+    const resultBytes = sum(own?.resultBytes, call.resultBytes);
+    entry.platform = {
+      rttMs: (own?.rttMs ?? 0) + call.rttMs,
+      ...(readTokens !== undefined ? { readTokens } : {}),
+      ...(writeTokens !== undefined ? { writeTokens } : {}),
+      ...(resultBytes !== undefined ? { resultBytes } : {}),
+    };
+  }
+  return entry;
+}
+
+/** `entry` with what a result's recalled memory (core/memory.ts) adds to
+ * the tokens the caller reads: the receipt, the session total and `cx usage`
+ * then count everything the model received. A no-op without memory. */
+export function withMemoryTokens(entry: UsageEntry, memory: unknown): UsageEntry {
+  if (memory) entry.returnedTokens += estTokens(jsonify(memory));
   return entry;
 }
 
@@ -305,15 +287,8 @@ export function formatReceipt(entry: UsageEntry, session?: SessionUsage): string
     parts.push(`returned ~${fmtTokens(entry.returnedTokens)} tokens | ${plural(entry.matches ?? hits.length, "match", "matches")} / ${plural(files, "file", "files")}`);
   } else if (entry.tool === "read") {
     const files = new Set((entry.hits ?? []).map((h) => h.path)).size;
-    parts.push(`returned ~${fmtTokens(entry.returnedTokens)} tokens | ${plural(files, "file", "files")}`);
-  } else if (entry.tool === "ask" || entry.tool === "answer" || entry.tool === "subagent" || entry.tool === "explore") {
-    // What came back, then the inner agent's spend beside it: the platform
-    // bills the model tokens, so the caller sees what one question cost there.
-    const hits = entry.hits ?? [];
-    parts.push(
-      `returned ~${fmtTokens(entry.returnedTokens)} tokens | ${plural(hits.length, "hit", "hits")} / ${plural(entry.rows ?? 0, "row", "rows")} | ` +
-        `${plural(entry.agentTurns ?? 0, "turn", "turns")} | ${fmtTokens(entry.agentInferenceTokens ?? 0)} inference tokens`,
-    );
+    const counted = entry.table !== undefined ? plural(files, "document", "documents") : plural(files, "file", "files");
+    parts.push(`returned ~${fmtTokens(entry.returnedTokens)} tokens | ${counted}`);
   } else {
     parts.push(`returned ~${fmtTokens(entry.returnedTokens)} tokens | ${plural(entry.rows ?? 0, "row", "rows")}`);
   }

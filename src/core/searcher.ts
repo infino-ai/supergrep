@@ -17,7 +17,7 @@
 //
 // `find` runs against the LOCAL index (the in-process engine on the handle),
 // and so do `search` and `sql` unless the MCP server is told otherwise. The
-// platform table the `ask` tool reads is the same index in
+// platform table `search` reads is the same index in
 // another place, and the doors reach for it in two cases: under
 // CX_REMOTE_SEARCH the hosted table is the index, so `search` goes through
 // `searchHosted` and every `sql` statement through `runSqlRows`; and a `sql`
@@ -31,9 +31,10 @@ import { localDb, CONTENT_COLUMN, EMBEDDING_COLUMN, type IndexHandle } from "./c
 import { TABLE, DEFAULT_SEARCH_K, DEFAULT_FIND_LIMIT, MAX_FIND_LIMIT } from "./config.js";
 import type { Embedder } from "./embedder.js";
 import type { Manifest } from "./manifest.js";
-import type { HostedDb, RowRecord } from "./hosted.js";
+import type { CheckedRows, HostedCallInfo, HostedDb, ReadChecks, RowRecord } from "./hosted.js";
 import { analyzerOf, analyzerTokens, hasIndexableToken, PLATFORM_DEFAULT_ANALYZER, type Analyzer } from "./analyzer.js";
-import { rowHit, sqlIdentifier, sqlLiteral, type TableShape } from "./table-shape.js";
+import { ENGINE_ID_COLUMN, rowHit, sqlIdentifier, sqlLiteral, type TableDocument, type TableShape } from "./table-shape.js";
+import { jsonify } from "./json.js";
 
 // The analyzer mirror is re-exported from the door that uses it: `find`
 // decides what the index can look up with `analyzerOf(handle.manifest)`, and
@@ -87,16 +88,27 @@ export function partialIndex(manifest: Manifest): PartialIndex | undefined {
 // is re-exported here for the callers that always found it on the searcher.
 export { jsonify } from "./json.js";
 
-/** The ledger's record of what the platform call behind an `ask` result
+/** The ledger's record of what a platform call behind a result
  * cost: the round trip of the answering request, the tokens the platform
  * metered and the bytes its egress meter recorded. Read right after the
  * call, while the client's last call is that one. Undefined when there is no
  * platform client, so callers spread it into the usage entry
  * unconditionally. Ledger-only: never part of a tool result. */
-export function hostedTelemetry(
-  handle: { hosted?: HostedDb },
-): { rttMs: number; readTokens?: number; writeTokens?: number; resultBytes?: number } | undefined {
-  const info = handle.hosted?.lastCall();
+export function hostedTelemetry(handle: { hosted?: HostedDb }): CallTelemetry | undefined {
+  return callTelemetry(handle.hosted?.lastCall());
+}
+
+/** What one platform call cost on the wire, as the ledger keeps it. */
+export interface CallTelemetry {
+  rttMs: number;
+  readTokens?: number;
+  writeTokens?: number;
+  resultBytes?: number;
+}
+
+/** One platform call's telemetry (`HostedDb.lastCall`, read right after
+ * the call), as the ledger keeps it; undefined without one. */
+export function callTelemetry(info: HostedCallInfo | null | undefined): CallTelemetry | undefined {
   if (!info) return undefined;
   return {
     rttMs: info.rttMs,
@@ -244,7 +256,7 @@ export function focusLines(
 
 /** One engine row as a hit. Shared by the local and the hosted search so the
  * two cannot drift: a caller must not be able to tell from the shape of a hit
- * which index answered, or a lane comparing them would be comparing the
+ * which index answered, or a run comparing them would be comparing the
  * mapping as well as the index. With `focus`, the hit is the chunk's matching
  * lines (focusLines) rather than the chunk. */
 function toHit(r: Record<string, unknown>, focus?: LineFocus): SearchHit {
@@ -344,9 +356,13 @@ export async function search(
     query,
     ranking,
     hits: rows.map((r) => toHit(r, focus)),
-    ...(ranking === "keyword" && handle.manifest.vectors !== "ready"
-      ? { note: "vectors not ready yet - keyword-ranked only (re-run `cx index` or wait for the vector stage to finish)" }
-      : {}),
+    // The local table never gains vectors, so "none" is final rather than
+    // pending: re-running `cx index` would not change it.
+    ...(ranking === "keyword" && handle.manifest.vectors === "building"
+      ? { note: "vectors not ready yet - keyword-ranked only (wait for the vector stage to finish)" }
+      : ranking === "keyword" && handle.manifest.vectors === "none"
+        ? { note: "keyword-ranked: the local index is keyword-only" }
+        : {}),
     ...(() => {
       const partial = partialIndex(handle.manifest);
       return partial ? { partial } : {};
@@ -1156,93 +1172,6 @@ export function guardSql(sql: string): string {
   return sql.trim().replace(/;\s*$/, "");
 }
 
-/** The most lines one file returns in one read; past it the result says
- * where the next page starts. Four hundred is a whole source file most of
- * the time and a bounded page of a long one. */
-export const READ_LINES_CAP = 400;
-/** The most characters of numbered lines one read returns across its files;
- * a file past it comes back as its line count alone, to be read in its own
- * call. The same size as a sql result's budget. */
-export const READ_CHAR_BUDGET = 24_000;
-
-export interface ReadFileResult {
-  path: string;
-  /** The first and last line returned. */
-  from: number;
-  to: number;
-  /** The lines, each numbered with its line in the file. Empty past the
-   * result budget, with `note` saying so. */
-  lines: string;
-  /** The file's last line as the index holds it. */
-  total: number;
-  /** Set when the range asked for goes past the page: where to read next. */
-  more?: { from: number };
-  note?: string;
-}
-export interface ReadFileMiss {
-  path: string;
-  error: string;
-}
-
-/** The lines of the files named, from the index rather than the disk - the
- * same numbered lines a search hit carries, for whole files at once: what
- * a caller does after the index has named the files it wants, in one call
- * rather than one read per file. Chunks are stitched by line number, so a
- * line in two overlapping windows appears once. `from`/`to` cut every file
- * to a line range; a file over READ_LINES_CAP lines comes back a page at a
- * time with `more`. A path the index does not hold is a miss beside the
- * others, never a failure of the call. */
-export async function readFiles(
-  handle: IndexHandle,
-  paths: string[],
-  opts: { from?: number; to?: number } = {},
-): Promise<Array<ReadFileResult | ReadFileMiss>> {
-  const from = Math.max(1, opts.from ?? 1);
-  const to = opts.to ?? Number.MAX_SAFE_INTEGER;
-  if (to < from) throw new Error(`to (${to}) is before from (${from})`);
-  const db = localDb(handle);
-  const files = await Promise.all(
-    paths.map(async (path): Promise<ReadFileResult | ReadFileMiss> => {
-      const rows = db.querySql(
-        `SELECT start_line, ${CONTENT_COLUMN} FROM ${TABLE} WHERE path = ${sqlLiteral(path)} ORDER BY start_line`,
-      ) as Array<Record<string, unknown>>;
-      if (rows.length === 0) return { path, error: "not in the index" };
-      const byLine = new Map<number, string>();
-      for (const row of rows) {
-        const start = Number(row.start_line);
-        String(row[CONTENT_COLUMN] ?? "")
-          .split("\n")
-          .forEach((text, i) => {
-            if (!byLine.has(start + i)) byLine.set(start + i, text);
-          });
-      }
-      const numbers = [...byLine.keys()].sort((a, b) => a - b);
-      const total = numbers[numbers.length - 1];
-      const wanted = numbers.filter((n) => n >= from && n <= to);
-      const page = wanted.slice(0, READ_LINES_CAP);
-      const lines = page.map((n) => `${n}${LINE_NUMBER_SEPARATOR}${byLine.get(n)}`).join("\n");
-      const last = page[page.length - 1] ?? from;
-      return {
-        path,
-        from: page[0] ?? from,
-        to: last,
-        lines,
-        total,
-        ...(wanted.length > page.length ? { more: { from: last + 1 } } : {}),
-      };
-    }),
-  );
-  // Held to the result budget across the files, in order: the first file is
-  // always whole, and a file past the budget keeps its span and count only.
-  let chars = 0;
-  return files.map((f, i) => {
-    if ("error" in f) return f;
-    chars += f.lines.length;
-    if (i === 0 || chars <= READ_CHAR_BUDGET) return f;
-    return { ...f, lines: "", note: "past the result budget - read it in its own call, or a range of it with from and to" };
-  });
-}
-
 export async function runSql(
   handle: IndexHandle,
   embedder: Embedder | null,
@@ -1258,6 +1187,251 @@ export async function runSql(
   if (embedder && placeholderNames(guarded).length > 0) checkQueryEmbedder(handle.manifest, embedder);
   const statement = await applyEmbeds(guarded, embeds, embedder);
   return localDb(handle).querySql(statement) as Array<Record<string, unknown>>;
+}
+
+// --- read: whole files and documents ------------------------------------------
+//
+// The numbered lines of the files the index named, several in one call: what
+// a caller does after find, search or sql have named the files it wants,
+// in place of one Read per file - and, over a hosted table of documents held
+// as passages, in place of paging each document through `sql`. Both kinds of
+// index come down to one map of line number to text per file, which one
+// pager cuts to the ranges asked for, the line cap and the result's budget.
+
+/** The most lines one file returns in one read; past it the result says
+ * where the next page starts. Four hundred is a whole source file most of
+ * the time and a bounded page of a long one. */
+export const READ_LINES_CAP = 400;
+
+/** The most files or documents one read names. */
+export const READ_PATHS_MAX = 16;
+
+/** Stands between two ranges of one file in a read of several: grep's group
+ * separator, as a trimmed find block writes it, so the numbers on either
+ * side say what was left out. */
+const READ_RANGE_GAP = "--";
+
+/** What a file past the result's budget says in place of its lines; its
+ * `more` says where to start, as a page cut short does. */
+const READ_PAST_BUDGET = "past the result budget - read it again from the line more names";
+
+/** One line range of a read, 1-based and inclusive. */
+export interface ReadRange {
+  from: number;
+  to: number;
+}
+
+/** Where the next page of a read starts: the line after the last one
+ * returned, or - for a read of several ranges - the ranges still to come,
+ * the first cut to start after that line, in the same paired form they were
+ * asked for. */
+export type ReadMore = { from: number; to?: number } | { from: number[]; to: number[] };
+
+export interface ReadFileResult {
+  path: string;
+  /** The first and last line returned. */
+  from: number;
+  to: number;
+  /** The lines, each numbered with its line in the file; in a read of
+   * several ranges, READ_RANGE_GAP between two that do not meet. Empty past
+   * the result budget, with `note` saying so. */
+  lines: string;
+  /** The file's last line as the index holds it. */
+  total: number;
+  /** Set when the ranges asked for go past the page: where to read next. */
+  more?: ReadMore;
+  note?: string;
+}
+
+export interface ReadFileMiss {
+  path: string;
+  error: string;
+}
+
+/** The files of a read that came back, without the misses. */
+export function readHits(files: ReadonlyArray<ReadFileResult | ReadFileMiss>): ReadFileResult[] {
+  return files.filter((f): f is ReadFileResult => !("error" in f));
+}
+
+/** One read call's arguments: the paths and where to start them. */
+export interface ReadCall {
+  paths: string[];
+  from: number | number[];
+  to?: number | number[];
+}
+
+/** The read calls that fetch the rest of every file a read cut short - by
+ * the line cap or by the result's budget - one call per distinct `more`, so
+ * files that resume at the same line share a call. Empty when every file
+ * came back whole. Said on the result because `from` applies to every path
+ * of a call: a caller handed several cut documents would otherwise have to
+ * work out the calls itself, and one holding a cut document tends to go back
+ * to paging it through sql. */
+export function readNextCalls(files: ReadonlyArray<ReadFileResult | ReadFileMiss>): ReadCall[] {
+  const calls = new Map<string, ReadCall>();
+  for (const file of readHits(files)) {
+    if (!file.more) continue;
+    const key = JSON.stringify(file.more);
+    const call = calls.get(key);
+    if (call) call.paths.push(file.path);
+    else calls.set(key, { paths: [file.path], ...file.more });
+  }
+  return [...calls.values()];
+}
+
+/** The ranges a read's `from` and `to` name. Plain numbers are one range
+ * (either end left open); lists pair up in order, one range per pair -
+ * `from [559, 1938], to [610, 1975]` is lines 559-610 and 1938-1975 - so the
+ * windows around several places in a file come back in one call - what a
+ * caller writes after a find has named several sites in one file. Undefined
+ * when neither end is given: the whole file. */
+export function readRanges(from: number | number[] | undefined, to: number | number[] | undefined): ReadRange[] | undefined {
+  if (from === undefined && to === undefined) return undefined;
+  if (!Array.isArray(from) && !Array.isArray(to)) {
+    return [{ from: Math.max(1, from ?? 1), to: to ?? Number.MAX_SAFE_INTEGER }];
+  }
+  if (!Array.isArray(from) || !Array.isArray(to) || from.length !== to.length) {
+    throw new Error(
+      "several ranges are lists of the same length in from and to, paired in order: from [10, 200], to [40, 230] " +
+        "reads lines 10-40 and 200-230",
+    );
+  }
+  return from.map((f, i) => ({ from: Math.max(1, f), to: to[i] }));
+}
+
+/** Where a read cut at `last` resumes: the next line, with the same end, for
+ * one range - an end the caller named is kept, so following `more` stops
+ * where the caller asked; for several, every range not yet finished, the
+ * first starting after `last`. */
+function moreAfter(ranges: readonly ReadRange[], last: number): ReadMore {
+  if (ranges.length === 1) {
+    const { to } = ranges[0];
+    return to === Number.MAX_SAFE_INTEGER ? { from: last + 1 } : { from: last + 1, to };
+  }
+  const rest = [...ranges]
+    .sort((a, b) => a.from - b.from)
+    .filter((r) => r.to > last)
+    .map((r) => ({ from: Math.max(r.from, last + 1), to: r.to }));
+  return { from: rest.map((r) => r.from), to: rest.map((r) => r.to) };
+}
+
+/** What every read takes: the ranges to cut each file to (the whole file
+ * when absent) and the bytes the numbered lines of the whole result may take
+ * as the result is sent - JSON-escaped and UTF-8 encoded (`serializedBytes`)
+ * - which the caller, knowing the cap on one tool result, sets. */
+export interface ReadOptions {
+  ranges?: ReadRange[];
+  budget: number;
+}
+
+/** The bytes `text` takes inside a JSON string, UTF-8 encoded: what a line
+ * costs the result it is sent in. Escaping inflates text past its length - a
+ * quote or a backslash doubles, a control character becomes six, a line
+ * break two - and a character past ASCII is two to four bytes, so a page of
+ * 60,000 characters can go out as 64 KB. */
+function serializedBytes(text: string): number {
+  return Buffer.byteLength(JSON.stringify(text)) - JSON_QUOTES_BYTES;
+}
+
+/** The two quotes JSON.stringify puts around a string, which a line inside
+ * the page's one string does not bring with it. */
+const JSON_QUOTES_BYTES = 2;
+
+/** A line break between two lines of a page, as the result sends it: `\n`. */
+const SERIALIZED_LINE_BREAK_BYTES = serializedBytes("\n");
+
+/** The gap marker between two ranges, with the line break before it. */
+const SERIALIZED_GAP_BYTES = serializedBytes(READ_RANGE_GAP) + SERIALIZED_LINE_BREAK_BYTES;
+
+/** Each file's lines, by number, read into pages: the ranges asked for,
+ * merged where they meet, at most READ_LINES_CAP lines a page, and the
+ * budget shared across the files in order - a page ends where its lines
+ * would pass what is left of it, the first file to carry lines carrying at
+ * least one, and a file none of whose lines fit keeps its count and a note. A
+ * page cut short - or not started - names where the next starts (`more`).
+ * `files` holds a null for a path the index does not hold, which comes back
+ * as a miss beside the others, never a failure of the call; a file's `note`,
+ * when it has one, rides on its result. */
+function readPages(
+  files: ReadonlyArray<{ path: string; byLine: Map<number, string> | null; note?: string }>,
+  opts: ReadOptions,
+  missing: string,
+): Array<ReadFileResult | ReadFileMiss> {
+  const ranges = opts.ranges ?? [{ from: 1, to: Number.MAX_SAFE_INTEGER }];
+  for (const r of ranges) {
+    if (r.to < r.from) throw new Error(`to (${r.to}) is before from (${r.from})`);
+  }
+  const several = ranges.length > 1;
+  const first = Math.min(...ranges.map((r) => r.from));
+  let used = 0;
+  // Whether a file has carried lines yet: the first to do so takes its first
+  // line whatever its length, so a read never comes back with nothing.
+  let carried = false;
+  return files.map(({ path, byLine, note }): ReadFileResult | ReadFileMiss => {
+    if (!byLine || byLine.size === 0) return { path, error: missing };
+    const numbers = [...byLine.keys()].sort((a, b) => a - b);
+    const total = numbers[numbers.length - 1];
+    const wanted = numbers.filter((n) => ranges.some((r) => n >= r.from && n <= r.to));
+    const room = opts.budget - used;
+    const numbered: string[] = [];
+    let bytes = 0;
+    let taken = 0;
+    for (const n of wanted) {
+      if (taken === READ_LINES_CAP) break;
+      const line = `${n}${LINE_NUMBER_SEPARATOR}${byLine.get(n)}`;
+      const gap = several && taken > 0 && n !== wanted[taken - 1] + 1;
+      // What the line adds to the page as the result sends it: itself, the
+      // line break before it, and the gap marker's line where a range is
+      // skipped - all as JSON-escaped UTF-8 bytes.
+      const cost = serializedBytes(line) + (taken > 0 ? SERIALIZED_LINE_BREAK_BYTES : 0) + (gap ? SERIALIZED_GAP_BYTES : 0);
+      if ((taken > 0 || carried) && bytes + cost > room) break;
+      if (gap) numbered.push(READ_RANGE_GAP);
+      numbered.push(line);
+      bytes += cost;
+      taken++;
+    }
+    if (taken === 0 && wanted.length > 0) {
+      const notes = [READ_PAST_BUDGET, ...(note ? [note] : [])].join("; ");
+      return { path, from: wanted[0], to: wanted[0], lines: "", total, more: moreAfter(ranges, wanted[0] - 1), note: notes };
+    }
+    used += bytes;
+    if (taken > 0) carried = true;
+    const last = wanted[taken - 1] ?? first;
+    return {
+      path,
+      from: wanted[0] ?? first,
+      to: last,
+      lines: numbered.join("\n"),
+      total,
+      ...(wanted.length > taken ? { more: moreAfter(ranges, last) } : {}),
+      ...(note ? { note } : {}),
+    };
+  });
+}
+
+/** The lines of the files named, from the local index rather than the disk -
+ * the same numbered lines a search hit carries, for whole files at once.
+ * Chunks are stitched by line number, so a line in two overlapping windows
+ * appears once. Paged and budgeted by `readPages`. */
+export async function readFiles(handle: IndexHandle, paths: string[], opts: ReadOptions): Promise<Array<ReadFileResult | ReadFileMiss>> {
+  const db = localDb(handle);
+  const files = paths.map((path) => {
+    const rows = db.querySql(
+      `SELECT start_line, ${CONTENT_COLUMN} FROM ${TABLE} WHERE path = ${sqlLiteral(path)} ORDER BY start_line`,
+    ) as Array<Record<string, unknown>>;
+    if (rows.length === 0) return { path, byLine: null };
+    const byLine = new Map<number, string>();
+    for (const row of rows) {
+      const start = Number(row.start_line);
+      String(row[CONTENT_COLUMN] ?? "")
+        .split("\n")
+        .forEach((text, i) => {
+          if (!byLine.has(start + i)) byLine.set(start + i, text);
+        });
+    }
+    return { path, byLine };
+  });
+  return readPages(files, opts, "not in the index");
 }
 
 // --- rows: the doors over a hosted table of another shape --------------------
@@ -1300,11 +1474,16 @@ export async function searchRows(
   shape: TableShape,
   query: string,
   k = DEFAULT_SEARCH_K,
+  question?: string,
 ): Promise<RowSearchResult> {
   if (shape.primaryText === "") throw new Error(`${shape.table} has no text column to search`);
+  // With the question, the platform's grader orders a wider pool and the
+  // top k come back (ReadChecks).
+  const rerank = question?.trim() ? { question: question.trim(), k } : undefined;
+  const asked = rerank ? ([rerank] as const) : ([] as const);
   const rows = shape.vectorColumn
-    ? await hosted.hybridSearch(shape.table, shape.primaryText, shape.vectorColumn, query, k, shape.projection)
-    : await hosted.bm25Search(shape.table, shape.primaryText, query, k, shape.projection);
+    ? await hosted.hybridSearch(shape.table, shape.primaryText, shape.vectorColumn, query, k, shape.projection, ...asked)
+    : await hosted.bm25Search(shape.table, shape.primaryText, query, k, shape.projection, ...asked);
   return {
     query,
     ranking: shape.vectorColumn ? "hybrid" : "keyword",
@@ -1360,14 +1539,17 @@ export function findRowsSql(shape: TableShape, terms: string, limit: number): st
  * platform's default for a bare column; both analyzers agree on whether a
  * query holds a token at all. */
 export async function findRows(
-  hosted: Pick<HostedDb, "querySql">,
+  hosted: Pick<HostedDb, "querySqlChecked">,
   shape: TableShape,
   query: string,
-  opts: { limit?: number } = {},
+  opts: { limit?: number; question?: string } = {},
 ): Promise<RowFindResult> {
   if (shape.primaryText === "") throw new Error(`${shape.table} has no text column to match in`);
   const limit = checkFindQuery(query, PLATFORM_DEFAULT_ANALYZER, shape.primaryText, opts.limit);
-  const rows = await hosted.querySql(findRowsSql(shape, plainTerms(query), limit));
+  // With the question, the matches come back in the platform grader's
+  // order, every one of them (ReadChecks).
+  const checks = opts.question?.trim() ? { rerank: { question: opts.question.trim() } } : {};
+  const { rows } = await hosted.querySqlChecked(findRowsSql(shape, plainTerms(query), limit), checks);
   const total = rows.length > 0 ? Number(rows[0][FIND_TOTAL_COLUMN]) : 0;
   const matches = rows.map(({ [FIND_TOTAL_COLUMN]: _total, ...row }) => rowHit(row, shape));
   return {
@@ -1379,6 +1561,218 @@ export async function findRows(
     total,
     ...(total > matches.length ? { truncated: true } : {}),
   };
+}
+
+// A document of a table loaded as passages is NOT the rows sharing its path.
+// The load copies a record's columns onto each of its passages except the
+// ones it keeps on the first passage alone - by default every nested column
+// and every long text column not embedded with the passage - and on a table
+// of documents that can be `path` itself: NULL on every passage but
+// `chunk = 0`. A read by `WHERE path IN (...)` then gets one passage a
+// document. Which columns stay on the first passage is not in the load's
+// record, so no column can be trusted to name every passage. What does: the
+// load appends a record's passages together, so passage k sits at the engine
+// id of its first passage plus k - except where a commit boundary fell inside
+// a record, whose rest begins the next commit's block of ids.
+
+/** The engine id as a read selects it: as text, since it is 32 digits and a
+ * number would round it. */
+const READ_ID_ALIAS = "__cx_id";
+/** The ids one round of the walk reads past each document's last passage: a
+ * typical document runs to a few dozen passages, so most are read in one
+ * round. */
+const READ_WALK_WINDOW = 256n;
+/** The rounds of the walk at most, past which a document is returned as far
+ * as it got, with a note: READ_WALK_WINDOW passages a round. */
+const READ_WALK_ROUNDS_MAX = 64;
+
+/** The cells a read selects of a passage beside its id and text. */
+function readCells(shape: TableShape, document: TableDocument): string[] {
+  return [document.textColumn, ...shape.rowColumns.filter((c) => c !== ENGINE_ID_COLUMN && c !== document.textColumn)];
+}
+
+/** The statement that finds each named document's first row: the row whose
+ * path column is the path - and, for a table of passages, whose number is 0,
+ * the one row a load keeps a first-passage-only path on - with every cell,
+ * which the walk matches a passage across a commit boundary against. Paths
+ * travel as SQL string literals, quotes doubled. */
+export function readHeadsSql(shape: TableShape, document: TableDocument, paths: readonly string[]): string {
+  const cells = readCells(shape, document).map(sqlIdentifier).join(", ");
+  return (
+    `SELECT CAST(${ENGINE_ID_COLUMN} AS VARCHAR) AS ${sqlIdentifier(READ_ID_ALIAS)}, ${cells} FROM ${shape.table} ` +
+    `WHERE ${sqlIdentifier(document.pathColumn)} IN (${paths.map(sqlLiteral).join(", ")})` +
+    (document.orderColumn ? ` AND ${sqlIdentifier(document.orderColumn)} = 0` : "")
+  );
+}
+
+/** The statement one round of the walk runs: the id, number and text of the
+ * rows in each id range, every document's in one statement. */
+export function readWindowSql(shape: TableShape, document: TableDocument, windows: ReadonlyArray<readonly [bigint, bigint]>): string {
+  const ranges = windows.map(([low, high]) => `(${ENGINE_ID_COLUMN} BETWEEN '${low}' AND '${high}')`).join(" OR ");
+  return (
+    `SELECT CAST(${ENGINE_ID_COLUMN} AS VARCHAR) AS ${sqlIdentifier(READ_ID_ALIAS)}, ` +
+    `${sqlIdentifier(document.orderColumn!)}, ${sqlIdentifier(document.textColumn)} FROM ${shape.table} WHERE ${ranges}`
+  );
+}
+
+/** The statement that finds where a document goes on past a commit
+ * boundary: the rows numbered one of `numbers` that begin a block of ids -
+ * no row holds the id before theirs - with every cell, for the walk to match
+ * against the document's first row. Only the candidates' predecessors are
+ * looked up - the rows whose id is one less than a candidate's - so the
+ * statement reads the rows numbered as asked and those ids, never the
+ * table joined against itself. */
+export function readContinuationSql(shape: TableShape, document: TableDocument, numbers: readonly number[]): string {
+  const cells = readCells(shape, document).map((c) => `a.${sqlIdentifier(c)}`).join(", ");
+  const numbered = `${sqlIdentifier(document.orderColumn!)} IN (${[...new Set(numbers)].join(", ")})`;
+  const id = ENGINE_ID_COLUMN;
+  return (
+    `SELECT CAST(a.${id} AS VARCHAR) AS ${sqlIdentifier(READ_ID_ALIAS)}, ${cells} FROM ${shape.table} a ` +
+    `WHERE a.${numbered} AND a.${id} NOT IN (` +
+    `SELECT ${id} + 1 FROM ${shape.table} WHERE ${id} IN (SELECT ${id} - 1 FROM ${shape.table} WHERE ${numbered}))`
+  );
+}
+
+/** Whether `row` is a passage of the document `head` begins: every cell the
+ * passage carries - its id, number and text aside - is a copy of the
+ * head's, since a load leaves a first-passage-only column empty on the rest
+ * and copies every other. At least one cell must be compared, or nothing
+ * ties the row to the head. */
+function passageOf(row: RowRecord, head: RowRecord, document: TableDocument): boolean {
+  let compared = 0;
+  for (const [name, value] of Object.entries(row)) {
+    if (name === READ_ID_ALIAS || name === document.orderColumn || name === document.textColumn) continue;
+    if (value === null || value === undefined) continue;
+    if (jsonify(value) !== jsonify(head[name])) return false;
+    compared++;
+  }
+  return compared > 0;
+}
+
+/** A row's text cell, or "" when it has none. */
+function passageText(row: RowRecord, document: TableDocument): string {
+  const cell = row[document.textColumn];
+  return typeof cell === "string" ? cell : "";
+}
+
+/** One document's walk: its first row, the passages read so far, the id of
+ * the last, the number the next must carry, and why it stopped. */
+interface Walk {
+  head: RowRecord;
+  texts: string[];
+  last: bigint;
+  next: number;
+  done: boolean;
+  note?: string;
+}
+
+/** Every passage of each document `heads` begin, in order: the rows at the
+ * ids after the first passage's, numbered 1, 2, ... without a break, read a
+ * window a round for every open document in one statement; where a block of
+ * ids ends under a document (a commit boundary), the one row that begins a
+ * block, carries the next number and copies the head's cells (`passageOf`)
+ * - found for every such document in one statement - and the walk goes on
+ * from it. A document ends at a row of another number (the next record's
+ * first passage), or at a block's end that nothing continues. More than one
+ * row that could continue it is not guessed between: the document ends
+ * there, with a note. */
+async function walkPassages(
+  hosted: Pick<HostedDb, "querySql">,
+  shape: TableShape,
+  document: TableDocument,
+  heads: readonly RowRecord[],
+): Promise<Walk[]> {
+  const walks: Walk[] = heads.map((head) => ({
+    head,
+    texts: [passageText(head, document)],
+    last: BigInt(String(head[READ_ID_ALIAS])),
+    next: 1,
+    done: false,
+  }));
+  const order = document.orderColumn!;
+  for (let round = 0; round < READ_WALK_ROUNDS_MAX; round++) {
+    const open = walks.filter((w) => !w.done);
+    if (open.length === 0) return walks;
+    const windows = open.map((w) => [w.last + 1n, w.last + READ_WALK_WINDOW] as const);
+    const byId = new Map<bigint, RowRecord>();
+    for (const row of await hosted.querySql(readWindowSql(shape, document, windows))) byId.set(BigInt(String(row[READ_ID_ALIAS])), row);
+    const boundaries: Walk[] = [];
+    open.forEach((walk, i) => {
+      const end = windows[i][1];
+      while (walk.last < end) {
+        const row = byId.get(walk.last + 1n);
+        if (!row) {
+          // No row holds the next id: a block of ids ends here.
+          boundaries.push(walk);
+          return;
+        }
+        if (Number(row[order]) !== walk.next) {
+          walk.done = true;
+          return;
+        }
+        walk.texts.push(passageText(row, document));
+        walk.last += 1n;
+        walk.next += 1;
+      }
+    });
+    if (boundaries.length === 0) continue;
+    const candidates = await hosted.querySql(readContinuationSql(shape, document, boundaries.map((w) => w.next)));
+    for (const walk of boundaries) {
+      const found = candidates.filter((row) => Number(row[order]) === walk.next && passageOf(row, walk.head, document));
+      if (found.length !== 1) {
+        walk.done = true;
+        if (found.length > 1) {
+          walk.note = `its passages from ${order} ${walk.next} on could not be told from another document's, so it ends there`;
+        }
+        continue;
+      }
+      walk.texts.push(passageText(found[0], document));
+      walk.last = BigInt(String(found[0][READ_ID_ALIAS]));
+      walk.next += 1;
+    }
+  }
+  for (const walk of walks.filter((w) => !w.done)) {
+    walk.note = `read to ${order} ${walk.next - 1}, past which this read does not follow a document`;
+  }
+  return walks;
+}
+
+/** `read` over a hosted table of documents (`TableShape.document`): each
+ * named document's first row by the table's own path column, then - for a
+ * table of passages - every passage after it (`walkPassages`), joined in
+ * order, a passage to a line break, into the document's text, numbered by
+ * line from 1 and paged as a file of the local index is (`readPages`). Each
+ * statement serves every document named. The document is read whole and cut
+ * to its page here, since where a line falls among the passages is known
+ * only once they are joined. */
+export async function readRows(
+  hosted: Pick<HostedDb, "querySql">,
+  shape: TableShape,
+  paths: string[],
+  opts: ReadOptions,
+): Promise<Array<ReadFileResult | ReadFileMiss>> {
+  const document = shape.document;
+  if (!document) throw new Error(`${shape.table} has no path column naming a document: read its rows with sql by ${shape.keyColumn}`);
+  const heads = (await hosted.querySql(readHeadsSql(shape, document, paths))).sort((a, b) =>
+    BigInt(String(a[READ_ID_ALIAS])) < BigInt(String(b[READ_ID_ALIAS])) ? -1 : 1,
+  );
+  // A table of records: a document is its row (or rows), in the order of
+  // their ids. A table of passages: each first passage's walk.
+  const pieces = document.orderColumn
+    ? (await walkPassages(hosted, shape, document, heads)).map((walk) => ({ row: walk.head, text: walk.texts.join("\n"), note: walk.note }))
+    : heads.map((row) => ({ row, text: passageText(row, document), note: undefined }));
+  const files = paths.map((path) => {
+    const mine = pieces.filter((piece) => String(piece.row[document.pathColumn] ?? "") === path);
+    if (mine.length === 0) return { path, byLine: null };
+    const text = mine.map((piece) => piece.text).join("\n");
+    const notes = mine.map((piece) => piece.note).filter((n): n is string => n !== undefined);
+    return {
+      path,
+      byLine: new Map(text.split("\n").map((line, i) => [i + 1, line] as const)),
+      ...(notes.length > 0 ? { note: notes.join("; ") } : {}),
+    };
+  });
+  return readPages(files, opts, `not in ${shape.table}`);
 }
 
 /** `sql` with every `{{name}}` placeholder the caller supplied embed text
@@ -1407,9 +1801,10 @@ export function foldEmbeds(sql: string, embeds: Record<string, string> | undefin
  * statement runs on the platform with its placeholders folded into the form
  * the platform embeds. */
 export async function runSqlRows(
-  hosted: Pick<HostedDb, "querySql">,
+  hosted: Pick<HostedDb, "querySqlChecked">,
   sql: string,
   embeds?: Record<string, string>,
-): Promise<RowRecord[]> {
-  return hosted.querySql(foldEmbeds(guardSql(sql), embeds));
+  checks: ReadChecks = {},
+): Promise<CheckedRows> {
+  return hosted.querySqlChecked(foldEmbeds(guardSql(sql), embeds), checks);
 }

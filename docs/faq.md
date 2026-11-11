@@ -2,16 +2,14 @@
 
 ### What is SuperGrep?
 
-Retrieval + inference offload for AI coding agents: four tools over an index
+Retrieval + inference offload for AI coding agents: three tools over an index
 kept in two places. `find` and plain `sql` run on your machine, over a keyword index that
 lives in plain files inside your repo. Anything with meaning in it - `search`,
-a `sql` statement with a ranked search inside it, and `ask` - runs in the
+and a `sql` statement with a ranked search inside it - runs in the
 Infino cloud over the same index's platform copy, where every embedding is
-computed, so the heavy compute stays off your laptop. `ask` hands the
-question to small models on the Infino service, which work the index at
-once and return the rows they found. Either way the point is the same: an
-agent answers questions about
-the codebase, or delegates its exploration, without reading it file by file.
+computed, so the heavy compute stays off your laptop. Either way the point is
+the same: an agent answers questions about the codebase without reading it
+file by file.
 The package, the CLI (`cx`) and the MCP server are still named
 `code-context`.
 
@@ -30,27 +28,24 @@ Not unless you ask it to. Without an account there is no key and no upload:
 `find` and plain `sql` run offline over the keyword index. The opt-in is an
 account (`cx login --platform`, which asks you first; or `--db`, next
 question), which keeps each directory's index in a database you own on the
-Infino platform; that is where embeddings are computed and where `search`,
-semantic `sql` and `ask` run. A directory is uploaded the first time you use
+Infino platform; that is where embeddings are computed and where `search`
+and semantic `sql` run. A directory is uploaded the first time you use
 one of those in it, never before.
 
 ### Can the index also live on the Infino platform?
 
-Yes, and it is the same index. Signed in, the first `search` or `ask` in a
+Yes, and it is the same index. Signed in, the first `search` in a
 directory sets this up; by hand,
 `cx index --db https://host/<database> --api-key-file <path>` builds the
 local index exactly as without the flag and then loads the same chunks into
 that database. Every sync after it (the explicit `cx index`, or the MCP
 server's auto-sync as queries arrive) applies the same diff to both, so the
 two never drift. `find` and plain `sql` keep reading the local index;
-`search`, a `sql` statement with a ranked search in it, and `ask` run on the
-platform copy, where the embeddings are computed. `ask` hands a question or
-task to small models on the service and returns the rows they retrieved -
-exact `path:line` places with the code, plus counts and rankings - for the
-coding agent to compose from, never a written summary. By default the
+`search`, and a `sql` statement with a ranked search in it, run on the
+platform copy, where the embeddings are computed. By default the
 platform embeds its copy with its own model. Every platform setting is a
 command-line flag on `cx index` and `cx mcp` (`--db`, `--api-key-file`,
-`--embed-provider`, `--analyzer`, the timeouts, the tool caps); the key
+`--embed-provider`, `--analyzer`, the timeouts); the key
 comes from a file or from `INFINO_API_KEY`, never from the command line.
 [The reference's flag table](reference.md#platform-flags) has every one.
 
@@ -76,9 +71,7 @@ are done.
 For `find`, `search` and `sql`, yes: each takes an optional `path` (an
 absolute repo root); omit it to use the server's startup root, or pass it to
 target a specific repo when a session spans several, each with its own index
-in its own `.infino/`. `ask` is scoped to the one platform
-database the server was started with, since that database holds one
-repository's index; it refuses a `path` naming a different one.
+in its own `.infino/`.
 
 ### Where does the index live, and can I share it?
 
@@ -114,23 +107,19 @@ full coverage.
 
 ### What tools does the MCP server expose?
 
-Four, one per question: `find` (every line containing an exact string, cited
+Three, one per question: `find` (every line containing an exact string, cited
 `path:line` like `grep -n`; complete and unranked, the grep replacement),
 `search` (hybrid keyword + semantic retrieval, one ranked pass, hits carry
-chunk content with `path:line` ranges), `sql` (read-only `SELECT`/`WITH`
+chunk content with `path:line` ranges) and `sql` (read-only `SELECT`/`WITH`
 over the index, with the ranked search functions usable as table-valued
-relations so search composes with `GROUP BY`) and `ask` (a question that
-spans the repository, answered as the rows the service retrieved rather than
-as prose). `find` and plain `sql` run on your machine with no account;
-`search`, a `sql` with a ranked search in it, and `ask` run in the cloud over
-the same index's platform copy.
+relations so search composes with `GROUP BY`). `find` and plain `sql` run on
+your machine with no account; `search`, and a `sql` with a ranked search in
+it, run in the cloud over the same index's platform copy.
 
 Every near-duplicate retrieval tool worsens an agent's tool selection, so
-each of the four earns its place by answering a question none of the others
+each of the three earns its place by answering a question none of the others
 does: `find` and `search` are not duplicates, one is complete and unranked,
-the other ranked and top-k; `ask` is not a flavour of either, it hands the
-whole question to small models that query the index themselves. Beside the
-four, `read` returns the numbered lines of files the index has named,
+the other ranked and top-k. Beside the three, `read` returns the numbered lines of files the index has named,
 several files in one call, so an agent opens what it needs to quote without
 one read per file. There is no reindex tool: the first query builds the
 index, every query re-syncs it, and `cx index --full` rebuilds from a shell.

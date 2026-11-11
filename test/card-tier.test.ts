@@ -95,21 +95,6 @@ describe("cardMeanings", () => {
     ).toBe('One row = one Czech district. Columns - a1 (district_id): District identifier; a12: Unemployment rate in 1995, codes: "?" = missing value.');
   });
 
-  it("says the JSON field a column was measured to hold, and the one named like it that it does not", () => {
-    expect(
-      cardMeanings({
-        schema: [
-          { name: "id" },
-          {
-            name: "lastvisit",
-            equals_field: "metadata.auto.lastupdated",
-            differs_from_field: "metadata.auto.lastvisit",
-          },
-        ],
-      }),
-    ).toBe("Columns - lastvisit: equals_field: metadata.auto.lastupdated, differs_from_field: metadata.auto.lastvisit.");
-  });
-
   it("is empty for a card that says nothing of what its table means", () => {
     expect(cardMeanings(undefined)).toBe("");
     expect(cardMeanings({ schema: [{ name: "n", min: "0", max: "9" }] })).toBe("");

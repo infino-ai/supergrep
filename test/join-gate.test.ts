@@ -6,7 +6,7 @@
 // round, and the verdict - run, or refuse with the keys.
 
 import { describe, expect, it } from "vitest";
-import { aliasesOf, joinGate, joinRefusal, predicateHolds, tablesNamed, type PlatformJoin } from "../src/core/join-gate.js";
+import { aliasesOf, joinGate, joinRefusal, joinsTables, predicateHolds, tablesNamed, withoutGraphCalls, type PlatformJoin } from "../src/core/join-gate.js";
 
 const TABLES = ["chunks", "swe_issues", "chunks_swelogs"];
 const BY_ID: PlatformJoin = { from_table: "chunks_swelogs", to_table: "swe_issues", predicate: "chunks_swelogs.instance_id = swe_issues.instance_id" };
@@ -76,5 +76,43 @@ describe("joinGate", () => {
     const k = keys([]);
     const v = await joinGate("SELECT 1 FROM chunks c JOIN chunks_swelogs l ON c.path = l.path", TABLES, k.fetch);
     expect(v).toEqual({ kind: "run", tables: ["chunks", "chunks_swelogs"], keysAsked: true });
+  });
+
+  it("holds only a statement that joins tables to a key; queries side by side run as written", async () => {
+    const joined = [
+      "SELECT 1 FROM swe_issues i JOIN chunks_swelogs l ON i.project = l.path",
+      "SELECT 1 FROM swe_issues i, chunks_swelogs l WHERE i.project = l.path",
+      "SELECT i.instance_id FROM swe_issues i WHERE i.instance_id IN (SELECT instance_id FROM chunks_swelogs)",
+      "SELECT * FROM swe_issues i WHERE EXISTS (SELECT 1 FROM chunks_swelogs l WHERE l.instance_id = i.instance_id)",
+      "WITH a AS (SELECT project FROM swe_issues), b AS (SELECT path FROM chunks_swelogs) SELECT * FROM a JOIN b ON a.project = b.path",
+      "SELECT count(*) FROM swe_issues UNION ALL SELECT count(*) FROM chunks c JOIN chunks_swelogs l ON c.path = l.path",
+    ];
+    for (const q of joined) expect(joinsTables(q, TABLES), q).toBe(true);
+    const sideBySide = [
+      "SELECT 'issues' AS t, count(*) FROM swe_issues UNION ALL SELECT 'logs', count(*) FROM chunks_swelogs",
+      "SELECT count(*) FROM swe_issues INTERSECT SELECT count(*) FROM chunks_swelogs",
+      "SELECT (SELECT count(*) FROM swe_issues) AS issues, (SELECT count(*) FROM chunks_swelogs) AS logs",
+      "WITH a AS (SELECT count(*) n FROM swe_issues), b AS (SELECT count(*) n FROM chunks_swelogs) SELECT n FROM a UNION ALL SELECT n FROM b",
+      "SELECT 'a,b' FROM swe_issues UNION SELECT '(select 1 from chunks)' FROM chunks_swelogs",
+    ];
+    for (const q of sideBySide) expect(joinsTables(q, TABLES), q).toBe(false);
+    // A UNION of two tables' counts runs without asking for keys at all.
+    const k = keys([BY_ID]);
+    const v = await joinGate(sideBySide[0], TABLES, k.fetch);
+    expect(v).toEqual({ kind: "run", tables: ["swe_issues", "chunks_swelogs"], keysAsked: false });
+    expect(k.asked).toEqual([]);
+  });
+
+  it("lets a graph walk through: the tables it names are its arguments, not a join to hold to a key", async () => {
+    const walk = "SELECT instance_id, score FROM graph_walk('swe_issues', 'chunks_swelogs', [42, 43], 2, 50) ORDER BY score";
+    expect(withoutGraphCalls(walk)).not.toContain("swe_issues");
+    const k = keys([BY_ID]);
+    expect(await joinGate(walk, TABLES, k.fetch)).toEqual({ kind: "run", tables: [], keysAsked: false });
+    expect(k.asked).toEqual([]);
+    // A walk JOINed to a third table is still held to that join's key.
+    const joined = "SELECT c.path FROM graph_rank('swe_issues', 'chunks_swelogs', [42], 2, 20) g JOIN chunks c ON split_part(c.path, '/', 1) = g.project";
+    const held = await joinGate(joined, TABLES, keys([BY_PREFIX]).fetch);
+    expect(held.kind).toBe("run");
+    expect(held.tables).toEqual(["chunks"]);
   });
 });

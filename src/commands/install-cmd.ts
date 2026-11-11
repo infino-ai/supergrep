@@ -47,12 +47,11 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { bold, dim, green, yellow } from "../core/output.js";
-import { API_KEY_ENV } from "../core/config.js";
+import { API_KEY_ENV, MEMORY_ENV, MEMORY_ON } from "../core/config.js";
 import { HostedError } from "../core/hosted.js";
 import { createDatabase, databaseNameFor, requestTrial, type Trial } from "../core/account-api.js";
 import { readStoredAccount, readStoredKey, writeStoredAccount, writeStoredKey } from "../core/keystore.js";
 import { askUploadConsent, hasUploadConsent, recordUploadConsent, type ConsentDeps, type ConsentOutcome } from "../core/consent.js";
-import { ANSWER_DISPLAY_CHUNKS, ANSWER_DISPLAY_ENV, ANSWER_DISPLAY_HOOK } from "../core/answer-display.js";
 import { signInHint } from "./login-cmd.js";
 
 /** Package this command installs, and the pinned spelling `npx` resolves. */
@@ -70,26 +69,56 @@ const PROJECT_CONFIG = ".mcp.json";
  * Code's, and another client's `--config` has no use for them. */
 const PROJECT_SETTINGS = join(".claude", "settings.json");
 
-/** The hook event that shows the `answer` tool's result to the person. */
+/** The event of an earlier version's hooks on the `answer` tool's result
+ * and on the retrieval tools' (`answer`, `answer-due`): none is written now,
+ * and an install takes out any it finds. */
 const ANSWER_HOOK_EVENT = "PostToolUse";
-/** The event of the hook that fills the `answer` call's narration from the
- * session transcript before the tool runs (`cx hook answer-input`). */
+/** The event of an earlier version's `answer-input` hook, taken out the same
+ * way. */
 const ANSWER_INPUT_HOOK_EVENT = "PreToolUse";
-/** The event of the hook that sends a model back for the `answer` call when
- * it retrieved through the server and stopped without one (`cx hook
- * answer-stop`). A Stop entry has no matcher: it runs on every stop and
- * decides from the transcript. */
+/** The event of the Stop hooks the install writes (`answer-figures`,
+ * `memory`). A Stop entry has no matcher: it runs on every stop and decides
+ * from the transcript. */
 const ANSWER_STOP_HOOK_EVENT = "Stop";
-/** Every event our hook entries live under. The due entry shares
- * PostToolUse with the chunk entries and is told apart by its matcher. */
+/** Every event our hook entries live, or once lived, under. */
 const ANSWER_HOOK_EVENTS = [ANSWER_HOOK_EVENT, ANSWER_INPUT_HOOK_EVENT, ANSWER_STOP_HOOK_EVENT];
-/** The `hook` subcommand's arguments for the Stop entry. */
+/** The `hook` subcommand's arguments for an earlier version's answer-stop
+ * entry, recognised to take it out. */
 const STOP_HOOK_ARGS = ["answer-stop"];
-/** The `hook` subcommand's arguments for the retrieval entry. */
+/** The `hook` subcommand's arguments for an earlier version's retrieval
+ * entry, recognised to take it out. */
 const DUE_HOOK_ARGS = ["answer-due"];
-/** What our Stop entry's command ends in, and no other entry's: how the
- * matcher-less entry is recognised as ours in a settings file. */
-const STOP_HOOK_COMMAND_TAIL = ` hook ${STOP_HOOK_ARGS.join(" ")}`;
+/** The `hook` subcommand's arguments for the figures Stop entry. */
+const FIGURES_HOOK_ARGS = ["answer-figures"];
+/** The `hook` subcommand's arguments for the memory Stop entry, before the
+ * server it belongs to and the platform flags it carries. */
+const MEMORY_HOOK_ARGS = ["memory"];
+/** The flag naming the server a Stop entry belongs to. */
+const SERVER_FLAG = "--server";
+/** What a Stop entry from before the entries named their server ends in:
+ * claimed by every install, so the next install replaces it with its own. */
+const LEGACY_STOP_TAILS = [STOP_HOOK_ARGS, FIGURES_HOOK_ARGS].map((args) => ` hook ${args.join(" ")}`);
+
+/** A word as the shell reads it back: quoted only when it holds a character
+ * the shell would act on. */
+const shellQuote = (s: string) => (/[\s"'\\$`]/.test(s) ? `'${s.replace(/'/g, `'\\''`)}'` : s);
+/** A literal for a regular expression. */
+const regexLiteral = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** How server `name`'s Stop entries running one of `events` are
+ * recognised: each runs `hook <event> --server <name>`, so two servers
+ * installed in one project keep their own. The memory entry carries its
+ * server's database, and memory waits on the answer-stop and figures entries
+ * (commands/hook-cmd.ts `memoryRows`), so an install or uninstall of one
+ * server must never remove another's. */
+const stopHookCommand = (name: string, events: string[][] = [STOP_HOOK_ARGS, FIGURES_HOOK_ARGS, MEMORY_HOOK_ARGS]) =>
+  new RegExp(` hook (${events.map((a) => regexLiteral(a.join(" "))).join("|")}) ${SERVER_FLAG} ${regexLiteral(shellQuote(name))}(\\s|$)`);
+
+/** The characters a server's name may hold: what Claude Code keeps of a
+ * name in its tools' names (`mcp__<server>__<tool>`), any other becoming
+ * `_` there. A name outside it would leave the hooks matching tools that
+ * never exist. */
+const SERVER_NAME = /^[A-Za-z0-9_-]+$/;
 /** What our retrieval entry's command ends in: the retrieval matcher names
  * tools a person may have their own hooks on, so the command decides
  * ownership there as well as the matcher. */
@@ -168,10 +197,10 @@ export interface InstallCmdOptions {
   /** The platform a first install asks for a free account, when this machine
    * has none. Overrides CX_PLATFORM_URL. */
   platform?: string;
-  /** Internal: the entry is written beside the answer-display hooks, so it
-   * tells the server to deliver answers through them. Decided by `installCmd`
-   * from the target config and the platform half, never a flag. */
-  answerHook?: boolean;
+  /** Internal: the entry is written beside the Stop hooks, the memory one
+   * among them, so it tells the server to recall memory. Decided by
+   * `installCmd` from the target config and the platform half, never a flag. */
+  withHooks?: boolean;
 }
 
 /** Injected for tests: the platform, and the person at the terminal. */
@@ -192,8 +221,8 @@ interface ServerEntry {
   command: string;
   args: string[];
   alwaysLoad?: boolean;
-  /** Set when the answer-display hooks are written too: the server then
-   * delivers a written answer through them (core/answer-display.ts). */
+  /** Set when the Stop hooks are written too: the server then recalls the
+   * memory the memory hook writes (core/memory.ts). */
   env?: Record<string, string>;
 }
 
@@ -411,7 +440,8 @@ function runningFromPackage(): boolean {
  * fetched, or an installed copy being used to write an entry for a checkout. */
 export function serverEntry(opts: InstallCmdOptions, version: string): ServerEntry {
   const tail = ["mcp", ...platformArgs(opts)];
-  const env = opts.answerHook ? { env: { [ANSWER_DISPLAY_ENV]: ANSWER_DISPLAY_HOOK } } : {};
+  // The hooks bring memory too (`memoryHookEntry`), so the server recalls it.
+  const env = opts.withHooks ? { env: { [MEMORY_ENV]: MEMORY_ON } } : {};
   const [command, head] = commandFor(opts, version);
   return { command, args: [...head, ...tail], alwaysLoad: true, ...env };
 }
@@ -432,13 +462,12 @@ export function answerHookMatcher(name: string): string {
   return `mcp__${name}__answer`;
 }
 
-/** The retrieval tools this server offers, as the `answer-due` matcher names
- * them. `ask` is registered only with a platform database; a matcher naming a
- * tool that is not registered simply never fires. */
+/** The retrieval tools as an earlier version's `answer-due` matcher named
+ * them, so the entry it wrote is recognised and taken out. */
 const RETRIEVAL_TOOLS = ["ask", "search", "find", "sql"];
 
-/** The matcher of the `answer-due` entry: the four retrieval tools and not
- * `answer`. Claude Code reads a matcher holding characters outside
+/** The matcher of an earlier version's `answer-due` entry: the four retrieval
+ * tools and not `answer`. Claude Code reads a matcher holding characters outside
  * `[A-Za-z0-9_\- ,|]` as a JavaScript regular expression tested against the
  * tool name, so the parentheses make this one a regex; `answer` does not
  * match any alternative in the group, which is what keeps the note off the
@@ -447,56 +476,32 @@ export function retrievalHookMatcher(name: string): string {
   return `mcp__${name}__(${RETRIEVAL_TOOLS.join("|")})`;
 }
 
-/** The hook entries that show a written answer to the person: one per
- * chunk, each running `cx hook answer --chunk i --chunks n` on the tool's
- * result (see core/answer-display.ts for why chunks, and commands/hook-cmd.ts
- * for what each prints). Written to Claude Code's project settings beside
- * the server entry when the platform half enabled `ask`. */
-export function answerHookEntries(opts: InstallCmdOptions, version: string, name: string): HookEntry[] {
-  const entries: HookEntry[] = [];
-  for (let chunk = 1; chunk <= ANSWER_DISPLAY_CHUNKS; chunk++) {
-    entries.push(hookEntry(opts, version, name, ["answer", "--chunk", String(chunk), "--chunks", String(ANSWER_DISPLAY_CHUNKS)]));
-  }
-  return entries;
-}
-
-/** The hook entry that hands the `answer` tool what the model said while it
- * worked: `cx hook answer-input`, run before the tool with the session's
- * transcript path in its event, filling the call's narration through the
- * hook's `updatedInput` (commands/hook-cmd.ts). The model itself types
- * nothing for the writer. */
-export function answerInputHookEntry(opts: InstallCmdOptions, version: string, name: string): HookEntry {
-  return hookEntry(opts, version, name, ["answer-input"]);
-}
-
-/** The Stop hook entry: `cx hook answer-stop`, run on every stop, sending
- * the model back for the `answer` call when it retrieved through the server
- * and wrote the answer itself instead (commands/hook-cmd.ts). A Stop entry
- * carries no matcher, the shape Claude Code documents for the event; what
- * marks it as ours on a re-run or an uninstall is its command, which ends in
- * the `hook answer-stop` the other entries never run. */
-export function answerStopHookEntry(opts: InstallCmdOptions, version: string, name: string): HookEntry {
-  const { hooks } = hookEntry(opts, version, name, STOP_HOOK_ARGS);
+/** The figures Stop entry: `cx hook answer-figures --server <name>`, run on
+ * every stop, sending the model back once to compute with `sql` any figure
+ * of its final answer that no tool result holds (commands/hook-cmd.ts).
+ * Matcher-less like the answer Stop entry, and the server's by its command
+ * (`stopHookCommand`). */
+export function answerFiguresHookEntry(opts: InstallCmdOptions, version: string, name: string): HookEntry {
+  const { hooks } = hookEntry(opts, version, name, [...FIGURES_HOOK_ARGS, SERVER_FLAG, name]);
   return { hooks };
 }
 
-/** The entry that puts the rule beside the rows: `cx hook answer-due`, run
- * after each RETRIEVAL tool returns, adding one sentence to the model's
- * context through the event's `additionalContext` (commands/hook-cmd.ts).
- * The Stop entry catches a model that skipped the `answer` call; this one is
- * for the model that makes the call and writes its own answer first anyway,
- * which is the commoner fault and the expensive one. */
-export function answerDueHookEntry(opts: InstallCmdOptions, version: string, name: string): HookEntry {
-  const { hooks } = hookEntry(opts, version, name, DUE_HOOK_ARGS);
-  return { matcher: retrievalHookMatcher(name), hooks };
+/** The memory Stop entry: `cx hook memory --server <name>` with the
+ * platform flags, run on every stop, writing the turn's question, final
+ * answer and the files the model wrote to the database's memory
+ * (commands/hook-cmd.ts, core/memory.ts). It carries the flags because it is
+ * the one hook that talks to the platform. Matcher-less like the other Stop
+ * entries, and the server's by its command (`stopHookCommand`). */
+export function memoryHookEntry(opts: InstallCmdOptions, version: string, name: string): HookEntry {
+  const { hooks } = hookEntry(opts, version, name, [...MEMORY_HOOK_ARGS, SERVER_FLAG, name, ...platformArgs(opts)]);
+  return { hooks };
 }
 
 /** One hook entry running this package's `hook` command with `args`, on the
  * `answer` tool. */
 function hookEntry(opts: InstallCmdOptions, version: string, name: string, args: string[]): HookEntry {
   const [command, head] = commandFor(opts, version);
-  const quote = (s: string) => (/[\s"'\\$`]/.test(s) ? `'${s.replace(/'/g, `'\\''`)}'` : s);
-  const line = [command, ...head, "hook", ...args].map(quote).join(" ");
+  const line = [command, ...head, "hook", ...args].map(shellQuote).join(" ");
   return { matcher: answerHookMatcher(name), hooks: [{ type: "command", command: line }] };
 }
 
@@ -512,21 +517,49 @@ function isAnswerHookEntry(entry: unknown, name: string): boolean {
   if (matcher === retrievalHookMatcher(name)) {
     return Array.isArray(hooks) && hooks.length > 0 && hooks.every((h) => h && typeof h === "object" && typeof (h as { command?: unknown }).command === "string" && (h as { command: string }).command.endsWith(DUE_HOOK_COMMAND_TAIL));
   }
-  if (matcher !== undefined || !Array.isArray(hooks) || !hooks.length) return false;
-  return hooks.every((h) => h && typeof h === "object" && typeof (h as { command?: unknown }).command === "string" && (h as { command: string }).command.endsWith(STOP_HOOK_COMMAND_TAIL));
+  return isStopEntryWhere(entry, (command) => stopHookCommand(name).test(command) || LEGACY_STOP_TAILS.some((tail) => command.endsWith(tail)));
 }
+
+/** Whether `entry` is a matcher-less Stop entry every command of which
+ * passes `ours`. */
+function isStopEntryWhere(entry: unknown, ours: (command: string) => boolean): boolean {
+  if (!entry || typeof entry !== "object") return false;
+  const { matcher, hooks } = entry as { matcher?: unknown; hooks?: unknown };
+  if (matcher !== undefined || !Array.isArray(hooks) || !hooks.length) return false;
+  return hooks.every((h) => h && typeof h === "object" && typeof (h as { command?: unknown }).command === "string" && ours((h as { command: string }).command));
+}
+
+/** An answer-stop or figures Stop entry an earlier version wrote, shared by
+ * every server it served (`LEGACY_STOP_TAILS`). */
+const isLegacyStopEntry = (entry: unknown) => isStopEntryWhere(entry, (command) => LEGACY_STOP_TAILS.some((tail) => command.endsWith(tail)));
+
+/** The servers other than `name` the settings hold answer hooks for: each
+ * one's `mcp__<server>__answer` entries. */
+function otherAnswerServers(events: Record<string, unknown>, name: string): string[] {
+  const list = events[ANSWER_HOOK_EVENT];
+  if (!Array.isArray(list)) return [];
+  const servers = new Set<string>();
+  for (const entry of list) {
+    const matcher = entry && typeof entry === "object" ? (entry as { matcher?: unknown }).matcher : undefined;
+    const server = typeof matcher === "string" ? ANSWER_MATCHER.exec(matcher)?.[1] : undefined;
+    if (server !== undefined && server !== name) servers.add(server);
+  }
+  return [...servers];
+}
+
+/** An answer-tool matcher (`answerHookMatcher`), the server's name captured. */
+const ANSWER_MATCHER = /^mcp__(.+)__answer$/;
 
 /** Our hook entries by event, as the install writes them; empty when the
  * install writes none. */
 export type AnswerHooks = Record<string, HookEntry[]>;
 
-/** The hook entries the install writes beside a platform entry: the chunk
- * hooks that show the answer, and the one that fills its narration. */
+/** The hook entries the install writes beside a platform entry: the
+ * figures Stop entry and memory's. `opts.db` is the database the install
+ * resolved, which the memory entry writes to. */
 export function answerHooks(opts: InstallCmdOptions, version: string, name: string): AnswerHooks {
   return {
-    [ANSWER_HOOK_EVENT]: [...answerHookEntries(opts, version, name), answerDueHookEntry(opts, version, name)],
-    [ANSWER_INPUT_HOOK_EVENT]: [answerInputHookEntry(opts, version, name)],
-    [ANSWER_STOP_HOOK_EVENT]: [answerStopHookEntry(opts, version, name)],
+    [ANSWER_STOP_HOOK_EVENT]: [answerFiguresHookEntry(opts, version, name), memoryHookEntry(opts, version, name)],
   };
 }
 
@@ -538,8 +571,19 @@ export function answerHookCount(hooks: AnswerHooks): number {
 /** The settings' hook lists with our entries replaced by `ours` under every
  * event we use (or removed, when `ours` has none for it), every other entry
  * passing through unread. Refuses a settings file whose hooks block is not
- * the shape Claude Code writes, rather than rewriting it. */
-function withAnswerHooks(config: Config, name: string, ours: AnswerHooks, settingsPath: string): Config {
+ * the shape Claude Code writes, rather than rewriting it.
+ *
+ * The answer-stop and figures entries an earlier version wrote were shared
+ * by every server installed in the project. This install takes them, so
+ * each other server with answer hooks gets its own in their place
+ * (`heirs`): none is left without the Stop hooks its memory waits on. */
+function withAnswerHooks(
+  config: Config,
+  name: string,
+  ours: AnswerHooks,
+  settingsPath: string,
+  heirs: (server: string) => HookEntry[],
+): Config {
   const hooks = config.hooks ?? {};
   if (hooks === null || typeof hooks !== "object" || Array.isArray(hooks)) {
     throw new InstallError(`"hooks" in ${settingsPath} is ${describeJson(hooks)}, not an object. Fix the file and re-run.`);
@@ -552,7 +596,16 @@ function withAnswerHooks(config: Config, name: string, ours: AnswerHooks, settin
       throw new InstallError(`"hooks.${event}" in ${settingsPath} is ${describeJson(list)}, not an array. Fix the file and re-run.`);
     }
     const kept = list.filter((e) => !isAnswerHookEntry(e, name));
-    const next = [...kept, ...(ours[event] ?? [])];
+    const inherited =
+      event === ANSWER_STOP_HOOK_EVENT && list.some(isLegacyStopEntry)
+        ? otherAnswerServers(events, name)
+            .filter(
+              (server) =>
+                !kept.some((e) => isStopEntryWhere(e, (command) => stopHookCommand(server, [STOP_HOOK_ARGS, FIGURES_HOOK_ARGS]).test(command))),
+            )
+            .flatMap(heirs)
+        : [];
+    const next = [...kept, ...inherited, ...(ours[event] ?? [])];
     if (next.length) nextEvents[event] = next;
     else delete nextEvents[event];
   }
@@ -610,7 +663,7 @@ async function resolvePlatform(
 ): Promise<PlatformSetup> {
   if (opts.db) return { db: opts.db, notes: [] };
   if (opts.localOnly) {
-    return { notes: ["Local tools only (find / search / sql), as asked: nothing about this repository leaves it."] };
+    return { notes: ["Local tools only (find / sql / read), as asked: nothing about this repository leaves it."] };
   }
 
   const account = readStoredAccount();
@@ -653,12 +706,12 @@ async function resolvePlatform(
   // than a half-configured one.
   const consent = opts.yes ? grantWithoutAsking() : await askUploadConsent(baseUrl, database, root, deps.consent);
   if (consent === "declined") {
-    return { notes: ["Local tools only (find / search / sql), as you asked: nothing about this repository leaves it."] };
+    return { notes: ["Local tools only (find / sql / read), as you asked: nothing about this repository leaves it."] };
   }
   if (consent === "no-terminal") {
     return {
       notes: [
-        `Local tools only (find / search / sql): enabling ask uploads this repository's contents, and there is no terminal here to ask.`,
+        `Local tools only (find / sql / read): enabling search uploads this repository's contents, and there is no terminal here to ask.`,
         `Re-run \`cx install\` from a terminal, or pass --yes to agree without being asked.`,
       ],
     };
@@ -676,12 +729,12 @@ async function resolvePlatform(
     };
   } catch (err) {
     return accountUnusable(err)
-      ? { notes: [`Local tools only (find / search / sql): ${unusableReason(err, baseUrl)}`] }
+      ? { notes: [`Local tools only (find / sql / read): ${unusableReason(err, baseUrl)}`] }
       : {
           db,
           notes: [
             `could not register the database ${database} on ${baseUrl}: ${(err as Error).message}`,
-            `The entry is written anyway - the first \`cx index\` retries. If it keeps failing, the database has to exist before ask works.`,
+            `The entry is written anyway - the first \`cx index\` retries. If it keeps failing, the database has to exist before search works.`,
           ],
         };
   }
@@ -713,7 +766,7 @@ async function firstRun(
   if (named === undefined || named === "") {
     return {
       notes: [
-        `Local tools only (find / search / sql). ask needs an Infino account, and this build names no platform to get one from.`,
+        `Local tools only (find / sql / read). search needs an Infino account, and this build names no platform to get one from.`,
         `Point it at one: \`cx install --platform https://host\` (or set ${PLATFORM_URL_ENV}). Or, with a key already, ${signInHint()}`,
       ],
     };
@@ -729,12 +782,12 @@ async function firstRun(
     ? "granted"
     : await askUploadConsent(baseUrl, database, root, { ...deps.consent, newAccount: true });
   if (consent === "declined") {
-    return { notes: ["Local tools only (find / search / sql), as you asked: no account was created and nothing left this machine."] };
+    return { notes: ["Local tools only (find / sql / read), as you asked: no account was created and nothing left this machine."] };
   }
   if (consent === "no-terminal") {
     return {
       notes: [
-        `Local tools only (find / search / sql): ask needs an Infino account, and creating one uploads this repository's contents - there is no terminal here to ask.`,
+        `Local tools only (find / sql / read): search needs an Infino account, and creating one uploads this repository's contents - there is no terminal here to ask.`,
         `Re-run \`cx install\` from a terminal, or pass --yes to agree without being asked.`,
       ],
     };
@@ -774,14 +827,14 @@ function formatCredit(cents: number): string {
 /** What to print when a trial was not granted. Each of the three cases has a
  * different next step, and none of them is "something went wrong". */
 function trialRefusalNotes(err: unknown, baseUrl: string): string[] {
-  const local = "Local tools only (find / search / sql)";
+  const local = "Local tools only (find / sql / read)";
   if (err instanceof HostedError && err.status === HTTP_NOT_IMPLEMENTED) {
-    return [`${local}: ${baseUrl} does not offer free accounts.`, `For ask, ${signInHint()}`];
+    return [`${local}: ${baseUrl} does not offer free accounts.`, `For search, ${signInHint()}`];
   }
   if (err instanceof HostedError && err.status === HTTP_CONFLICT) {
     return [
       `${local}: this machine's network has already used its free trial on ${baseUrl}.`,
-      `For ask, ${signInHint()}`,
+      `For search, ${signInHint()}`,
     ];
   }
   return [
@@ -836,6 +889,22 @@ export async function installCmd(
   // whose hooks would apply to every project.
   const settingsPath = join(root, PROJECT_SETTINGS);
   const hooksHere = !opts.config;
+  // A name Claude Code rewrites in its tools' names leaves the hooks
+  // matching tools that never exist. With `--db` hooks will be written, and
+  // that is known now, so the name is refused before anything is asked of
+  // the platform. Without it, whether hooks are written is known only once
+  // the platform half has resolved - which may already have registered a
+  // database - so the entry is written then and the hooks left out, said in
+  // a note (`hookable` below). A local-only entry writes none either way.
+  const refuseHookName = () =>
+    new InstallError(
+      `--name ${JSON.stringify(name)} holds a character Claude Code rewrites in the server's tool names, so its hooks would ` +
+        `never see its tools. Use letters, digits, "-" and "_" only.`,
+    );
+  if (hooksHere && !opts.uninstall && !opts.localOnly && opts.db && !SERVER_NAME.test(name)) throw refuseHookName();
+  // Another server's own figures entry, written when this install takes the
+  // shared ones an earlier version left (`withAnswerHooks`).
+  const heirs = (server: string) => [answerFiguresHookEntry(opts, version, server)];
 
   if (opts.uninstall) {
     const settings = hooksHere ? readConfig(settingsPath) : {};
@@ -847,35 +916,41 @@ export async function installCmd(
     const { [name]: _removed, ...rest } = servers;
     const next: Config = { ...config, mcpServers: rest };
     if (opts.dryRun) {
-      console.log(`${dim("would remove")} ${bold(name)} from ${configPath}${hadHooks ? ` and its answer hooks from ${settingsPath}` : ""}`);
+      console.log(`${dim("would remove")} ${bold(name)} from ${configPath}${hadHooks ? ` and its hooks from ${settingsPath}` : ""}`);
       return;
     }
     if (name in servers) writeConfig(configPath, next);
-    if (hadHooks) writeConfig(settingsPath, withAnswerHooks(settings, name, {}, settingsPath));
-    console.log(`${green("removed")} ${bold(name)} from ${configPath}${hadHooks ? ` and its answer hooks from ${settingsPath}` : ""}`);
+    if (hadHooks) writeConfig(settingsPath, withAnswerHooks(settings, name, {}, settingsPath, heirs));
+    console.log(`${green("removed")} ${bold(name)} from ${configPath}${hadHooks ? ` and its hooks from ${settingsPath}` : ""}`);
     console.log(dim("Restart the client to drop the server."));
     return;
   }
 
   const setup = await resolvePlatform(opts, root, deps);
-  // With `ask` enabled, the `answer` tool is too, and its result reaches the
-  // person through a hook rather than the model's retyping; the entry tells
-  // the server so, and the hooks are written beside it.
-  const answerHook = hooksHere && Boolean(setup.db);
-  const entry = serverEntry({ ...opts, db: setup.db, answerHook }, version);
+  // With a platform database the Stop hooks are written beside the entry,
+  // and the entry tells the server to recall the memory one of them writes.
+  const hookable = SERVER_NAME.test(name);
+  const withHooks = hooksHere && Boolean(setup.db) && hookable;
+  if (hooksHere && setup.db && !hookable) {
+    setup.notes.push(
+      `No hooks written: --name ${JSON.stringify(name)} holds a character Claude Code rewrites in the server's tool names, ` +
+        `so its hooks would never see its tools. Re-run with letters, digits, "-" and "_" only to add them.`,
+    );
+  }
+  const entry = serverEntry({ ...opts, db: setup.db, withHooks }, version);
   const existed = name in servers;
   const next: Config = { ...config, mcpServers: { ...servers, [name]: entry } };
-  const hookEntries = answerHook ? answerHooks(opts, version, name) : {};
+  const hookEntries = withHooks ? answerHooks({ ...opts, db: setup.db }, version, name) : {};
   const hookCount = answerHookCount(hookEntries);
   const settings = hooksHere ? readConfig(settingsPath) : {};
-  const nextSettings = hooksHere ? withAnswerHooks(settings, name, hookEntries, settingsPath) : null;
+  const nextSettings = hooksHere ? withAnswerHooks(settings, name, hookEntries, settingsPath, heirs) : null;
   const settingsChange = hooksHere && JSON.stringify(nextSettings) !== JSON.stringify(settings);
 
   if (opts.dryRun) {
     console.log(`${dim(existed ? "would replace" : "would write")} ${bold(name)} in ${configPath}:`);
     console.log(JSON.stringify(entry, null, CONFIG_INDENT));
     if (hookCount) {
-      console.log(`${dim("would write")} ${hookCount} hook(s) (${ANSWER_HOOK_EVENTS.map((e) => bold(e)).join(", ")}) for ${bold(answerHookMatcher(name))} in ${settingsPath}`);
+      console.log(`${dim("would write")} ${hookCount} hook(s) (${bold(ANSWER_STOP_HOOK_EVENT)}) for ${bold(name)} in ${settingsPath}`);
     }
     for (const note of setup.notes) console.log(dim(note));
     return;
@@ -887,7 +962,7 @@ export async function installCmd(
   console.log(`  ${dim(entry.command)} ${dim(entry.args.join(" "))}`);
   if (hookCount) {
     console.log(
-      `  ${dim(`${hookCount} hooks in ${settingsPath}: the answer tool's result is shown to you directly, and what the model said while it worked reaches the writer`)}`,
+      `  ${dim(`${hookCount} hooks in ${settingsPath}: the model is sent back once to compute with sql any figure of its answer no tool result holds, and each turn is kept in the database's memory`)}`,
     );
   }
   for (const note of setup.notes) console.log(dim(note));

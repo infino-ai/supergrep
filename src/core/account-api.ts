@@ -8,6 +8,10 @@
 //   GET  /v1/databases   the account's databases. Also the cheapest proof that
 //                        a key works at all, which is what `cx login` needs.
 //   POST /v1/databases   register this repository's database.
+//   GET  /v1/account/features
+//                        what the account may use beyond its databases: the
+//                        agent APIs (graph expansion, pages, web fetch,
+//                        memory) are offered only where it says so.
 //
 // Both authenticate with the same bearer key as the data plane. Neither is
 // retried: an account-plane call is a person waiting at a terminal, and every
@@ -111,6 +115,24 @@ export async function listDatabases(target: AccountTarget, opts: AccountApiOptio
   });
 }
 
+/** What the account may use beyond its databases, as `GET
+ * /v1/account/features` reports it. `agentApis` is the switch for the agent
+ * routes - `graph_expand`, `page`, `fetch`, `recall`, `remember` - which an
+ * account without them answers 403. */
+export interface AccountFeatures {
+  agentApis: boolean;
+}
+
+/** The account's features. Read once, where a server starts or a hook is
+ * about to write: anything but an answer saying `agent_apis: true` - a
+ * refusal, a platform that predates the route, a timeout - is an account
+ * without them, so a tool is never offered that would answer 403. */
+export async function accountFeatures(target: AccountTarget, opts: AccountApiOptions = {}): Promise<AccountFeatures> {
+  const body = await accountCall("account_features", target, { method: "GET" }, opts, "/account/features");
+  const parsed: unknown = JSON.parse(body);
+  return { agentApis: (parsed as { agent_apis?: unknown } | null)?.agent_apis === true };
+}
+
 /** Register `name` for this account, reporting whether it had to be made. A
  * name the account already holds answers 409, which is the outcome the caller
  * wanted, so it is a result and not an error. */
@@ -190,10 +212,11 @@ async function accountCall(
   target: AccountTarget,
   request: { method: string; body?: string; contentType?: string },
   opts: AccountApiOptions,
+  route = "/databases",
 ): Promise<string> {
   const fetchImpl = opts.fetch ?? fetch;
   const timeoutMs = opts.timeoutMs ?? ACCOUNT_TIMEOUT_MS;
-  const url = `${target.baseUrl.replace(/\/+$/, "")}${API_PREFIX}/databases`;
+  const url = `${target.baseUrl.replace(/\/+$/, "")}${API_PREFIX}${route}`;
   const headers: Record<string, string> = { authorization: `Bearer ${target.apiKey}`, accept: "application/json" };
   if (request.contentType) headers["content-type"] = request.contentType;
 

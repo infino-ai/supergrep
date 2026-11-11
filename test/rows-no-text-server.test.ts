@@ -7,8 +7,8 @@
 // codes hydrated with no full-text index, served with two of their siblings.
 // The engine refuses a token match or a BM25 search over a column with no
 // index, so the server offers no find and no search over such a table, and no
-// tool text names a search function it cannot run; sql, ask and join_keys
-// keep working, and the answer is told to cite no row by an id - the table
+// tool text names a search function it cannot run; sql and join_keys keep
+// working, and the answer is told to cite no row by an id - the table
 // has no link column to cite one by.
 
 import { existsSync } from "node:fs";
@@ -27,7 +27,6 @@ const LOAN_TABLE = "berka_loan";
 process.env.CX_TABLE = TRANS_TABLE;
 process.env.CX_REMOTE_SEARCH = "1";
 process.env.CX_NO_EMBED = "1";
-process.env.CX_SIBLING_TABLES = `${ACCOUNT_TABLE},${LOAN_TABLE}`;
 delete process.env.CX_AUTO_INDEX;
 delete process.env.CX_NO_RECEIPT;
 delete process.env.CX_INDEX_DIR;
@@ -69,22 +68,12 @@ const SCHEMAS: Record<string, unknown[]> = {
 /** The platform's loop answering one question over the table: the first
  * fact of the statement it ran, which matched three rows - the platform
  * returns the caller's k and says what it cut. */
-const ASKED_STATEMENT = `SELECT trans_id, account_id, amount FROM ${TRANS_TABLE} ORDER BY amount DESC LIMIT 10`;
-const ASKED_ROWS = [
+const LARGEST_STATEMENT = `SELECT trans_id, account_id, amount FROM ${TRANS_TABLE} ORDER BY amount DESC LIMIT 10`;
+const LARGEST_ROWS = [
   { trans_id: 695247, account_id: 2378, amount: 700 },
   { trans_id: 695248, account_id: 2378, amount: 650 },
   { trans_id: 695249, account_id: 11, amount: 600 },
 ];
-const ASKED = {
-  facts: [{ table: TRANS_TABLE, row: ASKED_ROWS[0] }],
-  statement: ASKED_STATEMENT,
-  coverage: { rows_total: ASKED_ROWS.length, rows_returned: 1, truncated: true },
-  terminate: "answered",
-  turns: 1,
-  retries: 0,
-  model_tokens: 320,
-};
-
 /** The writes this file exists to catch: none of them may ever be sent. */
 const FORBIDDEN_OPS = ["drop_table", "create_table", "append", "delete", "update"];
 
@@ -94,9 +83,11 @@ const UNRUNNABLE = ["hybrid_search", "bm25_search", "token_match", "exact_match"
 
 /** The platform with the three tables there: the primary not yet carded, one
  * sibling carded with every column scalar (the optimizer's card for a table
- * with no index), one not; every read answers. */
+ * with no index), one not; every read answers. The database lists the
+ * three, so the two beside the primary are the tables it may join. */
 const berka = () =>
   scriptPlatform({
+    list_tables: () => [200, [TRANS_TABLE, ACCOUNT_TABLE, LOAN_TABLE]],
     schema: (body) => {
       const fields = SCHEMAS[String(body?.table_name)];
       return fields ? [200, fields] : [404, { error: "no such table" }];
@@ -110,18 +101,21 @@ const berka = () =>
     join_keys: () => [200, { joins: [{ predicate: `${TRANS_TABLE}.account_id = ${ACCOUNT_TABLE}.account_id` }], pairs: 1, counted: 0, model_tokens: 0 }],
     // The loop's statement, run again by the client for the rows the
     // platform cut; any other statement is the model's own.
-    query_sql: (body) => [200, body?.query === ASKED_STATEMENT ? ASKED_ROWS : [{ account_id: 2378, n: 42 }]],
+    query_sql: (body) => [200, body?.query === LARGEST_STATEMENT ? LARGEST_ROWS : [{ account_id: 2378, n: 42 }]],
     validate: () => [200, { valid: true, check: "unchecked" }],
-    sub_agent: () => [200, ASKED],
+    // The platform's knowledge graph is the deployment's choice per table
+    // (`optimizer_settings.graph.tables`); the client walks it after every
+    // statement over a table with siblings and the platform answers, here,
+    // that this table is not covered.
+    graph_expand: () => [200, { seeds: 0, connected: [], note: `the graph does not cover table ${TRANS_TABLE} (optimizer_settings.graph.tables)` }],
   });
 
 beforeAll(() => {
-  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/cxbench" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
+  configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/testdb" }, { [API_KEY_ENV]: "inf_test_key_do_not_log" }));
 });
 
 afterAll(() => {
   configureHosted(null);
-  delete process.env.CX_SIBLING_TABLES;
 });
 
 describe("a table with no full-text column, with siblings of the same kind", () => {
@@ -133,18 +127,37 @@ describe("a table with no full-text column, with siblings of the same kind", () 
     await stop(s);
   });
 
-  it("read the primary's shape and each sibling's once at startup", () => {
-    // Each card asked at the enriched tier, the default; the primary and the
-    // uncarded sibling then at the lean one they fall back to.
-    expect(s.startup).toEqual(["schema", "table_card", "table_card", "hydrate", "schema", "table_card", "schema", "table_card", "table_card"]);
+  it("listed the database's tables once and read the primary's shape and each sibling's once at startup", () => {
+    // The database's tables first, once. Then every table's schema, once:
+    // the cards share a budget of whole columns by the tables' widths
+    // (cardLayouts), so the widths come before any card. Then each card
+    // asked at the enriched tier, the default; the primary and the uncarded
+    // sibling then at the lean one they fall back to, with the primary's
+    // load record between its cards and its siblings'.
+    // Last, the platform's rendering of the carded tables' cards, one call.
+    expect(s.startup).toEqual(["list_tables", "schema", "schema", "schema", "table_card", "table_card", "hydrate", "table_card", "table_card", "table_card", "table_card"]);
+    // The schemas are read at once, and the siblings' cards asked for at
+    // once, so which table each of those calls names is fixed in count, not
+    // in order: each table's schema once, the primary's cards before its
+    // siblings', and the uncarded sibling's lean card after its enriched one.
+    const asked = (op: string) => s.sent.filter((x) => x.op !== "account").slice(0, s.startup.length).filter((x) => x.op === op);
+    expect(asked("schema").map((x) => String(x.body?.table_name)).sort()).toEqual([ACCOUNT_TABLE, LOAN_TABLE, TRANS_TABLE].sort());
+    const cards = asked("table_card")
+      .filter((x) => x.body?.tables === undefined)
+      .map((x) => `${String(x.body?.table)}:${String(x.body?.tier)}`);
+    expect(asked("table_card").filter((x) => x.body?.tables !== undefined)).toHaveLength(1);
+    expect(cards.slice(0, 2)).toEqual([`${TRANS_TABLE}:enriched`, `${TRANS_TABLE}:lean`]);
+    expect(cards.slice(2).sort()).toEqual([`${ACCOUNT_TABLE}:enriched`, `${LOAN_TABLE}:enriched`, `${LOAN_TABLE}:lean`]);
+    expect(cards.indexOf(`${LOAN_TABLE}:enriched`)).toBeLessThan(cards.indexOf(`${LOAN_TABLE}:lean`));
   });
 
-  it("offers no find and no search, and keeps sql, ask and join_keys", async () => {
+  it("offers no find and no search, and keeps sql and join_keys", async () => {
     const { tools } = await s.client.listTools();
     const names = tools.map((t) => t.name);
     expect(names).not.toContain("find");
     expect(names).not.toContain("search");
-    for (const name of ["sql", "ask", "join_keys"]) expect(names, name).toContain(name);
+    for (const name of ["sql", "join_keys"]) expect(names, name).toContain(name);
+    expect(names).not.toContain("ask");
   });
 
   it("names no function the tables cannot run anywhere the model reads", async () => {
@@ -154,7 +167,7 @@ describe("a table with no full-text column, with siblings of the same kind", () 
     for (const [where, text] of [["instructions", instructions], ...byName.entries()]) {
       for (const name of UNRUNNABLE) expect(text, `${where} names ${name}`).not.toContain(name);
     }
-    // The routing names sql and ask alone and says why.
+    // The routing names sql alone and says why.
     expect(instructions).not.toContain("- find -");
     expect(instructions).not.toContain("- search -");
     expect(instructions).toContain(`No column of ${TRANS_TABLE} is full-text indexed, so there is no find or search over it`);
@@ -166,12 +179,10 @@ describe("a table with no full-text column, with siblings of the same kind", () 
     expect(sql).toContain(`FROM ${ACCOUNT_TABLE} JOIN ${TRANS_TABLE} ON <the predicate join_keys returned>`);
     expect(sql).toContain("The keys are not written here: call join_keys with the tables first and paste its predicate into ON");
     expect(byName.get("join_keys")).toContain(`FROM ${TRANS_TABLE} JOIN other ON <predicate> reads as written`);
-    expect(instructions).toContain("is an ask first: the loop sees every one of them");
+    expect(instructions).toContain("is one JOIN, not one query per table");
     // No row is cited by an id: the tables have no link to cite one by.
     const cite = "Cite no row by an id: its trans_id or _id looks a row up and never goes in the answer as a reference";
     expect(instructions).toContain(cite);
-    expect(byName.get("ask")).toContain(cite);
-    expect(byName.get("ask")).not.toContain("use find");
   });
 
   it("refuses a call to search or find without reaching the platform", async () => {
@@ -185,15 +196,19 @@ describe("a table with no full-text column, with siblings of the same kind", () 
     }
   });
 
-  it("runs sql on the platform, a statement over one table asking no keys", async () => {
+  it("runs sql on the platform, a statement over one table asking no keys, and walks the graph the platform decides over", async () => {
     const { ok, value, ops } = await call(s, "sql", {
       query: `SELECT account_id, COUNT(*) AS n FROM ${TRANS_TABLE} GROUP BY account_id ORDER BY n DESC LIMIT 5`,
       question: "which accounts have the most transactions?",
     });
     expect(ok, String(value)).toBe(true);
-    expect(ops).toEqual(["query_sql", "validate"]);
+    // The walk is the platform's call: the client asks, and a table the
+    // deployment's graph does not cover adds nothing to the result.
+    // The verdict rides on the statement, answered in the same call.
+    expect(ops).toEqual(["query_sql", "graph_expand"]);
     expect((value as { index: string; rows: unknown[] }).index).toBe("platform");
     expect((value as { rows: unknown[] }).rows).toEqual([{ account_id: 2378, n: 42 }]);
+    expect(value).not.toHaveProperty("connected");
   });
 
   it("answers join_keys and runs a statement across the tables on the key it found", async () => {
@@ -205,27 +220,6 @@ describe("a table with no full-text column, with siblings of the same kind", () 
     });
     expect(joined.ok, String(joined.value)).toBe(true);
     expect(joined.ops).toContain("query_sql");
-  });
-
-  it("asks the platform's loop with the row key as the projection, and reads the rows it cut with its statement", async () => {
-    const { ok, value, ops } = await call(s, "ask", { question: "which transactions are the largest?" });
-    expect(ok, String(value)).toBe(true);
-    // The platform returned the first of three rows; the client ran the
-    // statement again for the other two, so the model sees every row and
-    // not a sample (the owner, 2026-10-04: "unacceptable to simply take the
-    // top 10 results").
-    expect(ops).toEqual(["sub_agent", "query_sql"]);
-    const request = s.sent.find((x) => x.op === "sub_agent")?.body;
-    expect(request?.projection).toEqual(["trans_id"]);
-    expect(request?.tables).toEqual([ACCOUNT_TABLE, LOAN_TABLE]);
-    // The last query_sql sent is this call's (the sql tests above sent their own).
-    expect(s.sent.filter((x) => x.op === "query_sql").at(-1)?.body?.query).toBe(ASKED_STATEMENT);
-    const result = value as { rows: Array<Record<string, unknown>>; hits: unknown[]; coverage: Record<string, unknown>; completed?: string; more?: string };
-    expect(result.hits).toEqual([]);
-    expect(result.rows).toEqual(ASKED_ROWS);
-    expect(result.coverage).toMatchObject({ rowsTotal: 3, rowsReturned: 3, truncated: false });
-    expect(result.completed).toContain("the platform returned the first 1 of 3 rows");
-    expect(result).not.toHaveProperty("more");
   });
 
   it("never reached the platform with a drop, create or append, and wrote no manifest", () => {

@@ -12,15 +12,13 @@ server are still named `code-context`.
 | `search` | platform | one ranked pass fusing exact keyword matching (BM25) with semantic similarity; hits carry the code and their citation (`cite`), or with `lines` only the lines of each chunk that carry the query's words, with two lines of context | how a subsystem works, code by meaning or exact term, similar implementations; `lines` over logs and other long records, where the matching lines are the answer |
 | `sql` | local, or platform when a statement embeds | read-only SQL over the index, with `bm25_search`, `hybrid_search`, `vector_search` and `token_match` as table functions | counts, rankings and aggregates over the whole repository in one query |
 | `read` | local | the numbered lines of the files named, several files in one call, from the index; `from` and `to` cut to a range, and a long file comes back a page at a time | after the index has named the files: every one of them at once, in place of one read per file |
-| `ask` | platform | a question or task in plain language; returns the rows it retrieved, each with its citation, `path`, `start_line`, `end_line` and the code, never a summary | how does X work, where is X handled, when Claude wants facts to compose from rather than an answer |
 
-`search` and `ask` are registered when the server has an account (`install
+`search` is registered when the server has an account (`install
 --platform`, or `--db` by hand); without one the server is `find`, plain
 `sql` and `read` over the local index. `find`, `search` and `sql` take an
 optional `path` (an absolute repository root) so one server can serve
-several repositories in a session, each with its own local index; `ask`
-reads one platform database and refuses a `path` naming a different
-repository. Each of the three also takes `queries`, a list of up to sixteen
+several repositories in a session, each with its own local index. Each of
+the three also takes `queries`, a list of up to sixteen
 strings or statements in place of `query`: they run at the same time and
 the results come back in the same order, each under its query, so several
 lookups are one call and one turn of the agent rather than one per lookup.
@@ -47,13 +45,13 @@ server-side, so agents never handle raw vectors.
 
 ### One index in two places
 
-With the machine signed in (`cx login`), the first `search` or `ask` in a
+With the machine signed in (`cx login`), the first `search` in a
 directory builds the local index and loads the same chunks into that
 directory's own database on the account; `cx index --db` does it by hand for
 a database you name. Every sync after it (the explicit `cx index`, or the
 server's auto-sync as queries arrive) applies the same diff to both, so they
-never drift. `find` and plain `sql` read the local copy; `search`, a `sql`
-with a ranked search in it, and `ask` run on the platform copy, where every
+never drift. `find` and plain `sql` read the local copy; `search`, and a
+`sql` with a ranked search in it, run on the platform copy, where every
 embedding is computed. Without an account the server is the local keyword
 index alone, and nothing leaves the machine: no account, no key, no
 telemetry. A stored key alone is not an account here: the person has to have
@@ -80,7 +78,6 @@ that touch it, `cx index` and `cx mcp`:
 | `--analyzer <ascii_lower\|standard>` | the table's own; `ascii_lower` for a first load | `cx index` only: the full-text analyzer the platform table is created with. `ascii_lower` splits code identifiers on `.`, `_`, and `::`. Without the flag a rebuild keeps the analyzer the table has; naming a different one rebuilds it |
 | `--db-timeout-ms <n>` | 60000 | per-request timeout |
 | `--cold-start-secs <n>` | 120 | how long to keep retrying while the database is not yet ready, before giving up |
-| `--subagent-max-turns`, `--subagent-max-wall-secs`, `--subagent-k` | 4, 120, 10 | `cx mcp` only: turn and wall-clock caps for one `ask` call, and how many facts a call returns |
 
 Plain `http://` is accepted for a loopback host only
 (`http://127.0.0.1:<port>/<database>` or `http://localhost:<port>/<database>`);
@@ -113,7 +110,7 @@ model's side is on your own model bill as usual.
 ## CLI
 
 ```
-cx login --platform <url>    get a free account (asks first), store its key at mode 600: every directory has all four tools
+cx login --platform <url>    get a free account (asks first), store its key at mode 600: every directory has search too
 cx login --db <url> --yes < key   store a key you already have, agreed to uploads
 cx login --show | --logout   what is stored / forget the key
 cx install                   write this repository's MCP entry into .mcp.json, for clients other than the plugin
@@ -126,7 +123,7 @@ cx status                 what the index holds, how fresh, vector readiness
 cx usage                  ledger of queries run and what each returned  (-n, --all, --clear, --json)
 cx mcp                    serve the MCP tools over stdio
 cx index --db <url>       also keep the index on an Infino platform database  (--api-key-file, --embed-provider, --analyzer)
-cx mcp --db <url>         also serve ask over that copy                    (--api-key-file, the ask caps)
+cx mcp --db <url>         also serve search over that copy                 (--api-key-file)
 ```
 
 `cx usage` reads the local ledger at `.infino/usage.jsonl`: every call, from
@@ -161,7 +158,7 @@ stack.
 
 ## Architecture
 
-![SuperGrep: find, search and sql locally, ask in the cloud, one index in both places](subagent/architecture.svg)
+![SuperGrep: find and plain sql locally, search in the cloud, one index in both places](subagent/architecture.svg)
 
 - **Chunking:** tree-sitter (WASM, no native compiles) cuts at definition
   boundaries for TypeScript/JS, Python, Rust, Go, Java, C/C++, Ruby, C#, PHP;
@@ -172,7 +169,7 @@ stack.
 - **Index:** [infino](https://github.com/infino-ai/infino) tables - BM25 and
   IVF vector indexes over a single copy of the data - queried in-process
   through the Node binding locally, and the same table on an Infino platform
-  database for `ask`, written by the same builds and syncs.
+  database for `search`, written by the same builds and syncs.
 - **Embeddings:** computed on the platform, with its own model, so the
   compute-heavy stage never runs on your laptop; `--embed-provider local`
   embeds on this machine and ships the vectors instead.

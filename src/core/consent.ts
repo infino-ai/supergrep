@@ -38,7 +38,7 @@ export function consentNotice(baseUrl: string, database: string, root: string, n
   const lines = [
     `${bold("The cloud tools upload this repository's contents.")}`,
     ``,
-    `  ask runs on ${baseUrl}, over a copy of the index kept there.`,
+    `  search runs on ${baseUrl}, over a copy of the index kept there.`,
     `  Building that copy sends the ${bold("text of the files")} under ${root} - the code`,
     `  itself, not just names or metrics - into the database ${bold(database)}.`,
     `  Every later sync sends what changed.`,
@@ -58,11 +58,11 @@ export function machineConsentNotice(baseUrl: string, newAccount = false): strin
   const lines = [
     `${bold("The cloud tools upload the contents of the directories you use them in.")}`,
     ``,
-    `  search and ask run on ${baseUrl}, over a copy of each directory's index kept there.`,
+    `  search runs on ${baseUrl}, over a copy of each directory's index kept there.`,
     `  The first time you use them in a directory, its ${bold("text of the files")} - the code`,
     `  itself, not just names or metrics - goes into a database of its own there,`,
     `  named after the directory. Every later sync sends what changed. No directory`,
-    `  is uploaded until you use search or ask in it.`,
+    `  is uploaded until you use search in it.`,
     ``,
   ];
   return noticeTail(lines, newAccount);
@@ -76,7 +76,7 @@ function noticeTail(lines: string[], newAccount: boolean): string {
       `  This machine has no Infino account, so one will be ${bold("created for you")} -`,
       `  no email, no password and no card - with free credit to start on. Its`,
       `  key is stored at ${keyFilePath()}, readable only by you.`,
-      `  When the credit runs out, ask stops and says so; adding`,
+      `  When the credit runs out, search stops and says so; adding`,
       `  billing details then is a choice, not a renewal you have agreed to.`,
       ``,
     );
@@ -144,7 +144,7 @@ export async function askUploadConsent(
   const machine = deps.machine === true;
   console.log(machine ? machineConsentNotice(baseUrl, deps.newAccount === true) : consentNotice(baseUrl, database, root, deps.newAccount === true));
   console.log("");
-  const what = machine ? "the contents of the directories you use search and ask in" : "this repository's contents";
+  const what = machine ? "the contents of the directories you use search in" : "this repository's contents";
   const question = deps.newAccount === true ? `Create a free Infino account and upload ${what}? [y/N] ` : `Upload ${what} to Infino? [y/N] `;
   const answer = (await (deps.ask ?? promptStdin)(question)).trim().toLowerCase();
   if (answer !== "y" && answer !== "yes") {

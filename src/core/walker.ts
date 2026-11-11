@@ -5,7 +5,7 @@
 // (each applies to its own subtree), always skips VCS internals, vendored /
 // generated directories, and the index directory itself.
 
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import ignoreFactory, { type Ignore } from "ignore";
 import { INDEX_DIR_NAME } from "./config.js";
@@ -131,6 +131,64 @@ function isIgnored(relPath: string, isDir: boolean, layers: IgnoreLayer[]): bool
   return false;
 }
 
+/** Why a path is left out, or undefined when it is not: `.cxignore`'s
+ * choice ("cx") cannot be overridden, git's ("git") can be by `included`. */
+function exclusion(
+  childRel: string,
+  isDir: boolean,
+  gitLayers: IgnoreLayer[],
+  cxLayers: IgnoreLayer[],
+  included: Ignore | undefined,
+): "cx" | "git" | undefined {
+  if (isIgnored(childRel, isDir, cxLayers)) return "cx";
+  if (!isIgnored(childRel, isDir, gitLayers)) return undefined;
+  const sub = isDir ? `${childRel}/` : childRel;
+  if (included?.ignores(sub)) return undefined; // re-admitted
+  return "git";
+}
+
+/** Whether a walk of `root` would admit the file at `rel` (root-relative,
+ * "/" or the platform's separator): every directory on the way is a real
+ * directory, none of them a skipped one (`SKIP_DIRS`) or ignored, the file is
+ * a regular file and not ignored, and no part of the path is a symlink. The
+ * same layers apply as in `walkRepo`, read from the same files, so a path
+ * passes here exactly when the walk would list it. For callers that hold one
+ * path and must not send anything an index of the folder would not: the
+ * memory hook (commands/hook-cmd.ts). */
+export function walkAdmits(root: string, rel: string, options: WalkOptions = {}): boolean {
+  const parts = rel.split(/[\\/]/).filter((p) => p !== "" && p !== ".");
+  if (parts.length === 0 || parts.includes("..")) return false;
+  const respectGitignore = options.respectGitignore !== false;
+  const patterns = (options.include ?? []).filter((p) => p.trim() !== "");
+  const included = patterns.length > 0 ? ignoreFactory().add(patterns) : undefined;
+  let gitLayers: IgnoreLayer[] = [];
+  let cxLayers: IgnoreLayer[] = [];
+  let dir = root;
+  let relSoFar = "";
+  for (const [i, name] of parts.entries()) {
+    const gitLayer = respectGitignore ? loadIgnoreFile(dir, relSoFar, ".gitignore") : undefined;
+    if (gitLayer) gitLayers = [...gitLayers, gitLayer];
+    const cxLayer = loadIgnoreFile(dir, relSoFar, CX_IGNORE_FILE);
+    if (cxLayer) cxLayers = [...cxLayers, cxLayer];
+    const childRel = relSoFar === "" ? name : `${relSoFar}/${name}`;
+    const path = join(dir, name);
+    let stat;
+    try {
+      stat = lstatSync(path);
+    } catch {
+      return false;
+    }
+    if (stat.isSymbolicLink()) return false;
+    const last = i === parts.length - 1;
+    if (last) return stat.isFile() && exclusion(childRel, false, gitLayers, cxLayers, included) === undefined;
+    if (!stat.isDirectory() || SKIP_DIRS.has(name.toLowerCase())) return false;
+    if (exclusion(childRel, true, gitLayers, cxLayers, included) !== undefined) return false;
+    dir = path;
+    relSoFar = childRel;
+  }
+  return false;
+}
+
 /** Everything the walk carries down the tree, so adding a rule does not add a
  * positional argument to every recursive call. */
 interface WalkState {
@@ -165,13 +223,7 @@ function walk(
 
   /** Whether git's opinion stands: it can be overridden by `--include`, and
    * `.cxignore`'s cannot be overridden at all. */
-  const excluded = (childRel: string, isDir: boolean): "cx" | "git" | undefined => {
-    if (isIgnored(childRel, isDir, activeCx)) return "cx";
-    if (!isIgnored(childRel, isDir, activeGit)) return undefined;
-    const sub = isDir ? `${childRel}/` : childRel;
-    if (state.included?.ignores(sub)) return undefined; // re-admitted
-    return "git";
-  };
+  const excluded = (childRel: string, isDir: boolean) => exclusion(childRel, isDir, activeGit, activeCx, state.included);
 
   for (const entry of entries) {
     const name = entry.name;

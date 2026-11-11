@@ -33,7 +33,7 @@ const SECOND_KEY = `inf_${"4".repeat(16)}_${"aa".repeat(24)}`;
 const DATA_DB = "mydata";
 const TRANS = "data";
 /** The database `--db` names: the server's own, never a caller's. */
-const SERVER_DB = "cxbench";
+const SERVER_DB = "testdb";
 /** The JSON-RPC codes the server answers with, a wire contract. */
 const SESSION_NOT_FOUND_CODE = -32001;
 const UNAUTHORIZED_CODE = -32003;
@@ -88,7 +88,7 @@ describe("the server over Streamable HTTP with sign-in", () => {
   let url: string;
   beforeAll(async () => {
     // --sign-in: the process holds no key, even with one in the environment.
-    configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/cxbench", signIn: METADATA_URL }, { [API_KEY_ENV]: "inf_should_not_be_used" }));
+    configureHosted(hostedSettingsFromFlags({ db: "http://127.0.0.1:9/testdb", signIn: METADATA_URL }, { [API_KEY_ENV]: "inf_should_not_be_used" }));
     expect(hostedTarget()?.apiKey).toBe("");
     scripted = platform();
     served = await serveHttp(undefined, { port: 0, hostedOptions: { fetch: scripted.fetch }, signIn: METADATA_URL });
@@ -193,12 +193,10 @@ describe("a signed-in session and the repository the server was started for", ()
 
   it("is served neither the server's repository nor another directory of its machine, and writes nothing to the caller's account for them", async () => {
     const { client } = await signedIn(url, GOOD_KEY);
-    const names = (await client.listTools()).tools.map((t) => t.name);
     const doors = [
       { name: "find", args: { query: TOKEN } },
       { name: "sql", args: { query: "SELECT path FROM chunks" } },
       { name: "search", args: { query: TOKEN } },
-      ...(names.includes("ask") ? [{ name: "ask", args: { question: `where is ${TOKEN}` } }] : []),
     ];
     for (const { name, args } of doors) {
       const own = await callText(client, name, args);

@@ -8,7 +8,7 @@
 // sits beside the local one in the index dir.
 
 import { openIndex, NoIndexError, type IndexHandle } from "../core/context.js";
-import { indexDir, resolveRoot } from "../core/config.js";
+import { embedProvider, indexDir, resolveRoot } from "../core/config.js";
 import { createEmbedder, embedderInfo } from "../core/embedder.js";
 import { readPlatformManifest, type Manifest } from "../core/manifest.js";
 import { find, search, runSql, jsonify } from "../core/searcher.js";
@@ -193,8 +193,8 @@ export async function statusCmd(opts: StatusCmdOptions): Promise<void> {
     console.log(
       `code-context index: ${fmtCount(m.chunks)} chunks from ${fmtCount(m.files)} files, ` +
         `vectors ${m.vectors}, indexed ${fmtAge(m.indexedAt)}. ` +
-        `MCP tools: find (exact text, every occurrence), search (terms + meaning), sql (aggregation)` +
-        (platform ? `, ask (one retrieval as rows over the platform copy)` : "") +
+        `MCP tools: find (exact text, every occurrence), sql (aggregation), read (files the index named)` +
+        (platform ? `, search (terms + meaning, over the platform copy)` : "") +
         `; the index re-syncs on every query.`,
     );
     return;
@@ -220,7 +220,10 @@ export async function statusCmd(opts: StatusCmdOptions): Promise<void> {
     .map(([lang, n]) => `${lang} ${fmtCount(n)}`)
     .join(" · ");
   if (langs) console.log(`  languages  ${langs}`);
-  console.log(dim(`  embedder   ${embedderInfo()}`));
+  // The local index is keyword-only; a local embedder runs only to fill the
+  // platform table's vectors (`--embed-provider local`), as `cx index` says.
+  const embedding = platform && embedProvider() === "local" ? `${embedderInfo()} - fills the platform table` : "none (local index is keyword-only)";
+  console.log(dim(`  embedder   ${embedding}`));
   // The platform table this machine loaded, when there is one: the same
   // index in another place, so only what can differ is shown - its counts,
   // its vectors and when it was last written.
@@ -349,14 +352,6 @@ export async function usageCmd(opts: UsageCmdOptions): Promise<void> {
         `${dim(clock)}  ${bold(tool)}  ${q}  ${dim(`-> ${e.matches ?? hits.length} matches / ${files} files | ~${fmtTokens(e.returnedTokens)} tok`)}`,
       );
       const locs = hits.slice(0, 5).map((h) => `${h.path}:${h.startLine}`);
-      if (locs.length) console.log(green(`            ${locs.join("  ")}${hits.length > 5 ? dim(`  (+${hits.length - 5} more)`) : ""}`));
-    } else if (e.tool === "ask" || e.tool === "subagent" || e.tool === "explore") {
-      // What the platform's agent retrieved, and what it spent getting there.
-      const hits = e.hits ?? [];
-      console.log(
-        `${dim(clock)}  ${bold(tool)}  ${q}  ${dim(`-> ${hits.length} hits / ${e.rows ?? 0} rows | ${e.agentTurns ?? 0} turns | ~${fmtTokens(e.returnedTokens)} tok`)}`,
-      );
-      const locs = hits.slice(0, 5).map((h) => `${h.path}:${h.startLine}-${h.endLine}`);
       if (locs.length) console.log(green(`            ${locs.join("  ")}${hits.length > 5 ? dim(`  (+${hits.length - 5} more)`) : ""}`));
     } else {
       console.log(

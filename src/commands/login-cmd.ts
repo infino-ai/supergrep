@@ -100,7 +100,7 @@ export interface LoginResult {
   databases?: string[];
   /** Whether the person at this machine has agreed to uploads, after this
    * command: what the plugin's server needs, beside the key, to serve search
-   * and ask in any directory. */
+   * in any directory. */
   uploadAgreed?: boolean;
 }
 
@@ -215,7 +215,7 @@ export async function loginCmd(opts: LoginCmdOptions, deps: LoginDeps = {}): Pro
       throw new LoginError(`--yes agrees to uploads for an account this machine has, and it has none: ${signInHint()}`);
     }
     if (!hasUploadConsent()) recordUploadConsent(new Date().toISOString());
-    console.log(`${green("agreed")} - search and ask upload the contents of the directories you use them in, to ${bold(stored.baseUrl)}`);
+    console.log(`${green("agreed")} - search uploads the contents of the directories you use it in, to ${bold(stored.baseUrl)}`);
     return { action: "agreed", baseUrl: stored.baseUrl, keyPath: keyFilePath(), uploadAgreed: true };
   }
   const raw = opts.db ?? stored?.baseUrl;
@@ -259,9 +259,9 @@ export async function loginCmd(opts: LoginCmdOptions, deps: LoginDeps = {}): Pro
   // and without either the sign-in stands and the way to agree is printed.
   const agreed = await agreeUploads(baseUrl, opts, deps);
   if (agreed) {
-    console.log(dim("search and ask are on in every directory you open with the plugin; `cx install` in a repository writes an entry for other clients."));
+    console.log(dim("search is on in every directory you open with the plugin; `cx install` in a repository writes an entry for other clients."));
   } else {
-    console.log(dim(`search and ask stay off until you agree to uploads: \`cx login --yes\` (find and plain sql need nothing).`));
+    console.log(dim(`search stays off until you agree to uploads: \`cx login --yes\` (find and plain sql need nothing).`));
   }
   return { action: "stored", baseUrl, keyPath, databases, uploadAgreed: agreed };
 }
@@ -329,8 +329,8 @@ async function signUp(opts: LoginCmdOptions, deps: LoginDeps): Promise<LoginResu
   });
   console.log(`${green("created")} a free Infino account on ${bold(baseUrl)} with $${(trial.creditCents / 100).toFixed(2)} of credit`);
   console.log(`  key   ${keyPath} ${dim("(mode 600) - no email, no password, no card. Keep it: it is the only way back into this account.")}`);
-  console.log(`  db    ${trial.database} ${dim("(this directory's; every other directory gets its own the first time you use search or ask in it)")}`);
-  console.log(dim("Restart your Claude Code session: search and ask are on in every directory you open."));
+  console.log(`  db    ${trial.database} ${dim("(this directory's; every other directory gets its own the first time you use search in it)")}`);
+  console.log(dim("Restart your Claude Code session: search is on in every directory you open."));
   return { action: "created", baseUrl, keyPath, databases: [trial.database], uploadAgreed: true };
 }
 

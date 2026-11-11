@@ -12,10 +12,15 @@ describe("budgetSqlRows", () => {
   const size = (row: Record<string, unknown>) => jsonify(row).length;
 
   it("keeps every row: text cells cut at the cap while the budget lasts, keys and places alone past it", () => {
-    const rows = Array.from({ length: 40 }, (_, i) => ({ path: `logs/run-${i}.log`, start_line: i * 60 + 1, content: "x".repeat(2_000) }));
-    // Each capped row costs about 1,600 characters; a 5,000-character budget
-    // carries three with their text and the other 37 as places.
-    const { rows: held, budget } = budgetSqlRows(rows, size, 5_000);
+    const rows = Array.from({ length: 40 }, (_, i) => ({
+      path: `logs/run-${i}.log`,
+      start_line: i * 60 + 1,
+      content: "x".repeat(SQL_CELL_CHAR_CAP + 500),
+    }));
+    // Each capped row costs the cap and about 100 characters more; a budget
+    // of three caps and 500 carries three with their text and the other 37
+    // as places.
+    const { rows: held, budget } = budgetSqlRows(rows, size, 3 * SQL_CELL_CHAR_CAP + 500);
     expect(held.length).toBe(40);
     expect(budget).toEqual({ cutCells: 40, keysOnly: 37 });
     expect(String(held[0].content).startsWith("x".repeat(SQL_CELL_CHAR_CAP))).toBe(true);

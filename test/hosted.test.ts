@@ -59,7 +59,10 @@ function fakeFetch(script: Scripted[]) {
 const KEY = "inf_test_key_do_not_log";
 const target = { baseUrl: "https://api.example.test", database: "cx" };
 
-function client(script: Scripted[], extra: { coldStartSecs?: number; timeoutMs?: number; onCall?: (i: HostedCallInfo) => void } = {}) {
+function client(
+  script: Scripted[],
+  extra: { coldStartSecs?: number; timeoutMs?: number; deadlineMs?: number; onCall?: (i: HostedCallInfo) => void } = {},
+) {
   const fake = fakeFetch(script);
   const db = new HostedDb({ ...target, apiKey: KEY }, { fetch: fake.fetch, ...extra });
   return { db, calls: fake.calls };
@@ -82,6 +85,70 @@ describe("joinKeys", () => {
     expect(calls[0].method).toBe("POST");
     expect(new URL(calls[0].url).pathname).toBe("/v1/join_keys/cx");
     expect(bodyJson(calls[0])).toEqual({ tables: ["logs", "issues"] });
+  });
+});
+
+describe("graphExpand", () => {
+  it("sends what was searched beside the rows, and nothing for it when nothing was", async () => {
+    const { db, calls } = client([json({ connected: [], seeds: 0 }), json({ connected: [], seeds: 0 })]);
+    await db.graphExpand("docs", [{ _id: "1" }], { query: "change of control", statement: "SELECT 1" });
+    expect(new URL(calls[0].url).pathname).toBe("/v1/graph_expand/cx");
+    expect(bodyJson(calls[0])).toEqual({ table_name: "docs", rows: [{ _id: "1" }], query: "change of control", statement: "SELECT 1" });
+    await db.graphExpand("docs", [{ _id: "1" }]);
+    expect(bodyJson(calls[1])).toEqual({ table_name: "docs", rows: [{ _id: "1" }] });
+  });
+});
+
+describe("graphFacts", () => {
+  it("posts the statement and returns the facts' rows", async () => {
+    const answer = { rows: [{ subject: "Acme Corp", relation: "must repay", object: "$50,000" }] };
+    const { db, calls } = client([json(answer)]);
+    const sql = "SELECT subject, relation, object FROM facts WHERE subject_node = 'acme'";
+    expect(await db.graphFacts(sql)).toEqual(answer);
+    expect(calls[0].method).toBe("POST");
+    expect(new URL(calls[0].url).pathname).toBe("/v1/graph_facts/cx");
+    expect(bodyJson(calls[0])).toEqual({ sql });
+  });
+});
+
+describe("page", () => {
+  it("posts the row's table, document and page and returns the platform's image", async () => {
+    const answer = { media_type: "image/jpeg", data: "/9j/2Q==", width: 1350, height: 1803 };
+    const { db, calls } = client([json(answer)]);
+    const image = await db.page("officeqa", "cs-1991", 17);
+    expect(image).toEqual(answer);
+    expect(calls[0].method).toBe("POST");
+    expect(new URL(calls[0].url).pathname).toBe("/v1/page/cx");
+    expect(bodyJson(calls[0])).toEqual({ table: "officeqa", document: "cs-1991", page: 17 });
+  });
+
+  it("surfaces the platform's refusal of a drawn page as an error", async () => {
+    const { db } = client([{ status: 422, body: "page: a.pdf: page 2 holds no scanned image" }]);
+    await expect(db.page("officeqa", "a", 2)).rejects.toThrow(/holds no scanned image/);
+  });
+});
+
+describe("webFetch", () => {
+  it("posts the page's address and offset and returns the platform's text", async () => {
+    const answer = {
+      url: "https://fred.stlouisfed.org/data/PPIACO",
+      content_type: "text/plain",
+      text: "1960-01-01 31.7",
+      offset: 0,
+      total_chars: 15,
+      next_offset: null,
+    };
+    const { db, calls } = client([json(answer)]);
+    const page = await db.webFetch("https://fred.stlouisfed.org/data/PPIACO", 0);
+    expect(page).toEqual(answer);
+    expect(calls[0].method).toBe("POST");
+    expect(new URL(calls[0].url).pathname).toBe("/v1/fetch/cx");
+    expect(bodyJson(calls[0])).toEqual({ url: "https://fred.stlouisfed.org/data/PPIACO", offset: 0 });
+  });
+
+  it("surfaces the platform's refusal of an address inside as an error", async () => {
+    const { db } = client([{ status: 403, body: "fetch: 169.254.169.254 is not on the public internet" }]);
+    await expect(db.webFetch("http://169.254.169.254/", 0)).rejects.toThrow(/not on the public internet/);
   });
 });
 
@@ -279,34 +346,6 @@ describe("request shapes", () => {
     expect(calls[0].body).toBeUndefined();
   });
 
-  it("sub_agent posts only the fields given and decodes the facts", async () => {
-    const answer = {
-      facts: [{ row: { path: "a.rs", n: 3 } }],
-      statement: "SELECT path, COUNT(*) AS n FROM chunks GROUP BY path",
-      coverage: { rows_total: 1, rows_returned: 1, truncated: false },
-      terminate: "answered",
-      turns: 1,
-      retries: 0,
-      model_tokens: 12,
-    };
-    const { db, calls } = client([json(answer), json(answer)]);
-    expect(await db.subAgent({ question: "how many?" })).toEqual(answer);
-    expect(calls[0].url).toBe("https://api.example.test/v1/sub_agent/cx");
-    expect(bodyJson(calls[0])).toEqual({ question: "how many?" });
-    await db.subAgent({ question: "q", context: "Scope: src/superfile", k: 10, projection: ["path", "start_line", "end_line"], max_turns: 3, max_wall_secs: 30, include_transcript: true });
-    expect(bodyJson(calls[1])).toEqual({ question: "q", context: "Scope: src/superfile", k: 10, projection: ["path", "start_line", "end_line"], max_turns: 3, max_wall_secs: 30, include_transcript: true });
-    expect(calls[1].signal).toBeInstanceOf(AbortSignal);
-  });
-
-  it("sub_agent sends the sibling tables as `tables` beside `table`, and nothing when there are none", async () => {
-    const answer = { facts: [], coverage: { rows_total: 0, rows_returned: 0, truncated: false }, terminate: "answered", turns: 1, retries: 0, model_tokens: 1 };
-    const { db, calls } = client([json(answer), json(answer)]);
-    await db.subAgent({ question: "q", table: "chunks_swe", tables: ["swe_issues", "chunks_swelogs"] });
-    expect(bodyJson(calls[0])).toEqual({ question: "q", table: "chunks_swe", tables: ["swe_issues", "chunks_swelogs"] });
-    await db.subAgent({ question: "q", table: "chunks", tables: [] });
-    expect(bodyJson(calls[1])).toEqual({ question: "q", table: "chunks" });
-  });
-
   it("validate posts the statement, rows and question, and decodes the verdict", async () => {
     const verdict = {
       valid: false,
@@ -344,12 +383,6 @@ describe("request shapes", () => {
       statement: "SELECT COUNT(*) AS n FROM chunks",
       rows: [{ n: 0 }],
     });
-  });
-
-  it("sub_agent does not retry a 501 (no agent configured on the deployment)", async () => {
-    const { db, calls } = client([{ status: 501, body: "the sub-agent is not configured on this deployment" }]);
-    await expect(db.subAgent({ question: "q" })).rejects.toMatchObject({ status: 501 });
-    expect(calls).toHaveLength(1);
   });
 
   it("strips a trailing slash off the base URL", async () => {
@@ -409,22 +442,22 @@ describe("cold-start retries", () => {
   });
 
   it("backs off and retries a 429 (the platform at capacity) within the call's own budget, not the cold-start one", async () => {
-    // A tiny cold-start budget, a sub_agent budget of max_wall_secs + 60 s:
-    // the capacity retries ride the latter.
-    const answer = { facts: [], statement: null, coverage: { rows_total: 0, rows_returned: 0, truncated: false }, terminate: "answered", turns: 1, retries: 0, model_tokens: 5 };
+    // A tiny cold-start budget and the call's own timeout: the capacity
+    // retries ride the latter.
+    const rows = [{ n: 1 }];
     const seen: HostedCallInfo[] = [];
     const { db, calls } = client(
       [
         { status: 429, body: JSON.stringify({ code: "pool_saturated", message: "no room" }), headers: { "retry-after": "0", "content-type": "application/json" } },
         { status: 429, body: "no room", headers: { "retry-after": "0" } },
-        json(answer),
+        json(rows),
       ],
       { coldStartSecs: 0.001, onCall: (i) => seen.push(i) },
     );
-    expect(await db.subAgent({ question: "q", max_wall_secs: 30 })).toEqual(answer);
+    expect(await db.querySql("SELECT 1 AS n")).toEqual(rows);
     expect(calls).toHaveLength(3);
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatchObject({ op: "sub_agent", status: 200, retries: 2 });
+    expect(seen[0]).toMatchObject({ op: "query_sql", status: 200, retries: 2 });
   });
 
   it("gives up on a 429 whose Retry-After outlives the call's budget, naming that budget and the capacity", async () => {
@@ -471,6 +504,76 @@ describe("cold-start retries", () => {
     expect(ms).toBeGreaterThan(20_000);
     expect(ms).toBeLessThanOrEqual(30_000);
     expect(retryAfterMs(new Date(Date.now() - 60_000).toUTCString())).toBe(0);
+  });
+});
+
+// --- a client's deadline -------------------------------------------------------------
+
+describe("a client's deadline", () => {
+  /** A fetch that never answers until its signal aborts it, as undici's does. */
+  const hanging: typeof fetch = (_input, init) =>
+    new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+    });
+
+  it("makes no request once the deadline has passed, and records no call", async () => {
+    const seen: HostedCallInfo[] = [];
+    const { db, calls } = client([json(["t"])], { deadlineMs: Date.now() - 1, onCall: (i) => seen.push(i) });
+    const err = await db.listTables().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(HostedError);
+    expect(err).toMatchObject({ status: 0, op: "list_tables", pastDeadline: true });
+    expect((err as Error).message).toBe("list_tables: no answer before this client's deadline");
+    expect(calls).toHaveLength(0);
+    expect(seen).toHaveLength(0);
+    expect(db.lastCall()).toBeNull();
+  });
+
+  it("abandons a call in flight at the deadline, long before the call's own timeout", async () => {
+    const t0 = Date.now();
+    const db = new HostedDb({ ...target, apiKey: KEY }, { fetch: hanging, timeoutMs: 60_000, deadlineMs: t0 + 30 });
+    const err = await db.schema("t").catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 0, op: "schema", pastDeadline: true });
+    expect((err as Error).message).toMatch(/no answer before this client's deadline/);
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(db.lastCall()).toMatchObject({ op: "schema", status: 0 });
+    // The same hang on a client with no deadline is the call's own timeout,
+    // and says so.
+    const plain = new HostedDb({ ...target, apiKey: KEY }, { fetch: hanging, timeoutMs: 20 });
+    const own = await plain.schema("t").catch((e: unknown) => e);
+    expect(own).toMatchObject({ status: 0, pastDeadline: false });
+    expect((own as Error).message).toMatch(/no response within 20 ms/);
+  });
+
+  it("does not wait out a 429's Retry-After past the deadline, and names the deadline as the budget", async () => {
+    const t0 = Date.now();
+    const { db, calls } = client([{ status: 429, body: "rate limited", headers: { "retry-after": "1" } }, json(["t"])], {
+      timeoutMs: 60_000,
+      deadlineMs: t0 + 200,
+    });
+    const err = await db.listTables().catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 429, pastDeadline: true, retryAfterSecs: 1 });
+    expect((err as HostedError).atCapacity).toBe(true);
+    expect((err as Error).message).toMatch(/gave up after 0 retries within this client's deadline/);
+    expect(calls).toHaveLength(1);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it("ends the cold-start retries at the deadline", async () => {
+    const forever: Scripted[] = [];
+    for (let i = 0; i < 10_000; i++) forever.push({ status: 503, body: "still spawning", headers: { "retry-after": "0" } });
+    const t0 = Date.now();
+    const { db, calls } = client(forever, { coldStartSecs: 120, deadlineMs: t0 + 50 });
+    const err = await db.querySql("SELECT 1").catch((e: unknown) => e);
+    expect(err).toMatchObject({ pastDeadline: true });
+    expect(calls.length).toBeGreaterThan(1);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it("leaves a call that fails on its own as it was: not past the deadline", async () => {
+    const { db } = client([{ status: 404, body: "no such table" }], { deadlineMs: Date.now() + 60_000 });
+    const err = await db.schema("gone").catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 404, pastDeadline: false });
+    expect((err as Error).message).toBe("schema: server returned 404: no such table");
   });
 });
 
@@ -662,5 +765,123 @@ describe("rowsToIpc", () => {
     const ipc = rowsToIpc(columns, [{ path: "a.ts", start_line: 1, embedding: [1, 2, 3] }]);
     await db.appendIpc("chunks", ipc);
     expect(arrow.tableFromIPC(calls[0].body as Uint8Array).numRows).toBe(1);
+  });
+});
+
+describe("reads that ask for a rerank", () => {
+  it("send validate and rerank on the statement and read the platform's envelope", async () => {
+    const { db, calls } = client([
+      json({ rows: [{ id: 2 }, { id: 1 }], validation: { valid: true, check: "anchors" }, rerank: { model: "typesafe/jev-1.13" } }),
+    ]);
+    const checked = await db.querySqlChecked("SELECT id FROM t", {
+      validate: { table_name: "t", field_name: "body", question: "q" },
+      rerank: { question: "q" },
+    });
+    expect(checked.rows).toEqual([{ id: 2 }, { id: 1 }]);
+    expect(checked.validation).toMatchObject({ valid: true });
+    expect(checked.rerank).toMatchObject({ model: "typesafe/jev-1.13" });
+    expect(bodyJson(calls[0])).toEqual({
+      query: "SELECT id FROM t",
+      validate: { table_name: "t", field_name: "body", question: "q" },
+      rerank: { question: "q" },
+    });
+  });
+
+  it("fall back to no rerank on a platform that predates it, and stop asking", async () => {
+    const refused: Scripted = {
+      status: 400,
+      body: JSON.stringify({ message: "unknown field `rerank`, expected one of `query`, `validate`" }),
+      headers: { "content-type": "application/json" },
+    };
+    const { db, calls } = client([refused, json([{ id: 1 }]), json([{ id: 3 }])]);
+    const first = await db.querySqlChecked("SELECT id FROM t", { rerank: { question: "q" } });
+    expect(first.rows).toEqual([{ id: 1 }]);
+    expect(bodyJson(calls[0]).rerank).toEqual({ question: "q" });
+    expect(bodyJson(calls[1]).rerank).toBeUndefined();
+    // Remembered: the next read does not ask again.
+    await db.bm25Search("t", "body", "x", 5, [], { question: "q", k: 5 });
+    expect(calls).toHaveLength(3);
+    expect(bodyJson(calls[2]).rerank).toBeUndefined();
+  });
+
+  it("let any other refusal stand", async () => {
+    const refused: Scripted = {
+      status: 400,
+      body: JSON.stringify({ message: "query_sql is read-only" }),
+      headers: { "content-type": "application/json" },
+    };
+    const { db } = client([refused]);
+    await expect(db.querySqlChecked("DELETE FROM t", { rerank: { question: "q" } })).rejects.toThrow("read-only");
+  });
+});
+
+describe("a checked read whose check cannot answer", () => {
+  const VALIDATE = { validate: { table_name: "t", field_name: "body" } };
+  const rows = [{ id: 1 }, { id: 2 }];
+  const error = (status: number, message: string): Scripted => ({
+    status,
+    body: JSON.stringify({ message }),
+    headers: { "content-type": "application/json" },
+  });
+
+  it("resends without the check where the deployment does not validate, and asks for it no more", async () => {
+    const { db, calls } = client([error(400, "validate is not available on this deployment"), json(rows), json(rows)]);
+    expect(await db.querySqlChecked("SELECT id FROM t", VALIDATE)).toEqual({ rows });
+    expect(calls.map((c) => bodyJson(c).validate === undefined)).toEqual([false, true]);
+    expect(db.validatesOnRead).toBe(false);
+    // The next read goes out plain at once.
+    expect(await db.querySqlChecked("SELECT id FROM t", VALIDATE)).toEqual({ rows });
+    expect(calls).toHaveLength(3);
+    expect(bodyJson(calls[2]).validate).toBeUndefined();
+  });
+
+  it("returns the rows plain when the checked read fails for any other reason, and keeps asking next time", async () => {
+    // A 503 on the checked attempt is not waited out: it has the plain read to fall back to.
+    const { db, calls } = client([error(503, "the worker is restarting"), json(rows)], { coldStartSecs: 60 });
+    expect(await db.querySqlChecked("SELECT id FROM t", VALIDATE)).toEqual({ rows });
+    expect(calls).toHaveLength(2);
+    expect(bodyJson(calls[1]).validate).toBeUndefined();
+    expect(db.validatesOnRead).toBe(true);
+  });
+
+  it("returns the rows plain when the platform rejects the check's own arguments", async () => {
+    const { db, calls } = client([error(400, "validate: no column named body in t"), json(rows)]);
+    expect(await db.querySqlChecked("SELECT id FROM t", VALIDATE)).toEqual({ rows });
+    expect(calls).toHaveLength(2);
+    expect(bodyJson(calls[1]).validate).toBeUndefined();
+    // Not a deployment without validation: the next read still asks.
+    expect(db.validatesOnRead).toBe(true);
+  });
+
+  it("refuses a statement the platform refuses, in the plain read's words", async () => {
+    const { db, calls } = client([error(400, "query_sql is read-only"), error(400, "query_sql is read-only")]);
+    await expect(db.querySqlChecked("DELETE FROM t", VALIDATE)).rejects.toThrow("read-only");
+    expect(calls).toHaveLength(2);
+  });
+
+  it("lets a refusal of the key or the account stand, without a second read", async () => {
+    for (const status of [401, 402, 403]) {
+      const { db, calls } = client([error(status, "refused")]);
+      await expect(db.querySqlChecked("SELECT id FROM t", VALIDATE), String(status)).rejects.toThrow();
+      expect(calls, String(status)).toHaveLength(1);
+    }
+  });
+
+  it("gives the checked attempt a budget of its own, and returns the rows plain past it", async () => {
+    // The checked read never answers; the plain one does at once.
+    let call = 0;
+    const fetchImpl: typeof fetch = (_input, init) => {
+      call += 1;
+      if (call === 1) {
+        return new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)));
+      }
+      return Promise.resolve(new Response(JSON.stringify(rows), { status: 200, headers: { "content-type": "application/json" } }));
+    };
+    const db = new HostedDb({ ...target, apiKey: KEY }, { fetch: fetchImpl, timeoutMs: 60_000, checkedReadTimeoutMs: 50 });
+    const t0 = performance.now();
+    expect(await db.querySqlChecked("SELECT id FROM t", VALIDATE)).toEqual({ rows });
+    expect(call).toBe(2);
+    // Bounded by the checked budget, not the client's minute.
+    expect(performance.now() - t0).toBeLessThan(5_000);
   });
 });

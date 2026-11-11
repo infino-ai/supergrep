@@ -20,7 +20,6 @@ import { call, scriptPlatform, start, stop, type Started } from "./mcp-harness.j
 // code below is dynamic.
 delete process.env.CX_TABLE;
 delete process.env.CX_REMOTE_SEARCH;
-delete process.env.CX_SIBLING_TABLES;
 process.env.CX_NO_EMBED = "1";
 process.env.CX_AUTO_INDEX = "0";
 process.env.CX_NO_RECEIPT = "1";

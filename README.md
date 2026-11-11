@@ -12,19 +12,18 @@
 
 **[Try it live at infino.ai/supergrep](https://infino.ai/supergrep)** - put a question to a real codebase and watch the same model answer it with and without SuperGrep, side by side, with the bill for each. Supergrep uses Infino for retrieval, which tightly integrates small language models with indexes for scalable agent retrieval on object storage. 
 
-![SuperGrep: find and plain sql on your machine, search, semantic sql and ask in the Infino cloud, one index in both places](docs/subagent/architecture.svg)
+![SuperGrep: find and plain sql on your machine, search and semantic sql in the Infino cloud, one index in both places](docs/subagent/architecture.svg)
 
-SuperGrep offers agents four tools over an Infino index, kept in two places. `find` and plain `sql` run on your machine, over the keyword index. Conversely, anything with meaning in it - `search`, a `sql` statement with a ranked search inside it, and `ask` - runs in the Infino cloud, so heavy compute and embeddings stays off your laptop. Infino also embeds inference models in its service, so several small models work the index at once and hand your agent the rows they found. Your agent keeps the reasoning, writes the answer, and decides when to use SuperGrep. No configuration.
+SuperGrep offers agents three tools over an Infino index, kept in two places. `find` and plain `sql` run on your machine, over the keyword index. Conversely, anything with meaning in it - `search`, and a `sql` statement with a ranked search inside it - runs in the Infino cloud, so heavy compute and embeddings stay off your laptop. Your agent keeps the reasoning, writes the answer, and decides when to use SuperGrep. No configuration.
 
 <details>
-<summary>The four tools, one line each - for the agent reading this</summary>
+<summary>The three tools, one line each - for the agent reading this</summary>
 
 | tool | what it does |
 |---|---|
 | `find` | Every line containing an exact string, like `grep -n`: complete, unranked, with the repo-wide total and per-file counts. Tens of milliseconds from the index. |
 | `search` | One ranked pass fusing exact keyword matching with semantic similarity, so it works whether or not you know the words. Hits carry the code, cited `path:line`. |
 | `sql` | Read-only SQL over the index. The ranked searches are table-valued, so "which files have the most code about X" ranks and tallies in one query. |
-| `ask` | A question that spans the repository, handed to small models on the Infino service that run the investigation against the index and return the rows they found, cited `path:line`, rather than prose. Several asks run at once. |
 
 </details>
 
@@ -32,8 +31,7 @@ SuperGrep offers agents four tools over an Infino index, kept in two places. `fi
 
 ## What people use it for
 
-- **Code review.** The reviewer's question is "what else calls this, and what breaks if it changes". `find` answers with every caller and the counts in one call, and `ask` reads the paths that matter, so the review is about the change rather than about finding it.
-- **Big explorations.** "How does X work end to end" spawns fifty look-ups. With SuperGrep they run as fifty asks in parallel against the index, instead of fifty subagents reading the tree into your bill.
+- **Code review.** The reviewer's question is "what else calls this, and what breaks if it changes". `find` answers with every caller and the counts in one call, so the review is about the change rather than about finding it.
 - **Several codebases at once.** Every local tool takes a repository path, so one session roams across every repo it touches - the service, the client, the shared library - without a checkout per question.
 - **Code, logs and issues together.** Index the logs, the test output and the issue export beside the source, and "why did this integration test start failing?" is one question over all of them.
 
@@ -47,8 +45,8 @@ The model's own file tools stayed available throughout. What it had from SuperGr
 
 SuperGrep looks across all the files a question needs, not just the source. Logs, test output, stack traces, CI output, configuration and docs go in beside the code -
 `.log`, `.out`, `.err`, `.jsonl` and `.ndjson` are chunked at record boundaries, so a stack trace stays with the message that explains it -
-and the same four tools run over all of it: `find` for an exact stack frame, `search` for a failure you can only describe, `sql` to count and rank across a
-run, `ask` for the question that spans several of them at once.
+and the same three tools run over all of it: `find` for an exact stack frame, `search` for a failure you can only describe, and `sql` to count and rank across a
+run.
 
 That matters most where a frontier model is weakest. A log is the pathological case for a context window - large, repetitive, mostly irrelevant, and paid for
 again on every turn it stays in the transcript. An index collapses it to the spans that matter before the model sees any of it. On a public benchmark of CI-failure diagnosis, scored by the benchmark's own judge, that puts SuperGrep second on the score and first by a distance on score per token of context:
@@ -64,7 +62,7 @@ The same model, the same 36 questions about a 256,000-line codebase, with and wi
 <details>
 <summary>How the runs were set up</summary>
 
-Real agent runs through the Claude Agent SDK, the same minimal prompt in every arm, on the [infino](https://github.com/infino-ai/infino) engine repository, measured 2026-09-24. Thirty-six questions in five categories: aggregation (10), comprehension (6), by meaning (6), pinpoint (8), known file (6). The file-tools arm is stock Claude Code: Glob, Grep, Read, LS, Bash, and the Agent tool with the built-in Explore subagent. The SuperGrep arm is the same plus the four tools above. The judge is Opus 5.5.
+Real agent runs through the Claude Agent SDK, the same minimal prompt in every arm, on the [infino](https://github.com/infino-ai/infino) engine repository, measured 2026-09-24. Thirty-six questions in five categories: aggregation (10), comprehension (6), by meaning (6), pinpoint (8), known file (6). The file-tools arm is stock Claude Code: Glob, Grep, Read, LS, Bash, and the Agent tool with the built-in Explore subagent. The SuperGrep arm is the same plus SuperGrep's MCP tools. The judge is Opus 5.5.
 
 </details>
 
@@ -91,7 +89,7 @@ It wins on questions about the whole codebase: counts, rankings, every occurrenc
 
 ## Install
 
-Two commands, once per machine. You need Claude Code and node 22 or newer, on macOS or Linux.
+Two commands, once per machine. You need [Claude Code](https://claude.com/claude-code) and Node.js 22.19 or newer, on macOS or Linux.
 
 ```bash
 claude plugin marketplace add infino-ai/supergrep
@@ -102,17 +100,17 @@ claude plugin install supergrep@infino-ai
 
 That is the setup. Open Claude Code in any directory - a repository, a folder of logs, your notes, anything - and ask a question. The first question indexes the directory, and `find`, `sql` and `read` answer from then on. Nothing is configured per directory, no account exists yet, and nothing has left your machine.
 
-`search` and `ask` are the cloud half - the embeddings and the retrieval loop run on the Infino platform, over a copy of the index kept there - and they need an account. The first time a question needs them, Claude tells you the one command and does not run it, because it is yours to run. Once, in a terminal:
+`search` is the cloud half - the embeddings run on the Infino platform, over a copy of the index kept there - and it needs an account. The first time a question needs it, Claude tells you the one command and does not run it, because it is yours to run. Once, in a terminal:
 
 ```bash
 npx -y @infino-ai/code-context login --platform https://api.supergrep.infino.ai
 ```
 
-**A free account, no credit card required.** There is no form, no email, no password and no card, and nothing is created without your say-so: the command tells you that the contents of the directories you use `search` and `ask` in will be uploaded to Infino, asks, and only on your yes creates the account and stores its key at `~/.infino/key`, mode 600, readable only by you. No config file ever holds a key or a path to one. Infino is SOC 2 Type 2 certified.
+**A free account, no credit card required.** There is no form, no email, no password and no card, and nothing is created without your say-so: the command tells you that the contents of the directories you use `search` in will be uploaded to Infino, asks, and only on your yes creates the account and stores its key at `~/.infino/key`, mode 600, readable only by you. No config file ever holds a key or a path to one. Infino is SOC 2 Type 2 certified.
 
 **Keep that key.** Because the free account asks for no email and no card, the key is the only thing that identifies you: it is how you get back in, and nothing else can. Back it up somewhere safe. When you add your details in the Infino console the same account gains a sign-in, and keys can be managed from there.
 
-Restart the session and every directory you open has all four tools. Each one gets its own database on your account, named after the directory and loaded the first time you use `search` or `ask` there - a directory you only ever `find` in is never uploaded. One server answers for every directory a session touches: the tools take a `path`, so a session that spans several projects names the one it means. When the free credit runs out, `ask` says so and tells you how to add billing details and a card to the same account; `find` and plain `sql` keep working throughout.
+Restart the session and every directory you open has all three tools. Each one gets its own database on your account, named after the directory and loaded the first time you use `search` there - a directory you only ever `find` in is never uploaded. One server answers for every directory a session touches: the tools take a `path`, so a session that spans several projects names the one it means. When the free credit runs out, add billing details and a card to the same account; `find` and plain `sql` keep working throughout.
 
 ### If you already have an Infino account
 
@@ -135,14 +133,14 @@ cx index                      # bring the index up to date; incremental, full on
 cx index ~/notes              # index some other directory
 cx index --full               # force a full rebuild
 cx index --watch              # keep watching the tree and sync on every change
-cx index --no-embed           # keyword index only, skip the vector stage
+cx index --no-embed           # signed in: load the platform table without vectors
 cx index --max-files 1000000  # raise the cap past the 500,000 default; over it, the index is
                               # partial and says so, with the value to pass to get all of it
 ```
 
-The index is plain files under `.infino/` in the directory you indexed. Keyword search is live within seconds of the first `cx index`; semantic and hybrid search light up as the vectors finish backfilling behind it. `cx status` says what the index holds and how fresh it is.
+The index is plain files under `.infino/` in the directory you indexed. Keyword search is live within seconds of the first `cx index`. The local index stays keyword-only: search by meaning runs on the platform copy, once you are signed in. `cx status` says what the index holds and how fresh it is.
 
-Signed in, `cx index` loads the platform copy in the same pass - the directory's own database on your account, so `ask` sees the same content as `find`. To load a database you name instead:
+Signed in, `cx index` loads the platform copy in the same pass - the directory's own database on your account, so `search` sees the same content as `find`. To load a database you name instead:
 
 ```bash
 cx index --db https://api.supergrep.infino.ai/<database>
@@ -152,7 +150,7 @@ cx index --db https://api.supergrep.infino.ai/<database>
 
 ## Your data, through the same tools
 
-The same plugin reaches every table in your Infino account, not only the directories it indexed. Signed in, the agent has three more tools and a `database` argument on the four it had:
+The same plugin reaches every table in your Infino account, not only the directories it indexed. Signed in, the agent has three more tools and a `database` argument on the three it had:
 
 | tool | what it does |
 |---|---|
@@ -160,7 +158,7 @@ The same plugin reaches every table in your Infino account, not only the directo
 | `hydrate` | Load a dataset into a database of the account, from wherever it is: a bucket prefix the platform reads itself, files on your laptop, files on a machine you reach with `ssh`, or a prefix already in the database's storage. Parquet, CSV, NDJSON, Iceberg and parsed documents. The database is created if it is new; the load runs on the platform and `hydrate_status` follows it. |
 | `hydrate_status`, `hydrate_cancel` | Where a load stands; stop one. |
 
-`sql`, `search`, `find` and `ask` take `database` (and `table`) to run over a table of the account instead of a repository - the statement, the ranked search, the exact match and the retrieval loop, with the platform's verdict on a statement's rows and its keys for a join, exactly as over code. So one session asks "which files call this" of the checkout and "which accounts moved the most money last quarter" of the data, through one MCP, and a question can span both.
+`sql`, `search` and `find` take `database` (and `table`) to run over a table of the account instead of a repository - the statement, the ranked search and the exact match, with the platform's verdict on a statement's rows and its keys for a join, exactly as over code. So one session asks "which files call this" of the checkout and "which accounts moved the most money last quarter" of the data, through one MCP, and a question can span both.
 
 Nothing is configured per table or per database. Point the agent at a folder of CSVs, a Parquet export, a bucket, or a directory on a dev box, and ask it to load it; then ask questions. Files on your laptop or on a remote machine go straight into the database's storage over the platform's upload sessions (`ssh` is yours: the plugin runs one `find` and one `cat` per file over it and installs nothing there); a bucket is read in place and nothing is copied.
 
@@ -224,7 +222,7 @@ curl -sS -X DELETE "https://api.supergrep.infino.ai/v1/hydrate/<database>?table=
 
 By default a job that fails for good drops its half-built table, so a partial table is never served; `"on_failure": "keep"` keeps what was committed.
 
-The table is then searchable like any other. `ask` runs over it, and one question can span it and your code at once.
+The table is then searchable like any other, and one question can span it and your code at once.
 
 Note: Hydrate API needs to be enabled per account. Contact support@infino.ai to enable.
 

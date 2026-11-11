@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 //
-// SuperGrep, package/CLI/MCP server code-context / cx - retrieval subagents
-// for Claude Sonnet: three tools over a local code index, two more over the
-// same index's platform copy.
+// SuperGrep, package/CLI/MCP server code-context / cx - retrieval for AI
+// coding agents: find, sql and read over a local code index, and search over
+// the same index's platform copy.
 //
 // Configuration is command-line flags. The platform knobs are flags on the two
 // commands that write or serve the platform table (`index`, `mcp`); they are
@@ -13,10 +13,12 @@
 // process on the machine - so it comes from a file (--api-key-file) or the
 // INFINO_API_KEY environment variable.
 
-import { Command } from "commander";
+import { resolve } from "node:path";
+import { Command, Option } from "commander";
 import { indexCmd, type IndexCmdOptions } from "./commands/index-cmd.js";
 import { installCmd, type InstallCmdOptions } from "./commands/install-cmd.js";
-import { hookCmd, type HookCmdOptions } from "./commands/hook-cmd.js";
+import { PLAYBOOK_ENV } from "./core/playbook.js";
+import { HOOK_MEMORY, HOOK_MEMORY_SEND, hookCmd, type HookCmdOptions } from "./commands/hook-cmd.js";
 import { loginCmd, type LoginCmdOptions } from "./commands/login-cmd.js";
 import { findCmd, searchCmd, sqlCmd, statusCmd, usageCmd } from "./commands/query-cmds.js";
 import { savingsCmd } from "./commands/savings-cmd.js";
@@ -27,9 +29,6 @@ import {
   API_KEY_ENV,
   DEFAULT_DB_TIMEOUT_MS,
   DEFAULT_DB_COLD_START_SECS,
-  DEFAULT_SUBAGENT_K,
-  DEFAULT_SUBAGENT_MAX_TURNS,
-  DEFAULT_SUBAGENT_MAX_WALL_SECS,
   DEFAULT_CAPS,
   configureHosted,
   hostedSettingsFromFlags,
@@ -75,8 +74,8 @@ program
     "Local code search for AI coding agents - an index in plain files under .infino/.\n" +
       "Keyword search seconds after `cx index`; semantic and hybrid search when vectors\n" +
       "finish backfilling; SQL with relevance-ranked aggregation over the whole repo.\n" +
-      "With --db the same index is also kept on an Infino database in the cloud, where the\n" +
-      "ask tool runs.",
+      "With --db the same index is also kept on an Infino database in the cloud, where\n" +
+      "search runs.",
   )
   .version(CLI_VERSION)
   .addHelpText(
@@ -90,18 +89,18 @@ Examples:
   cx sql "SELECT path, SUM(end_line - start_line + 1) AS lines \\
           FROM bm25_search('chunks','content','vector index', 300) \\
           GROUP BY path ORDER BY lines DESC LIMIT 10"
-  cx mcp                              serve the MCP tools over stdio (find and plain sql locally; search, ranked sql and ask on the platform)
+  cx mcp                              serve the MCP tools over stdio (find and plain sql locally; search and ranked sql on the platform)
   cx login --db https://host < key    store this machine's account once (key at mode 600)
   cx install                          write the MCP entry into .mcp.json - with an account stored,
-                                      this also registers the repo's database and enables all four
-                                      tools, with no flags and no key in the config
+                                      this also registers the repo's database and enables search,
+                                      with no flags and no key in the config
   cx install --db https://host/<database> --api-key-file ~/.infino/key
                                       the same, naming the database and key explicitly instead
   cx index --db https://host/<database> --api-key-file ~/.infino/key
                                       index the repo locally AND load it into the platform database
   cx mcp --db https://host/<database> --api-key-file ~/.infino/key
-                                      serve find/search/sql over the local index, plus ask over
-                                      the platform copy; every sync updates both`,
+                                      serve find/sql over the local index, plus search over the
+                                      platform copy; every sync updates both`,
   );
 
 program
@@ -124,7 +123,7 @@ hostedOptions(
     .argument("[path]", "repo root to index")
     .option("--full", "force a full rebuild instead of an incremental sync")
     .option("-w, --watch", "keep watching the tree and sync on changes")
-    .option("--no-embed", "keyword index only - skip the vector stage")
+    .option("--no-embed", "load the platform table without vectors (the local index is keyword-only either way)")
     .option("--max-files <n>", `cap on files indexed - a tree over it indexes partially and says so (default ${DEFAULT_CAPS.maxFiles})`)
     .option("--no-ignore", "index gitignored files and directories too (or CX_NO_IGNORE=1, which cx mcp also honours)")
     .option(
@@ -201,7 +200,7 @@ program
   .option("--platform [url]", "get a free account on this platform, https://host (or CX_PLATFORM_URL); asks you first, then stores the key")
   .option("--db <url>", "the platform a key you already have belongs to, https://host")
   .option("--api-key-file <path>", "file holding that key (default: read it from standard input)")
-  .option("--yes", "agree to uploading the contents of the directories you use search and ask in, without being asked (a piped key has no terminal to ask on)")
+  .option("--yes", "agree to uploading the contents of the directories you use search in, without being asked (a piped key has no terminal to ask on)")
   .option("--console-url <url>", "where a human manages billing on this platform, shown when the account runs out of credit")
   .option("--show", "report the stored account and change nothing")
   .option("--logout", "forget the stored key (the platform URL is kept: it is not a secret)")
@@ -249,19 +248,20 @@ hostedOptions(
 hostedOptions(
   program
     .command("mcp")
-    .description("serve the MCP tools (find / search / sql) over stdio; with --db, also ask over the platform table")
+    .description("serve the MCP tools (find / sql / read) over stdio; with --db, also search over the platform table")
     .option("-C, --path <dir>", "repo root (default: current directory)"),
 )
-  .option("--subagent-max-turns <n>", `turn cap for one ask call (default ${DEFAULT_SUBAGENT_MAX_TURNS})`)
-  .option("--subagent-max-wall-secs <n>", `wall-clock cap for one ask call, in seconds (default ${DEFAULT_SUBAGENT_MAX_WALL_SECS})`)
-  .option("--subagent-k <n>", `facts one ask call asks for and returns (default ${DEFAULT_SUBAGENT_K}, search's k)`)
   .option("--http <port>", "serve over Streamable HTTP on this port instead of stdio - one URL any MCP client adds as a remote connector - behind a TLS proxy")
   .option("--http-host <host>", `the address --http binds (default ${DEFAULT_HTTP_HOST}, loopback)`)
   .option("--http-path <path>", `the URL path --http serves MCP at (default ${DEFAULT_HTTP_PATH})`)
   .option("--read-only", "offer no tool that writes - no hydrate, no hydrate_cancel (or CX_READ_ONLY=1): for a URL shared with no sign-in")
   .option("--sign-in <url>", "with --http: every call carries an Infino account's key, and a call with none is told to sign in at <url>, the OAuth resource metadata; --db then names the platform alone")
-  .action(async (opts: { path?: string; http?: string; httpHost?: string; httpPath?: string; readOnly?: boolean } & HostedFlags) => {
+  .option("--playbook <file>", "a playbook of learned bullets (core/playbook.ts): its outer bullets join the instructions (or CX_PLAYBOOK)")
+  .action(async (opts: { path?: string; http?: string; httpHost?: string; httpPath?: string; readOnly?: boolean; playbook?: string } & HostedFlags) => {
     applyHosted(opts, resolveRoot(opts.path));
+    // The flag is the env var, so one reading (`configuredPlaybook`) serves
+    // the server however it was started.
+    if (opts.playbook) process.env[PLAYBOOK_ENV] = resolve(opts.playbook);
     const readOnly = opts.readOnly ? { readOnly: true } : {};
     if (opts.http !== undefined) {
       const port = Number(opts.http);
@@ -281,20 +281,35 @@ hostedOptions(
     await serveMcp(opts.path, readOnly);
   });
 
-program
-  .command("hook")
-  .description(
-    "(run by Claude Code) a hook `cx install` wrote: `hook answer` shows the answer tool's result to you directly; " +
-      "`hook answer-input` hands the tool what the model said while it worked, from the session transcript; " +
-      "`hook answer-stop` sends the model back for the answer call when it retrieved and stopped without one; " +
-      "`hook answer-due` reminds the model, as each retrieval returns, that the writer has the rows and it should not write the answer itself",
-  )
-  .argument("<event>", "which hook: answer | answer-input | answer-stop | answer-due")
-  .option("--chunk <i>", "which chunk of the answer this entry shows (from 1)")
-  .option("--chunks <n>", "how many chunks the answer is shown in")
-  .action((event: string, opts: HookCmdOptions) => {
-    hookCmd(event, opts);
-  });
+hostedOptions(
+  program
+    .command("hook")
+    .description(
+      "(run by Claude Code) a hook `cx install` wrote: " +
+        "`hook answer-figures` sends the model back once to compute with sql any figure of its final answer that no tool result holds; " +
+        "`hook memory` writes the turn's question, final answer and the files the model wrote to the --db database's memory",
+    )
+    .argument("<event>", "which hook: answer-figures | memory")
+    // Accepted and ignored: a hook entry an earlier install wrote may still
+    // pass them, and the event it names now exits quietly (hookCmd).
+    .addOption(new Option("--chunk <i>").hideHelp())
+    .addOption(new Option("--chunks <n>").hideHelp())
+    .option("--server <name>", "answer-figures, memory: the server this install's Stop entry belongs to")
+    .option("--rows-file <path>", "(internal) memory-send: the rows the memory hook left to send"),
+).action(async (event: string, opts: HookCmdOptions & HostedFlags) => {
+  // Only memory talks to the platform; the other hooks read the transcript
+  // alone and must not fail on a flag they have no use for. A platform it
+  // cannot name (no key, say) costs the turn its memory, never the stop.
+  if (event === HOOK_MEMORY || event === HOOK_MEMORY_SEND) {
+    try {
+      applyHosted(opts, resolveRoot());
+    } catch (err) {
+      console.error(`code-context: memory not written: ${(err as Error).message}`);
+      return;
+    }
+  }
+  await hookCmd(event, opts);
+});
 
 program.parseAsync().catch((err: Error) => {
   console.error(`error: ${err.message}`);
