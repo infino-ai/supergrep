@@ -36,7 +36,7 @@ def _status(args) -> int:
     if not settings.repos:
         print(f"repositories: none ({config.REPOS_ENV} is unset)")
     for repo in settings.repos:
-        state = "not a directory" if not repo.is_dir() else ("indexed" if (repo / ".infino").is_dir() else "no index yet")
+        state = "not a directory" if not repo.is_dir() else ("indexed" if index.has_index(repo) else "no index yet")
         print(f"repository: {repo} ({state})")
     problems = config.missing(settings)
     for problem in problems:
@@ -53,7 +53,7 @@ def _index(args) -> int:
     failed = 0
     for repo, outcome in index.sync_all(settings):
         print(f"{repo}: {outcome}")
-        if outcome.startswith(("failed", "gave up", "the client did not start", "not a directory")):
+        if index.failed(outcome):
             failed += 1
     return 1 if failed else 0
 

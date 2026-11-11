@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -54,6 +54,11 @@ class Settings:
     node: str
     mcp_server: str = DEFAULT_MCP_SERVER
     auto_index: bool = True
+    # The `env` of `mcp_servers.<mcp_server>`: what Hermes hands the server it
+    # starts, handed to the session-start index too, so the client's own
+    # settings there (CX_INCLUDE, CX_NO_IGNORE, CX_MAX_FILES, ...) are the
+    # same for both.
+    block: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def default_root(self) -> Optional[Path]:
@@ -81,6 +86,18 @@ def default_client(checkout: Path = CHECKOUT) -> Path:
     return checkout / "dist" / "cli.js"
 
 
+def hermes_node(env: Mapping[str, str]) -> Optional[str]:
+    """The Node Hermes's installer keeps under `<hermes home>/tools/node-*/bin`
+    (HERMES_HOME, else ~/.hermes), the newest by name; None when there is
+    none."""
+    homes = [Path(os.path.expanduser(h)) for h in (env.get("HERMES_HOME"), "~/.hermes") if h]
+    for home in homes:
+        found = sorted((home / "tools").glob("node-*/bin/node"))
+        if found:
+            return str(found[-1])
+    return None
+
+
 def _block(server: str) -> Mapping[str, str]:
     """The `env` of `mcp_servers.<server>` in the profile's Hermes config,
     when this runs under Hermes; empty elsewhere (the tests, a plain shell)."""
@@ -102,7 +119,8 @@ def load(env: Optional[Mapping[str, str]] = None, checkout: Path = CHECKOUT) -> 
     the config block."""
     env = dict(os.environ if env is None else env)
     server = (env.get(MCP_SERVER_ENV) or DEFAULT_MCP_SERVER).strip() or DEFAULT_MCP_SERVER
-    merged = {**env, **_block(server)}
+    block = _block(server)
+    merged = {**env, **block}
 
     def value(name: str) -> str:
         return (merged.get(name) or "").strip()
@@ -114,15 +132,18 @@ def load(env: Optional[Mapping[str, str]] = None, checkout: Path = CHECKOUT) -> 
     )
     client = value(CLIENT_ENV)
     client_js = Path(os.path.expanduser(client)).resolve() if client else default_client(checkout)
-    node = value(NODE_ENV) or shutil.which("node") or "node"
+    node = value(NODE_ENV) or shutil.which("node", path=merged.get("PATH")) or hermes_node(merged) or "node"
     auto_index = value(AUTO_INDEX_ENV).lower() not in OFF_VALUES
-    return Settings(repos=repos, client_js=client_js, node=node, mcp_server=server, auto_index=auto_index)
+    return Settings(repos=repos, client_js=client_js, node=node, mcp_server=server, auto_index=auto_index,
+                    block=block)
 
 
 def missing(settings: Settings) -> list[str]:
-    """What keeps the client from starting: the client not built, a
-    repository that is not a directory."""
+    """What keeps the client from starting: no Node, the client not built,
+    a repository that is not a directory."""
     out = []
+    if shutil.which(settings.node) is None:
+        out.append(f"no Node at {settings.node!r} (put `node` on PATH, or set {NODE_ENV})")
     if not settings.client_js.is_file():
         out.append(f"the client is not built: no {settings.client_js} (run `npm run build` in the checkout, "
                    f"or set {CLIENT_ENV})")

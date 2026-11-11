@@ -9,7 +9,7 @@ Hermes starts one command for `mcp_servers.supergrep`:
         command: hermes
         args: [supergrep, mcp]
         env:
-          SUPERGREP_REPOS: /home/me/src/infino,/home/me/src/agent-apis
+          SUPERGREP_REPOS: /home/me/src/project-one,/home/me/src/project-two
 
 `hermes supergrep mcp` reads the settings and becomes `node dist/cli.js mcp`
 with the first repository as the tools' root (`CX_ROOT`); the client reaches
@@ -53,4 +53,7 @@ def launch(settings: Optional[config.Settings] = None) -> None:
         sys.exit("supergrep: " + "; ".join(problems))
     argv, env = command(settings)
     sys.stdout.flush()
-    os.execvpe(argv[0], argv, {**os.environ, **env})
+    try:
+        os.execvpe(argv[0], argv, {**os.environ, **env})
+    except OSError as e:
+        sys.exit(f"supergrep: the client did not start: {argv[0]}: {e}")

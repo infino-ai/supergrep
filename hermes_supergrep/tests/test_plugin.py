@@ -7,7 +7,9 @@ itself is not needed; its context's methods are the ones this plugin calls
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import threading
 import stat
 from pathlib import Path
 
@@ -46,6 +48,7 @@ def fake_node(tmp_path):
     script.write_text(
         "#!/bin/sh\n"
         f"echo \"$PWD $*\" >> {log}\n"
+        f"echo \"env CX_ROOT=$CX_ROOT CX_INDEX_DIR=$CX_INDEX_DIR CX_INCLUDE=$CX_INCLUDE\" >> {log}.env\n"
         "if [ \"$2\" = index ]; then echo 'indexed 3 files'; fi\n"
         "case \"$1\" in */fail.js) echo boom >&2; exit 3;; esac\n"
     )
@@ -121,26 +124,34 @@ def test_indexing_runs_the_client_s_index_in_each_repository(tmp_path, fake_node
     assert outcomes == [(a.resolve(), "indexed 3 files"), (b.resolve(), "indexed 3 files"),
                         ((tmp_path / "gone").resolve(), "not a directory")]
     runs = log.read_text().strip().splitlines()
-    assert runs == [f"{a.resolve()} {client} index", f"{b.resolve()} {client} index"]
+    assert runs == [f"{a.resolve()} {client} index {a.resolve()}", f"{b.resolve()} {client} index {b.resolve()}"]
     # A client that fails says so with its last line, and the index command reports it.
     failing = config.load({config.REPOS_ENV: str(a), config.CLIENT_ENV: str(tmp_path / "fail.js"),
                            config.NODE_ENV: str(node)})
     assert index.sync_one(failing, a.resolve()) == "failed (3): boom"
 
 
-def test_the_session_start_hook_indexes_unless_told_not_to(tmp_path, fake_node, monkeypatch):
+def _indexed(repo: Path) -> Path:
+    (repo / index.INDEX_DIR_NAME).mkdir(parents=True)
+    (repo / index.INDEX_DIR_NAME / index.MANIFEST_NAME).write_text("{}")
+    return repo
+
+
+def test_the_session_start_hook_syncs_indexed_repositories_unless_told_not_to(tmp_path, fake_node, monkeypatch):
     node, log = fake_node
-    a = tmp_path / "a"
-    a.mkdir()
+    a = _indexed(tmp_path / "a")
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
     client = tmp_path / "cli.js"
     client.write_text("")
-    env = {config.REPOS_ENV: str(a), config.CLIENT_ENV: str(client), config.NODE_ENV: str(node)}
+    env = {config.REPOS_ENV: f"{fresh},{a}", config.CLIENT_ENV: str(client), config.NODE_ENV: str(node)}
     monkeypatch.setattr(os, "environ", env)
     thread = hermes_supergrep._on_session_start(session_id="s1", model="m")
     assert thread is not None, "the indexing runs in a thread, so the session does not wait on it"
     thread.join(timeout=30)
     assert not thread.is_alive()
-    assert log.read_text().strip() == f"{a.resolve()} {client} index"
+    # The repository with no index is left to the server's first query.
+    assert log.read_text().strip() == f"{a.resolve()} {client} index {a.resolve()}"
     env[config.AUTO_INDEX_ENV] = "0"
     assert hermes_supergrep._on_session_start(session_id="s2", model="m") is None, "off: nothing started"
     assert len(log.read_text().strip().splitlines()) == 1, "off: nothing more indexed"
@@ -180,3 +191,76 @@ def test_the_command_line_status_and_index(tmp_path, fake_node, monkeypatch, cap
     monkeypatch.setattr(os, "environ", {config.CLIENT_ENV: str(client), config.NODE_ENV: str(node)})
     assert cli.main(["status"]) == 1
     assert config.REPOS_ENV in capsys.readouterr().err
+
+
+def test_the_index_run_gets_the_config_block_and_not_another_root(tmp_path, fake_node, monkeypatch):
+    """The child runs with the server's `env` block and without CX_ROOT or
+    CX_INDEX_DIR, so it indexes the repository it is run for, into its own
+    index, with the server's file settings."""
+    node, log = fake_node
+    a = tmp_path / "a"
+    a.mkdir()
+    client = tmp_path / "cli.js"
+    client.write_text("")
+    monkeypatch.setattr(config, "_block", lambda server: {"CX_INCLUDE": "vendor/**", "CX_ROOT": "/elsewhere"})
+    monkeypatch.setattr(os, "environ", {"PATH": os.environ.get("PATH", ""), "CX_ROOT": "/elsewhere",
+                                        "CX_INDEX_DIR": "/shared-index"})
+    settings = config.load({config.REPOS_ENV: str(a), config.CLIENT_ENV: str(client), config.NODE_ENV: str(node)})
+    assert settings.block == {"CX_INCLUDE": "vendor/**", "CX_ROOT": "/elsewhere"}
+    assert index.sync_one(settings, a.resolve()) == "indexed 3 files"
+    assert (tmp_path / "node.log.env").read_text().strip() == "env CX_ROOT= CX_INDEX_DIR= CX_INCLUDE=vendor/**"
+
+
+def test_one_run_per_repository_at_a_time(tmp_path, fake_node):
+    node, log = fake_node
+    a = tmp_path / "a"
+    a.mkdir()
+    client = tmp_path / "cli.js"
+    client.write_text("")
+    settings = config.load({config.REPOS_ENV: str(a), config.CLIENT_ENV: str(client), config.NODE_ENV: str(node)})
+    held = index._lock_for(a.resolve())
+    held.acquire()
+    try:
+        assert index.sync_one(settings, a.resolve()) == index.BUSY
+    finally:
+        held.release()
+    assert not log.exists(), "a busy repository is not run a second time"
+    assert index.sync_one(settings, a.resolve()) == "indexed 3 files"
+
+
+def test_a_failed_sync_logs_a_warning(tmp_path, fake_node, monkeypatch, caplog):
+    node, log = fake_node
+    a = _indexed(tmp_path / "a")
+    env = {config.REPOS_ENV: str(a), config.CLIENT_ENV: str(tmp_path / "fail.js"), config.NODE_ENV: str(node)}
+    monkeypatch.setattr(os, "environ", env)
+    with caplog.at_level(logging.INFO, logger="hermes_supergrep"):
+        hermes_supergrep._on_session_start(session_id="s", model="m").join(timeout=30)
+    failures = [r for r in caplog.records if "failed (3): boom" in r.getMessage()]
+    assert [r.levelno for r in failures] == [logging.WARNING]
+
+
+def test_node_falls_back_to_hermes_s_own_and_a_missing_one_is_a_problem(tmp_path, monkeypatch):
+    client = tmp_path / "cli.js"
+    client.write_text("")
+    a = tmp_path / "a"
+    a.mkdir()
+    bin_dir = tmp_path / "hermes" / "tools" / "node-v22.19.0-linux-x64" / "bin"
+    bin_dir.mkdir(parents=True)
+    hermes = bin_dir / "node"
+    hermes.write_text("#!/bin/sh\n")
+    hermes.chmod(hermes.stat().st_mode | stat.S_IEXEC)
+    empty_path = tmp_path / "empty"
+    empty_path.mkdir()
+    monkeypatch.setenv("PATH", str(empty_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    env = {config.REPOS_ENV: str(a), config.CLIENT_ENV: str(client), "PATH": str(empty_path),
+           "HERMES_HOME": str(tmp_path / "hermes")}
+    assert config.load(env).node == str(hermes)
+    assert config.missing(config.load(env)) == []
+    del env["HERMES_HOME"]
+    settings = config.load(env)
+    assert settings.node == "node"
+    assert any("no Node" in m for m in config.missing(settings))
+    with pytest.raises(SystemExit) as exited:
+        mcp_launch.launch(settings)
+    assert "no Node" in str(exited.value)

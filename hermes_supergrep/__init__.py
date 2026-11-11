@@ -13,10 +13,12 @@ It gives a profile the repositories it reads:
   and the others by their `path`;
 - the `code-context` skill, which says how to use them, loads as
   `supergrep:code-context`;
-- when a session starts, every repository is indexed or synced in the
-  background (`index.py`), so the tools' first call finds the index there
-  or nearly so; a call that comes first still indexes on its own, since
-  the client does that for any root without an index.
+- when a session starts, every repository that has an index is synced in
+  the background (`index.py`), so the tools' first call finds it current or
+  nearly so. A repository with no index yet is left to the server, which
+  builds one on its first query: the server's build lock is in its own
+  process, and a build here at the same time would drop and recreate the
+  table under it. `hermes supergrep index` builds them ahead of a session.
 
 Memory is another plugin's; this one keeps to the code, and
 the two load side by side in one profile under different server names.
@@ -46,12 +48,16 @@ def register(ctx) -> None:
 
 
 def _on_session_start(*args, **kwargs) -> Optional[threading.Thread]:
-    """Index or sync every configured repository as a session starts, in a
-    thread, since Hermes waits for this hook and a first index of a large
-    tree takes minutes. Hermes hands the hook its session (`session_id`,
-    `model`); the plugin reads nothing of it, since the repositories are the
-    profile's, not the session's. The thread is returned for whoever wants
-    to wait on it (the tests); Hermes ignores it."""
+    """Sync every configured repository that has an index as a session
+    starts, in a thread, since Hermes waits for this hook. Hermes hands the
+    hook its session (`session_id`, `model`); the plugin reads nothing of
+    it, since the repositories are the profile's, not the session's. The
+    thread is returned for whoever wants to wait on it (the tests); Hermes
+    ignores it.
+
+    A sync of an index the client finds it cannot update in place (another
+    embedder, another analyzer) still becomes a full build in `cx index`,
+    as it does in the server; this hook does not close that case."""
     settings = config.load()
     if not settings.repos:
         logger.info("supergrep: %s names no repository; nothing indexed", config.REPOS_ENV)
@@ -60,8 +66,13 @@ def _on_session_start(*args, **kwargs) -> Optional[threading.Thread]:
         return None
 
     def run() -> None:
-        for repo, outcome in index.sync_all(settings):
-            logger.info("supergrep: %s: %s", repo, outcome)
+        for repo in settings.repos:
+            if repo.is_dir() and not index.has_index(repo):
+                logger.info("supergrep: %s: no index yet; the server builds it on the first query", repo)
+                continue
+            outcome = index.sync_one(settings, repo)
+            level = logging.WARNING if index.failed(outcome) else logging.INFO
+            logger.log(level, "supergrep: %s: %s", repo, outcome)
 
     thread = threading.Thread(target=run, name="supergrep-index", daemon=True)
     thread.start()

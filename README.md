@@ -126,7 +126,7 @@ Cursor, Codex CLI, Gemini CLI, Windsurf and Cline take the same server over stdi
 
 ### Hermes
 
-[Hermes](https://github.com/NousResearch/hermes-agent) loads SuperGrep as a plugin, `hermes_supergrep/` in this repository: a profile names the repositories it reads, the plugin starts the server over them, registers the `code-context` skill as `supergrep:code-context`, and indexes or syncs every repository in the background when a session starts. Memory stays whatever plugin the profile uses for it; this one keeps to the code, and the two load side by side.
+[Hermes](https://github.com/NousResearch/hermes-agent) loads SuperGrep as a plugin, `hermes_supergrep/` in this repository: a profile names the repositories it reads, the plugin starts the server over them, registers the `code-context` skill as `supergrep:code-context`, and syncs every repository that has an index in the background when a session starts. A repository with no index yet is built by the server on its first query, or ahead of time by `hermes supergrep index`. Memory stays whatever plugin the profile uses for it; this one keeps to the code, and the two load side by side.
 
 **1. Build the client.** Node.js 22.19 or newer; Hermes's installer keeps one in `~/.hermes/tools/`.
 
@@ -153,7 +153,7 @@ hermes config set mcp_servers.supergrep.env.SUPERGREP_REPOS /full/path/to/repo-o
 hermes config set mcp_servers.supergrep.connect_timeout 120
 ```
 
-`hermes supergrep status` says whether the client and each repository are in place, and `hermes supergrep index` indexes them now rather than at the next session's start. The same `env` block takes `SUPERGREP_NODE` for a Node other than the one on Hermes's path, `SUPERGREP_AUTO_INDEX=off` to leave indexing to the first query, and `SUPERGREP_MCP_SERVER` when the entry is named something other than `supergrep` (environment only, since it names the block). `search` needs the account from the [install](#install) above, stored once per machine, as with any other client.
+`hermes supergrep status` says whether Node, the client and each repository are in place, and `hermes supergrep index` indexes them now: a first build where there is no index, a sync where there is. The session-start sync runs with the same `env` block as the server, so file settings there (`CX_INCLUDE`, `CX_NO_IGNORE`, ...) hold for both. The block takes `SUPERGREP_NODE` for a Node other than the one on Hermes's path (without it, the first `node` on `PATH`, else Hermes's own under `~/.hermes/tools`), `SUPERGREP_AUTO_INDEX=off` to leave syncing to the first query, and `SUPERGREP_MCP_SERVER` when the entry is named something other than `supergrep` (environment only, since it names the block). `search` needs the account from the [install](#install) above, stored once per machine, as with any other client. With the account stored, each sync also loads the repository's changes into its own database on the platform, so every named repository with an index uploads at each session start; `SUPERGREP_AUTO_INDEX=off` leaves that to the first query on each.
 
 ## Indexing it yourself
 
