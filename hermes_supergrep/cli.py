@@ -36,7 +36,12 @@ def _status(args) -> int:
     if not settings.repos:
         print(f"repositories: none ({config.REPOS_ENV} is unset)")
     for repo in settings.repos:
-        state = "not a directory" if not repo.is_dir() else ("indexed" if index.has_index(repo) else "no index yet")
+        if not repo.is_dir():
+            state = "not a directory"
+        elif not index.has_index(repo):
+            state = "no index yet"
+        else:
+            state = "indexed, vectors still building" if index.vectors_building(repo) else "indexed"
         print(f"repository: {repo} ({state})")
     problems = config.missing(settings)
     for problem in problems:

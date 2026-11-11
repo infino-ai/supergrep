@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,13 +87,24 @@ def default_client(checkout: Path = CHECKOUT) -> Path:
     return checkout / "dist" / "cli.js"
 
 
+_NODE_VERSION = re.compile(r"node-v?(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+
+
+def _node_version(node: Path) -> tuple:
+    """The version a `node-v<major>.<minor>.<patch>-...` folder names, as
+    numbers, so 22.19.0 sorts after 22.9.0; a folder that names none sorts
+    first."""
+    m = _NODE_VERSION.match(node.parent.parent.name)
+    return (1, *(int(g or 0) for g in m.groups())) if m else (0,)
+
+
 def hermes_node(env: Mapping[str, str]) -> Optional[str]:
     """The Node Hermes's installer keeps under `<hermes home>/tools/node-*/bin`
-    (HERMES_HOME, else ~/.hermes), the newest by name; None when there is
+    (HERMES_HOME, else ~/.hermes), the newest by version; None when there is
     none."""
     homes = [Path(os.path.expanduser(h)) for h in (env.get("HERMES_HOME"), "~/.hermes") if h]
     for home in homes:
-        found = sorted((home / "tools").glob("node-*/bin/node"))
+        found = sorted((home / "tools").glob("node-*/bin/node"), key=lambda p: (_node_version(p), str(p)))
         if found:
             return str(found[-1])
     return None

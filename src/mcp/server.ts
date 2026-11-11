@@ -240,6 +240,7 @@ import {
   type IndexStats,
   type StagedIndexRun,
 } from "../core/indexer.js";
+import { otherHolder, tryLockIndex, type IndexLock, type LockAttempt } from "../core/index-lock.js";
 import { createEmbedder, createIndexingEmbedder, embedderInfo, platformEmbedderInfo, type Embedder } from "../core/embedder.js";
 import { RepoRegistry, type RepoCtx } from "./repos.js";
 import { ensureIndexed, type EnsureResult } from "./ensure.js";
@@ -1927,11 +1928,23 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // it with CX_NO_RECEIPT. One accumulator per session (this long-lived process).
   const receiptOn = receiptEnabled();
   const session = newSession();
-  /** Run an index mutation on a repo exclusively; null if one is in flight. */
-  const exclusive = <T,>(ctx: RepoCtx, fn: () => Promise<T>): Promise<T> | null => {
+  /** Run an index mutation on a repo exclusively; null if one is in flight,
+   * here or in another process (a `cx index` beside this server holds the
+   * index's lock file, core/index-lock.ts). `fn` gets the lock, for a build
+   * whose completion holds it past this call (`backfill`). */
+  const exclusive = <T,>(ctx: RepoCtx, fn: (lock: IndexLock) => Promise<T>): Promise<T> | null => {
     if (ctx.mutation) return null;
-    const p = fn().finally(() => {
+    let attempt: LockAttempt;
+    try {
+      attempt = tryLockIndex(ctx.dir);
+    } catch (err) {
+      return Promise.reject(err); // an index dir that cannot be written: the caller reports it
+    }
+    if (!("lock" in attempt)) return null;
+    const { lock } = attempt;
+    const p = fn(lock).finally(() => {
       ctx.mutation = null;
+      lock.release();
     });
     ctx.mutation = p.catch(() => undefined); // guard must not reject
     return p;
@@ -1950,7 +1963,8 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * nothing on this chain may take that on faith - an unhandled rejection
    * here would kill the whole server. A failed platform load is logged: the
    * next sync asks for a build, which retries it. */
-  const backfill = (ctx: RepoCtx, run: StagedIndexRun, emb: Embedder | null) => {
+  const backfill = (ctx: RepoCtx, run: StagedIndexRun, emb: Embedder | null, lock: IndexLock) => {
+    lock.retain();
     const held = run.completion
       .then((stats) => {
         if (stats.hostedError) console.error(`platform load failed for ${ctx.root}: ${stats.hostedError} (the next sync reloads it)`);
@@ -1958,6 +1972,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       .catch(() => undefined)
       .finally(() => {
         if (ctx.completion === held) ctx.completion = null;
+        lock.release();
         void emb?.dispose?.()?.catch(() => undefined);
       });
     ctx.completion = held;
@@ -1987,15 +2002,15 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * The build's completion (vectors, then the platform table when one is
    * configured) runs on in the background, held on `ctx.completion`. */
   const buildIndex = (ctx: RepoCtx): Promise<IndexStats> | null =>
-    exclusive(ctx, async () => {
+    exclusive(ctx, async (lock) => {
       await ensureDatabase(ctx);
       const emb = buildEmbedder();
       const run = await indexRepoStaged({ ...indexTargets(ctx), embedder: emb });
-      backfill(ctx, run, emb);
+      backfill(ctx, run, emb, lock);
       return run.text;
     });
 
-  const doSync = async (ctx: RepoCtx): Promise<SyncOutcome> => {
+  const doSync = async (ctx: RepoCtx, lock: IndexLock): Promise<SyncOutcome> => {
     await ensureDatabase(ctx);
     const outcome = await syncRepo({ ...indexTargets(ctx), embedder: getEmbedder() });
     // A rebuild for every reason but "a build is already in flight" (the
@@ -2003,7 +2018,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     if (outcome.action === "rebuild-required" && !syncInProgress(outcome)) {
       const emb = buildEmbedder();
       const run = await indexRepoStaged({ ...indexTargets(ctx), embedder: emb });
-      backfill(ctx, run, emb);
+      backfill(ctx, run, emb, lock);
     }
     return outcome;
   };
@@ -2031,7 +2046,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     // stat walk still shares the process, so on very large repos a
     // concurrent query can feel it. Queries are never queued behind syncs.
     setImmediate(() => {
-      const p = exclusive(ctx, () => doSync(ctx));
+      const p = exclusive(ctx, (lock) => doSync(ctx, lock));
       p?.catch((err) => console.error(`auto-sync failed: ${(err as Error).message}`));
     });
   };
@@ -2209,8 +2224,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     if (typeof query !== "string" || query.length === 0) return fail(`${tool}: give query, or queries for several at once`);
     return single({ ...(rest as A), query });
   };
-  const noIndex = (ctx: RepoCtx) =>
-    fail(`no index for ${ctx.root} yet - run \`cx index\` there once (keyword search is live in seconds).`);
+  const noIndex = (ctx: RepoCtx) => {
+    const other = otherHolder(ctx.dir);
+    return other
+      ? fail(`no index for ${ctx.root} yet - another process (pid ${other.pid}) is indexing it now; retry when it finishes.`)
+      : fail(`no index for ${ctx.root} yet - run \`cx index\` there once (keyword search is live in seconds).`);
+  };
 
   /** The refusal when a query would build the index but the process does
    * not own the platform table a build writes (ownsTable): CX_AUTO_INDEX is

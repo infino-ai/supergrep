@@ -50,7 +50,7 @@ def fake_node(tmp_path):
         f"echo \"$PWD $*\" >> {log}\n"
         f"echo \"env CX_ROOT=$CX_ROOT CX_INDEX_DIR=$CX_INDEX_DIR CX_INCLUDE=$CX_INCLUDE\" >> {log}.env\n"
         "if [ \"$2\" = index ]; then echo 'indexed 3 files'; fi\n"
-        "case \"$1\" in */fail.js) echo boom >&2; exit 3;; esac\n"
+        "case \"$1\" in */fail.js) echo boom >&2; exit 3;; */busy.js) echo 'error: another process' >&2; exit 75;; esac\n"
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     return script, log
@@ -131,9 +131,12 @@ def test_indexing_runs_the_client_s_index_in_each_repository(tmp_path, fake_node
     assert index.sync_one(failing, a.resolve()) == "failed (3): boom"
 
 
-def _indexed(repo: Path) -> Path:
+def _indexed(repo: Path, vectors: str = "ready", platform: str = "") -> Path:
     (repo / index.INDEX_DIR_NAME).mkdir(parents=True)
-    (repo / index.INDEX_DIR_NAME / index.MANIFEST_NAME).write_text("{}")
+    (repo / index.INDEX_DIR_NAME / index.MANIFEST_NAME).write_text(f'{{"vectors": "{vectors}"}}')
+    if platform:
+        (repo / index.INDEX_DIR_NAME / index.PLATFORM_MANIFEST_NAME).write_text(
+            f'{{"origin": "hosted", "vectors": "{platform}"}}')
     return repo
 
 
@@ -244,11 +247,14 @@ def test_node_falls_back_to_hermes_s_own_and_a_missing_one_is_a_problem(tmp_path
     client.write_text("")
     a = tmp_path / "a"
     a.mkdir()
-    bin_dir = tmp_path / "hermes" / "tools" / "node-v22.19.0-linux-x64" / "bin"
-    bin_dir.mkdir(parents=True)
-    hermes = bin_dir / "node"
-    hermes.write_text("#!/bin/sh\n")
-    hermes.chmod(hermes.stat().st_mode | stat.S_IEXEC)
+    # Newest by version, not by name: 22.19.0 after 22.9.0, which sorts after it as text.
+    for folder in ("node-v22.9.0-linux-x64", "node-v22.19.0-linux-x64", "node-v8.0.0-linux-x64"):
+        bin_dir = tmp_path / "hermes" / "tools" / folder / "bin"
+        bin_dir.mkdir(parents=True)
+        hermes = bin_dir / "node"
+        hermes.write_text("#!/bin/sh\n")
+        hermes.chmod(hermes.stat().st_mode | stat.S_IEXEC)
+    hermes = tmp_path / "hermes" / "tools" / "node-v22.19.0-linux-x64" / "bin" / "node"
     empty_path = tmp_path / "empty"
     empty_path.mkdir()
     monkeypatch.setenv("PATH", str(empty_path))
@@ -264,3 +270,49 @@ def test_node_falls_back_to_hermes_s_own_and_a_missing_one_is_a_problem(tmp_path
     with pytest.raises(SystemExit) as exited:
         mcp_launch.launch(settings)
     assert "no Node" in str(exited.value)
+
+
+def test_the_hook_leaves_an_index_whose_vectors_are_still_building(tmp_path, fake_node, monkeypatch, caplog, capsys):
+    """A sync refuses an index whose vectors (or platform load) are still
+    being built, and `cx index` then rebuilds it under the server building
+    it; the hook leaves it alone, and syncs it once the build is done."""
+    node, log = fake_node
+    local = _indexed(tmp_path / "local", vectors="building")
+    platform = _indexed(tmp_path / "platform", platform="building")
+    done = _indexed(tmp_path / "done")
+    client = tmp_path / "cli.js"
+    client.write_text("")
+    env = {config.REPOS_ENV: f"{local},{platform},{done}", config.CLIENT_ENV: str(client), config.NODE_ENV: str(node)}
+    monkeypatch.setattr(os, "environ", env)
+    with caplog.at_level(logging.INFO, logger="hermes_supergrep"):
+        hermes_supergrep._on_session_start(session_id="s", model="m").join(timeout=30)
+    assert log.read_text().strip() == f"{done.resolve()} {client} index {done.resolve()}"
+    left = [r for r in caplog.records if index.STILL_BUILDING in r.getMessage()]
+    assert len(left) == 2 and all(r.levelno == logging.INFO for r in left)
+    assert cli.main(["status"]) == 0
+    assert f"repository: {local.resolve()} (indexed, vectors still building)" in capsys.readouterr().out
+    # Once the build finishes, the next session syncs it.
+    (local / index.INDEX_DIR_NAME / index.MANIFEST_NAME).write_text('{"vectors": "ready"}')
+    assert index.sync_skip(local.resolve()) is None
+    # A manifest that does not parse reads as no index, as the client reads it.
+    (local / index.INDEX_DIR_NAME / index.MANIFEST_NAME).write_text("{")
+    assert index.sync_skip(local.resolve()) == index.NO_INDEX
+
+
+def test_a_repository_another_process_is_indexing_is_skipped_not_failed(tmp_path, fake_node, monkeypatch, caplog):
+    """`cx index` exits EXIT_BUSY when the server or another run holds the
+    index's lock; the hook logs that at info and the index command does not
+    count it as a failure."""
+    node, log = fake_node
+    a = _indexed(tmp_path / "a")
+    (tmp_path / "busy.js").write_text("")
+    env = {config.REPOS_ENV: str(a), config.CLIENT_ENV: str(tmp_path / "busy.js"), config.NODE_ENV: str(node)}
+    monkeypatch.setattr(os, "environ", env)
+    settings = config.load()
+    assert index.sync_one(settings, a.resolve()) == index.OTHER_PROCESS
+    assert index.skipped(index.OTHER_PROCESS) and not index.failed(index.OTHER_PROCESS)
+    with caplog.at_level(logging.INFO, logger="hermes_supergrep"):
+        hermes_supergrep._on_session_start(session_id="s", model="m").join(timeout=30)
+    busy = [r for r in caplog.records if index.OTHER_PROCESS in r.getMessage()]
+    assert [r.levelno for r in busy] == [logging.INFO]
+    assert cli.main(["index"]) == 0

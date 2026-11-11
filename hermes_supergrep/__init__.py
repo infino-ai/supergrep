@@ -13,12 +13,15 @@ It gives a profile the repositories it reads:
   and the others by their `path`;
 - the `code-context` skill, which says how to use them, loads as
   `supergrep:code-context`;
-- when a session starts, every repository that has an index is synced in
-  the background (`index.py`), so the tools' first call finds it current or
-  nearly so. A repository with no index yet is left to the server, which
-  builds one on its first query: the server's build lock is in its own
-  process, and a build here at the same time would drop and recreate the
-  table under it. `hermes supergrep index` builds them ahead of a session.
+- when a session starts, every repository that has a finished index is
+  synced in the background (`index.py`), so the tools' first call finds it
+  current or nearly so. A repository with no index yet, or one whose
+  vectors are still being built, is left to the server, which builds or
+  finishes it: a sync here would find nothing to update in place, and `cx
+  index` would rebuild it, dropping the table under the server. The client
+  lets one process at a time write an index (its lock file), so the hook's
+  sync and the server's own never overlap; whichever comes second skips.
+  `hermes supergrep index` builds them ahead of a session.
 
 Memory is another plugin's; this one keeps to the code, and
 the two load side by side in one profile under different server names.
@@ -48,7 +51,7 @@ def register(ctx) -> None:
 
 
 def _on_session_start(*args, **kwargs) -> Optional[threading.Thread]:
-    """Sync every configured repository that has an index as a session
+    """Sync every configured repository with a finished index as a session
     starts, in a thread, since Hermes waits for this hook. Hermes hands the
     hook its session (`session_id`, `model`); the plugin reads nothing of
     it, since the repositories are the profile's, not the session's. The
@@ -67,8 +70,9 @@ def _on_session_start(*args, **kwargs) -> Optional[threading.Thread]:
 
     def run() -> None:
         for repo in settings.repos:
-            if repo.is_dir() and not index.has_index(repo):
-                logger.info("supergrep: %s: no index yet; the server builds it on the first query", repo)
+            skip = index.sync_skip(repo) if repo.is_dir() else None
+            if skip:
+                logger.info("supergrep: %s: %s", repo, skip)
                 continue
             outcome = index.sync_one(settings, repo)
             level = logging.WARNING if index.failed(outcome) else logging.INFO

@@ -19,6 +19,7 @@ import { createEmbedder, createIndexingEmbedder, embedderInfo, platformEmbedderI
 import { DEFAULT_CAPS, INDEX_DIR_NAME, embedProvider, hostedAnalyzer, type EmbedProvider } from "../core/config.js";
 import { HOSTED_DEFAULT_ANALYZER, analyzerOf } from "../core/analyzer.js";
 import { readPlatformManifest } from "../core/manifest.js";
+import { lockIndex, tryLockIndex } from "../core/index-lock.js";
 import { bold, dim, green, yellow, fmtMs, fmtCount, progressLine, progressDone } from "../core/output.js";
 
 export interface IndexCmdOptions {
@@ -340,7 +341,15 @@ export async function indexCmd(path: string | undefined, opts: IndexCmdOptions):
     if (final.parseFailures) console.log(parseWarning(final.parseFailures, final.parseBreakerTripped ?? false));
   };
 
-  await once();
+  // One writer per index across processes (core/index-lock.ts): a server or
+  // another `cx index` working on this index makes this run stop before it
+  // writes anything, with an IndexBusyError the CLI exits on.
+  const lock = lockIndex(dir);
+  try {
+    await once();
+  } finally {
+    lock.release();
+  }
 
   if (!opts.watch) return;
 
@@ -352,6 +361,8 @@ export async function indexCmd(path: string | undefined, opts: IndexCmdOptions):
     if (timer) clearTimeout(timer);
     timer = setTimeout(async () => {
       if (running) return kick(); // a sync is active - re-debounce
+      const attempt = tryLockIndex(dir);
+      if (!("lock" in attempt)) return kick(); // another process is writing it - try again shortly
       running = true;
       try {
         const outcome = await syncRepo(baseOpts);
@@ -360,6 +371,7 @@ export async function indexCmd(path: string | undefined, opts: IndexCmdOptions):
       } catch (err) {
         console.error(yellow(`sync failed: ${(err as Error).message}`));
       } finally {
+        attempt.lock.release();
         running = false;
       }
     }, WATCH_DEBOUNCE_MS);
