@@ -8,7 +8,7 @@ server are still named `code-context`.
 
 | tool | runs | what it does | when Claude uses it |
 |---|---|---|---|
-| `find` | local | every line containing an exact string, `path:line` like `grep -n`, with per-file counts like `grep -c`; complete and unranked, and every hit is a real occurrence | where it would grep: every use or definition of an identifier, an error message, a config key |
+| `find` | local | every line containing an exact string, with per-file counts like `grep -c`; complete and unranked, and every hit is a real occurrence. Over MCP each match comes in its block of code, trimmed to 4 lines around it unless `chunks` or `context` is set (`chunks: false` is `path:line` like `grep -n`); a result too wide for its budget names the `skip` of each following page | where it would grep: every use or definition of an identifier, an error message, a config key |
 | `search` | platform | one ranked pass fusing exact keyword matching (BM25) with semantic similarity; hits carry the code and their citation (`cite`), or with `lines` only the lines of each chunk that carry the query's words, with two lines of context | how a subsystem works, code by meaning or exact term, similar implementations; `lines` over logs and other long records, where the matching lines are the answer |
 | `sql` | local, or platform when a statement embeds | read-only SQL over the index, with `bm25_search`, `hybrid_search`, `vector_search` and `token_match` as table functions | counts, rankings and aggregates over the whole repository in one query |
 | `read` | local | the numbered lines of the files named, several files in one call, from the index; `from` and `to` cut to a range, and a long file comes back a page at a time | after the index has named the files: every one of them at once, in place of one read per file |
@@ -91,7 +91,7 @@ network.
 |---|---|---|
 | `CX_INDEX_DIR` | `<repo>/.infino` | where the local index lives |
 | `CX_SEARCH_K` | 10 | default number of hits `search` returns (also settable per call and via the CLI `-k` flag) |
-| `CX_FIND_LIMIT` | 500 | default number of matching lines `find` returns, which is also the hard cap; `total` and `byFile` are complete either way |
+| `CX_FIND_LIMIT` | 500 | default number of matching lines one `find` result carries, which is also the hard cap per result; over MCP the lines past it come on the following pages the result names; `total` and `byFile` are complete either way |
 | `CX_MAX_FILES` / `CX_MAX_FILE_BYTES` | 500000 / 1MB | indexing caps (files over the file cap are left out; `cx index` warns on every build and sync while the tree is over it, and the tools flag the index as partial) |
 | `CX_ROOT` | current directory | default repository root for the MCP server / CLI when not run from the repository (each tool call can override it with a `path` argument) |
 | `CX_AUTO_INDEX` | on | `0` makes a query on an unindexed repository error instead of building the index inline |

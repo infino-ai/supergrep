@@ -191,7 +191,6 @@ import {
   hostedTelemetry,
   type CallTelemetry,
   CONTENT_COLUMN,
-  FIND_RESULT_CHAR_BUDGET,
   MAX_FIND_CONTEXT,
   MAX_FIND_PAGES,
   AUTO_CHUNK_CONTEXT,
@@ -973,6 +972,7 @@ export function findHint(
   listed = total,
   blocks = false,
   pages?: number[],
+  skip = 0,
 ): string | null {
   // Pages: the result names where each following page starts, so the rest
   // is one reply of finds with skip - not one find per file, and never a
@@ -990,8 +990,13 @@ export function findHint(
   // listed, and the text of the rest is one sql away - never the shell over
   // a saved result (the demo, 2026-09-24: a 58,000-character find went to a
   // file and Bash read it).
-  if (total > withText) {
-    const beyond = total > listed ? ` ${total - listed} more are in the total and the per-file counts but not listed.` : "";
+  // A page from `skip` answers for the matches from there on: the last page
+  // carries all of those, and the ones before it came on earlier pages, so
+  // it needs no hint sending the caller back for them.
+  const from = Math.min(Math.max(0, skip), total);
+  if (total - from > withText) {
+    const beyond =
+      total - from > listed ? ` ${total - from - listed} more are in the total and the per-file counts but not listed.` : "";
     // A chunks find past its budget: the rest's blocks are one more chunks
     // find away, not a read per line.
     if (blocks) {
@@ -3385,7 +3390,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             .positive()
             .max(MAX_FIND_LIMIT)
             .default(DEFAULT_FIND_LIMIT)
-            .describe("Maximum matching lines to return; the result reports the total either way."),
+            .describe(
+              "Matching lines one result carries at most: a page, not a cap on the find. With more than this, the " +
+                "result names the skip of each following page; the result reports the total either way.",
+            ),
           question: z.string().optional().describe(RERANK_QUESTION_PARAM),
           context: z
             .number()
@@ -3495,13 +3503,13 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         if (!autoIndexed) maybeAutoSync(ctx); // a fresh build is already current
         try {
           const t0 = performance.now();
-          // A batch shares the one text budget between its queries.
-          const budget = share && share > 1 ? Math.floor(FIND_RESULT_CHAR_BUDGET / share) : undefined;
+          // A batch shares the one text budget between its queries; the
+          // pages a result names are worked out for calls of their own.
           const form = findForm(chunks, context);
-          const result = await find(handle, query, { ignoreCase, defines, under, limit, context: form.context, chunks: form.chunks, skip, budget });
+          const result = await find(handle, query, { ignoreCase, defines, under, limit, context: form.context, chunks: form.chunks, skip, share });
           const listed = result.matches.length + (result.more ?? []).reduce((n, m) => n + m.lines.length, 0);
           const hint =
-            findHint(query, result.total, Boolean(defines), result.matches.length, listed, Boolean(result.blocks), result.pages) ??
+            findHint(query, result.total, Boolean(defines), result.matches.length, listed, Boolean(result.blocks), result.pages, result.skip) ??
             undefined;
           const noted = autoIndexed ? autoIndexNote(autoIndexed) : undefined;
           const tookMs = Math.round((performance.now() - t0) * 1000) / 1000;
