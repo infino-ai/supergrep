@@ -16,6 +16,7 @@
 import { resolve } from "node:path";
 import { Command, Option } from "commander";
 import { indexCmd, type IndexCmdOptions } from "./commands/index-cmd.js";
+import { EXIT_INDEX_BUSY, IndexBusyError } from "./core/index-lock.js";
 import { installCmd, type InstallCmdOptions } from "./commands/install-cmd.js";
 import { PLAYBOOK_ENV } from "./core/playbook.js";
 import { HOOK_MEMORY, HOOK_MEMORY_SEND, hookCmd, type HookCmdOptions } from "./commands/hook-cmd.js";
@@ -313,5 +314,5 @@ hostedOptions(
 
 program.parseAsync().catch((err: Error) => {
   console.error(`error: ${err.message}`);
-  process.exit(1);
+  process.exit(err instanceof IndexBusyError ? EXIT_INDEX_BUSY : 1);
 });

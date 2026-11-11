@@ -23,7 +23,9 @@ export interface EnsureDeps {
   getHandle(ctx: RepoCtx): IndexHandle | null | Promise<IndexHandle | null>;
   /** Acquire the repo's mutation lock and run a staged build, resolving at
    * keyword-live with the stage-1 stats; null if a build/sync is already in
-   * flight on this repo (its promise lives on `ctx.mutation`). */
+   * flight on this repo: here (its promise lives on `ctx.mutation`), or in
+   * another process that holds the index's lock file, when there is nothing
+   * here to wait on and the caller reports no index yet. */
   build(ctx: RepoCtx): Promise<IndexStats> | null;
 }
 

@@ -26,6 +26,23 @@ jobs:
       - name: Test
         run: npm test
 
+  hermes-plugin:
+    name: Hermes plugin tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install pytest
+        run: python -m pip install pytest
+      - name: Test
+        run: python -m pytest -q hermes_supergrep/tests
+
 # The recall report ran here until the benchmark harness left this repository
 # for the one that owns the demo. It was report-only — hit@5 / MRR@5 printed to
 # the log, never failing the build — so what is lost is a log line rather than a
