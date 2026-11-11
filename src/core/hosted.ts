@@ -233,6 +233,13 @@ function refusedEitherWay(err: unknown): boolean {
   return err instanceof HostedError && (err.unauthenticated || err.paymentRequired || err.status === HTTP_FORBIDDEN);
 }
 
+/** Whether a read's status, beside a message naming `rerank`, is the
+ * platform saying it offers no rerank: a 400 from one that predates the
+ * field or runs no grader, a 501 from a gateway that runs no grader. */
+function rerankRefusal(status: number): boolean {
+  return status === HTTP_BAD_REQUEST || status === HTTP_NOT_IMPLEMENTED;
+}
+
 /** The fields `checks` adds to a read's body: none for a check not asked. */
 function readChecks(checks: ReadChecks): RowRecord {
   return {
@@ -490,6 +497,8 @@ export async function uploadBytes(
 const HTTP_BAD_REQUEST = 400;
 /** The status of a key the account's rights do not cover. */
 const HTTP_FORBIDDEN = 403;
+/** Not implemented: a deployment that runs no rerank says so with this. */
+const HTTP_NOT_IMPLEMENTED = 501;
 /** The budget a checked read has before its statement is resent plain: the
  * check rides on the statement, so a check that is slow holds the rows, and
  * past this the rows are worth more than the verdict. */
@@ -956,7 +965,8 @@ export class HostedDb {
   }
 
   /** `read` with `checks`, and - when the platform refuses the `rerank`
-   * because it predates it (a 400 naming the field) - again without it,
+   * because it predates it or runs no grader (a 400 or 501 naming the
+   * field, `rerankRefusal`) - again without it,
    * remembering the refusal so no later read asks: a platform without the
    * rerank answers as it did before the client knew of it. Any other
    * failure is the read's own. */
@@ -965,7 +975,7 @@ export class HostedDb {
     try {
       return await read(checks);
     } catch (err) {
-      if (!(err instanceof HostedError && err.status === HTTP_BAD_REQUEST && /\brerank\b/.test(err.message))) throw err;
+      if (!(err instanceof HostedError && rerankRefusal(err.status) && /\brerank\b/.test(err.message))) throw err;
       this.rerankUnsupported = true;
       return read({ ...checks, rerank: undefined });
     }

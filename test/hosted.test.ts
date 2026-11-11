@@ -804,6 +804,20 @@ describe("reads that ask for a rerank", () => {
     expect(bodyJson(calls[2]).rerank).toBeUndefined();
   });
 
+  it("fall back to no rerank on a deployment whose gateway runs no grader (501)", async () => {
+    const refused: Scripted = {
+      status: 501,
+      body: JSON.stringify({ message: "rerank is not available on this deployment; send the query without `rerank`" }),
+      headers: { "content-type": "application/json" },
+    };
+    const { db, calls } = client([refused, json([{ id: 1 }])]);
+    const rows = await db.hybridSearch("t", "body", "emb", "x", 5, [], { question: "q", k: 5 });
+    expect(rows).toEqual([{ id: 1 }]);
+    expect(calls).toHaveLength(2);
+    expect(bodyJson(calls[0]).rerank).toEqual({ question: "q", k: 5 });
+    expect(bodyJson(calls[1]).rerank).toBeUndefined();
+  });
+
   it("let any other refusal stand", async () => {
     const refused: Scripted = {
       status: 400,
