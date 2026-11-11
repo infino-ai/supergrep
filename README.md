@@ -124,6 +124,37 @@ npx -y @infino-ai/code-context login --db https://api.supergrep.infino.ai --yes 
 
 Cursor, Codex CLI, Gemini CLI, Windsurf and Cline take the same server over stdio. `cx install` in a repository writes its entry into `.mcp.json` there (`--config` for another client's file); with the account stored it names the repository's database and nothing else, `--local-only` writes the keyword-only entry, and `install --platform https://api.supergrep.infino.ai` is the sign-up and the entry in one for a machine with no account. [The reference](docs/reference.md#cli) has every flag, and [CONTRIBUTING](CONTRIBUTING.md) how to build from source.
 
+### Hermes
+
+[Hermes](https://github.com/NousResearch/hermes-agent) loads SuperGrep as a plugin, `hermes_supergrep/` in this repository: a profile names the repositories it reads, the plugin starts the server over them, registers the `code-context` skill as `supergrep:code-context`, and indexes or syncs every repository in the background when a session starts. Memory stays whatever plugin the profile uses for it; this one keeps to the code, and the two load side by side.
+
+**1. Build the client.** Node.js 22.19 or newer; Hermes's installer keeps one in `~/.hermes/tools/`.
+
+```bash
+git clone https://github.com/infino-ai/supergrep.git
+cd supergrep
+export PATH="$(ls -d ~/.hermes/tools/node-*/bin | head -n 1):$PATH"
+npm ci && npm run build
+```
+
+**2. Install the plugin.** Hermes copies the plugin directory out of the repository; it has no Python dependencies.
+
+```bash
+hermes plugins install https://github.com/infino-ai/supergrep/tree/main/hermes_supergrep --enable
+```
+
+**3. Add the tools**, naming the client from step 1 and the repositories the profile reads, first one first: it is the tools' default root, and the others are reached by the `path` each tool takes.
+
+```bash
+hermes config set mcp_servers.supergrep.command hermes
+hermes config set mcp_servers.supergrep.args '["supergrep", "mcp"]'
+hermes config set mcp_servers.supergrep.env.SUPERGREP_CLIENT /full/path/to/supergrep/dist/cli.js
+hermes config set mcp_servers.supergrep.env.SUPERGREP_REPOS /full/path/to/repo-one,/full/path/to/repo-two
+hermes config set mcp_servers.supergrep.connect_timeout 120
+```
+
+`hermes supergrep status` says whether the client and each repository are in place, and `hermes supergrep index` indexes them now rather than at the next session's start. The same `env` block takes `SUPERGREP_NODE` for a Node other than the one on Hermes's path, `SUPERGREP_AUTO_INDEX=off` to leave indexing to the first query, and `SUPERGREP_MCP_SERVER` when the entry is named something other than `supergrep` (environment only, since it names the block). `search` needs the account from the [install](#install) above, stored once per machine, as with any other client.
+
 ## Indexing it yourself
 
 The first question in a directory indexes it and the MCP server keeps it current, so most of the time you never run an index by hand. When you want to - a first pass over a huge tree, a CI step, a corpus that is not a git repository - `index` is the command. (`cx` below is `npx -y @infino-ai/code-context`, or `cx` itself after `npm install -g @infino-ai/code-context`.)

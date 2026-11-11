@@ -1,0 +1,27 @@
+name: supergrep
+version: 0.1.0
+description: "SuperGrep as a Hermes plugin: the repositories a profile reads, indexed by this checkout's client and served to the agent as the find, search, sql and read tools (mcp_servers.supergrep); the code-context skill that says how to use them."
+author: "Infino"
+homepage: "https://github.com/infino-ai/supergrep"
+# The client is Node: this plugin runs `node dist/cli.js` from the checkout it
+# is installed from, so it has no Python dependencies of its own.
+python_dependencies: []
+optional_env:
+  - name: SUPERGREP_REPOS
+    description: "The repositories this profile reads, as checkout paths, comma-separated; the first is the tools' default root and the others are reached by their `path`"
+    password: false
+  - name: SUPERGREP_CLIENT
+    description: "The client's dist/cli.js (default: the one in the checkout this plugin directory sits in)"
+    password: false
+  - name: SUPERGREP_NODE
+    description: "The node binary to run the client with (default: the first `node` on PATH)"
+    password: false
+  - name: SUPERGREP_MCP_SERVER
+    description: "The client's name under mcp_servers (default supergrep)"
+    password: false
+  - name: SUPERGREP_AUTO_INDEX
+    description: "off: do not index or sync the repositories when a session starts; a repository is then indexed on its first query (default on)"
+    password: false
+# The plugin's hook: every repository is indexed or synced when a session starts.
+hooks:
+  - on_session_start
