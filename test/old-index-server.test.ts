@@ -52,7 +52,15 @@ describe("an index an earlier version built", () => {
       };
       expect(found.isError, found.content[0].text).toBeFalsy();
       expect(found.content[0].text).toContain('1 matching line in 1 file for "reconcile_tombstone_seqs"');
+      // The call says it replaced an index, not that there was none.
+      expect(found.content[0].text).toContain("rebuilt the index an earlier version of code-context built");
+      expect(found.content[0].text).not.toContain("no index existed");
       expect(readManifest(dir)!.analyzer).toBe("standard");
+      // A second call answers from the rebuilt index and notes nothing.
+      const again = (await s.client.callTool({ name: "find", arguments: { query: "reconcile_tombstone_seqs" } })) as {
+        content: Array<{ text: string }>;
+      };
+      expect(again.content[0].text).not.toContain("rebuilt the index");
     });
   }
 
