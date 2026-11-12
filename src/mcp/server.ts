@@ -174,7 +174,6 @@ import {
   runSql,
   runSqlRows,
   embedsAQuery,
-  ordersOrGroups,
   guardSql,
   jsonify,
   normalizeQueryPlaceholders,
@@ -2762,15 +2761,13 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // order come back with the rows, where before the rows went back up
       // to /validate in a second call. Validation is asked for wherever the
       // verdict is attached (not under the API tools, where the model asks
-      // for it); the rerank when there is a question to rank for and the
-      // statement does not order or group its rows itself: a top ten by
-      // count keeps its own order (`ordersOrGroups`).
+      // for it); the rerank when there is a question to rank for.
       const asked = question?.trim() ? question.trim() : undefined;
       const checks: ReadChecks = {
         ...(!apiTools && (opts.over ? opts.over.table !== undefined : verdictDb)
           ? { validate: { table_name: opts.over?.table ?? TABLE, field_name: opts.column ?? CONTENT_COLUMN, ...(asked ? { question: asked } : {}) } }
           : {}),
-        ...(asked && !ordersOrGroups(query) ? { rerank: { question: asked } } : {}),
+        ...(asked ? { rerank: { question: asked } } : {}),
       };
       const checked = await runSqlRows(db, query, embeds, checks);
       const own = opts.over ? callTelemetry(db.lastCall()) : hostedTelemetry(ctx);

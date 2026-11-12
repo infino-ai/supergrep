@@ -919,10 +919,6 @@ interface StatementReading {
   /** The comments, each as the offsets of its first and last character; a
    * block comment that never closes is not among them. */
   comments: Array<[number, number]>;
-  /** The quoted text - strings (escape and dollar-quoted ones included),
-   * quoted names and query placeholders - each as the offsets of its first
-   * and last character. */
-  quoted: Array<[number, number]>;
   /** Whether a block comment opens and never closes - the rest of the
    * statement is inside it, and the engine refuses the statement. */
   unclosed: boolean;
@@ -948,7 +944,6 @@ interface StatementReading {
 function readStatement(sql: string): StatementReading {
   const nearSpellings: NearSpelling[] = [];
   const comments: Array<[number, number]> = [];
-  const quoted: Array<[number, number]> = [];
   let unclosed = false;
   let placeholders = 0;
   // The parenthesis depth of the arguments of each vector search call still
@@ -991,7 +986,6 @@ function readStatement(sql: string): StatementReading {
       word = sql.slice(i, wordEnd);
       if (sql[wordEnd] === "'" && ESCAPE_STRING_PREFIX.has(word)) {
         i = quotedEnd(sql, wordEnd, true);
-        quoted.push([wordEnd, i]);
         word = "";
       } else {
         if (leading) firstWord = word.toLowerCase();
@@ -1016,21 +1010,15 @@ function readStatement(sql: string): StatementReading {
     if (sql.startsWith(HOSTED_PLACEHOLDER_OPEN, i)) {
       if (inArgument) placeholders += 1;
       const close = sql.indexOf(HOSTED_PLACEHOLDER_CLOSE, i + HOSTED_PLACEHOLDER_OPEN.length);
-      const open = i;
       i = close < 0 ? sql.length - 1 : close + HOSTED_PLACEHOLDER_CLOSE.length - 1;
-      quoted.push([open, i]);
     } else if (c === "'" || c === '"' || c === "`") {
-      const open = i;
       i = quotedEnd(sql, i, false);
-      quoted.push([open, i]);
     } else if (c === "$") {
       DOLLAR_QUOTE_TAG.lastIndex = i;
       const tag = DOLLAR_QUOTE_TAG.exec(sql)?.[0];
       if (tag) {
         const close = sql.indexOf(tag, i + tag.length);
-        const open = i;
         i = close < 0 ? sql.length - 1 : close + tag.length - 1;
-        quoted.push([open, i]);
       }
     } else if (c === "(") {
       depth += 1;
@@ -1044,7 +1032,6 @@ function readStatement(sql: string): StatementReading {
       if (near) {
         const [written, , single, double] = near;
         nearSpellings.push({ at: i, length: written.length, text: single !== undefined ? single.replace(/''/g, "'") : (double ?? "") });
-        quoted.push([i, i + written.length - 1]);
         i += written.length - 1;
       } else {
         structs += 1;
@@ -1055,7 +1042,7 @@ function readStatement(sql: string): StatementReading {
     code();
     word = "";
   }
-  return { nearSpellings, placeholders, comments, quoted, unclosed, firstWord, more };
+  return { nearSpellings, placeholders, comments, unclosed, firstWord, more };
 }
 
 /** `sql` with each of its comments read out, as readStatement reads them,
@@ -1079,21 +1066,6 @@ export function withoutComments(sql: string): string {
     copied = last + 1;
   }
   return out + sql.slice(copied);
-}
-
-/** Whether a statement orders or groups its rows itself - an ORDER BY or a
- * GROUP BY in its code, not in a comment, a string, a quoted name or a
- * placeholder's text, as readStatement reads them: its rows' order is then
- * its own answer (a top ten by count), and a rerank for the question would
- * put another order on them. A block comment that never closes leaves the
- * rest of the statement read as code: the engine refuses that statement. */
-export function ordersOrGroups(sql: string): boolean {
-  const reading = readStatement(sql);
-  let code = sql;
-  for (const [first, last] of [...reading.comments, ...reading.quoted]) {
-    code = code.slice(0, first) + " ".repeat(last - first + 1) + code.slice(last + 1);
-  }
-  return /\b(?:order|group)\s+by\b/i.test(code);
 }
 
 /** Whether a statement embeds a query - carries a `{{name}}` placeholder, or
