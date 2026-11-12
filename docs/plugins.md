@@ -8,8 +8,11 @@ release that changes a setting's meaning or a consumer's tool list says so in
 its notes.
 
 `test/consumers-code.test.ts` and `test/consumers-table.test.ts` pin the tool
-lists below. A change that adds a tool to a consumer changes those tests and
-this page in the same pull request.
+lists below, for the settings each row names. A change that adds a tool to one
+of those consumers changes those tests and this page in the same pull request.
+The tools that depend on an account's agent routes or on the data
+(`web_fetch`, `page`, `describe_columns`) are not pinned beyond what the rows
+say.
 
 ## One primary corpus
 
@@ -22,17 +25,28 @@ A server reads one corpus by default, chosen at startup:
 
 Everything else stacks on top of that corpus with its own switch.
 
+## How much of the account a server reaches
+
+With a platform, a server reaches as much of the account as `CX_ACCOUNT_DATA`
+says:
+
+| `CX_ACCOUNT_DATA` | the server reaches |
+|---|---|
+| `account`, the default (also `1`, `true`, `yes`) | every database the key may see: the `tables` and `hydrate` tools, and the `database` argument of the query tools |
+| `database` (also `0`, `false`, `no`) | its own database only. Every table in it is described in the `sql` text, and `sql` and `join_keys` may join them |
+| `table` | the one table it was started for. The other tables of its database are not described, `join_keys` is not offered, and a `sql` statement that names one is refused before it runs |
+
+Any other value stops the server at startup. Whatever the key could see beyond
+the scope, the server does not reach.
+
 ## Switches a consumer may set
 
 | variable | default | what it does |
 |---|---|---|
 | `CX_TABLE` | `chunks` | the table the server reads, for a table loaded by something other than `cx index` |
-| `CX_TEXT_COLUMN` | chosen from the table's shape | with `CX_TABLE`, the column searched on a table with several indexed text columns |
-| `CX_ACCOUNT_DATA` | on with a platform | `0` turns off the account's other databases: `tables`, `hydrate`, `hydrate_status`, `hydrate_cancel`, and the `database` argument of the query tools. The server then reads its own corpus and nothing else of the account |
+| `CX_ACCOUNT_DATA` | `account` | how much of the account the server reaches, as above |
 | `CX_READ_ONLY` | off | `1` offers no tool that writes: `hydrate` and `hydrate_cancel` are not registered |
 | `CX_API_TOOLS` | off | `1` offers the platform's routes as tools (`table_card`, `validate`, and `cite` on the code index), and `sql` then carries no card or verdict of its own |
-| `CX_SIBLING_TABLES` | none | comma-separated tables beside the primary that `sql` may join; their schemas go into the `sql` text |
-| `CX_SIBLING_NOTES` | none | what the model is told about the siblings beyond their columns, such as the keys that join them |
 | `CX_CARD_TIER` | `enriched` | the card folded into the `sql` text: `enriched`, or `lean` |
 | `CX_MEMORY` | off | `1` recalls the database's memory beside the platform's searches |
 | `CX_WEB_FETCH` | off | `1` offers `web_fetch` on an account with the agent routes |
@@ -57,8 +71,9 @@ Two tools depend on the data rather than on a switch:
 | code search, no account | none | `find`, `read`, `sql` |
 | code search with an account | `--db` or a stored login | `find`, `read`, `search`, `sql`, `join_keys`, `tables`, `hydrate`, `hydrate_status`, `hydrate_cancel` |
 | the same, read-only | `CX_READ_ONLY=1` | as above, without `hydrate` and `hydrate_cancel` |
-| an agent's own table | `CX_TABLE`, `CX_ACCOUNT_DATA=0` | `find`, `search`, `sql`, `join_keys` |
-| a hosted page over one data table | `CX_TABLE`, `CX_ACCOUNT_DATA=0` | `find`, `search`, `sql`, `join_keys`, and `describe_columns` where the card allows |
+| a table of an account | `CX_TABLE` | `find`, `search`, `sql`, `join_keys`, `tables`, `hydrate`, `hydrate_status`, `hydrate_cancel` |
+| a hosted page over one database | `CX_TABLE`, `CX_ACCOUNT_DATA=database` | `find`, `search`, `sql`, `join_keys`, and `describe_columns` where the card allows |
+| an agent's own table | `CX_TABLE`, `CX_ACCOUNT_DATA=table` | `find`, `search`, `sql` |
 
 `CX_API_TOOLS=1` adds `table_card` and `validate` to any consumer with an
 account, and `cite` on the code index.

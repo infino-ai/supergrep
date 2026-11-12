@@ -100,7 +100,7 @@ network.
 | `CX_NO_EMBED` | off | keyword-only mode (with `--db`, the platform copy is keyword-only too) |
 | `CX_NO_RECEIPT` | off | `1` turns off usage accounting - the per-call receipt on results and the `cx usage` ledger |
 | `CX_TABLE` | `chunks` | the hosted table the server reads, for a table loaded from object storage rather than built by `cx index` |
-| `CX_TEXT_COLUMN` | chosen from the table's shape | with `CX_TABLE`, the column the doors search on a table that has several indexed text columns |
+| `CX_ACCOUNT_DATA` | `account` | how much of the account the server reaches: `account`, `database` or `table` (see [Building on SuperGrep](plugins.md)) |
 
 Every result carries a **usage receipt**: the tokens it returned, the files
 it spanned, and a running session total. For the platform tools the receipt

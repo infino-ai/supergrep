@@ -71,9 +71,14 @@ describe("SuperGrep, with an account: the code index, the account's data, the ch
     expect(await toolsOf()).toEqual([...CODE, "tables"].sort());
   });
 
-  it("with CX_ACCOUNT_DATA=0, none of the account's other databases", async () => {
-    process.env.CX_ACCOUNT_DATA = "0";
+  it("with CX_ACCOUNT_DATA=database, none of the account's other databases", async () => {
+    process.env.CX_ACCOUNT_DATA = "database";
     expect(await toolsOf()).toEqual(CODE);
+  });
+
+  it("with CX_ACCOUNT_DATA=table, the code index's own table alone: no join_keys", async () => {
+    process.env.CX_ACCOUNT_DATA = "table";
+    expect(await toolsOf()).toEqual(CODE.filter((t) => t !== "join_keys"));
   });
 
   it("with CX_API_TOOLS, the platform's routes as tools", async () => {

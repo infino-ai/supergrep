@@ -73,22 +73,29 @@ afterEach(() => {
 
 /** A table's doors: no `read`, which reads a repository's files. */
 const TABLE_DOORS = ["find", "join_keys", "search", "sql"];
+const HYDRATE = ["hydrate", "hydrate_cancel", "hydrate_status"];
 
-describe("Hermes, cloud: its conversations table, and nothing else of the account", () => {
-  it("offers the table's search and the checks, without the account's data", async () => {
-    process.env.CX_ACCOUNT_DATA = "0";
-    expect(await toolsOf("none")).toEqual(TABLE_DOORS);
+describe("a table server with CX_ACCOUNT_DATA unset: the table and the whole account", () => {
+  it("offers the table's doors, and the account's databases through tables and hydrate", async () => {
+    expect(await toolsOf("none")).toEqual([...TABLE_DOORS, ...HYDRATE, "tables"].sort());
   });
 });
 
-describe("a hosted page over one data table: the table, the checks, no account data", () => {
-  it("offers the table's search, the checks and describe_columns where the card allows", async () => {
-    process.env.CX_ACCOUNT_DATA = "0";
+describe("Hermes, cloud: its conversations table, and nothing else of the account", () => {
+  it("offers the table's search and sql alone (CX_ACCOUNT_DATA=table)", async () => {
+    process.env.CX_ACCOUNT_DATA = "table";
+    expect(await toolsOf("none")).toEqual(TABLE_DOORS.filter((t) => t !== "join_keys"));
+  });
+});
+
+describe("a hosted page over one database: its tables, the checks, no other database", () => {
+  it("offers the table's doors and describe_columns where the card allows (CX_ACCOUNT_DATA=database)", async () => {
+    process.env.CX_ACCOUNT_DATA = "database";
     expect(await toolsOf("kinds")).toEqual(["describe_columns", ...TABLE_DOORS]);
   });
 
   it("with CX_API_TOOLS, the platform's routes as tools", async () => {
-    process.env.CX_ACCOUNT_DATA = "0";
+    process.env.CX_ACCOUNT_DATA = "database";
     process.env.CX_API_TOOLS = "1";
     expect(await toolsOf("kinds")).toEqual(["describe_columns", ...TABLE_DOORS, "table_card", "validate"]);
   });
