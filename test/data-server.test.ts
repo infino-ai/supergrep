@@ -392,10 +392,10 @@ describe("the account's data through the server started for a repository", () =>
   });
 });
 
-describe("the account's data switched off (CX_ACCOUNT_DATA=0)", () => {
+describe("the account's other databases switched off (CX_ACCOUNT_DATA=database)", () => {
   let s: Started;
   beforeAll(async () => {
-    s = await start(account(), "cx-data-off-", { accountData: false });
+    s = await start(account(), "cx-data-off-", { accountData: "database" });
   });
   afterAll(async () => {
     await stop(s);

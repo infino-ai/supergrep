@@ -72,7 +72,8 @@ import {
   autoSyncEnabled as autoSyncSetting,
   apiToolsEnabled,
   readOnlyEnabled,
-  accountDataEnabled,
+  accountDataScope,
+  type AccountDataScope,
   configuredCardTier,
   LEAN_CARD_TIER,
   memoryEnabled,
@@ -1770,8 +1771,9 @@ export interface ServeOptions {
   hostedOptions?: HostedOptions;
   /** Offer no tool that writes (`readOnlyEnabled` when absent). */
   readOnly?: boolean;
-  /** Serve the account's other databases (`accountDataEnabled` when absent). */
-  accountData?: boolean;
+  /** How much of the account the server reaches (`accountDataScope` when
+   * absent). */
+  accountData?: AccountDataScope;
   /** The key this session's platform calls carry instead of the configured
    * one (the server over HTTP with sign-in). The repository the server was
    * started for is then not served at all (see `signedIn`). */
@@ -1798,7 +1800,7 @@ const PACKAGE_VERSION: string = JSON.parse(readFileSync(new URL("../../package.j
 export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {}): Promise<void> {
   const { hostedOptions } = serveOptions;
   const readOnly = serveOptions.readOnly ?? readOnlyEnabled();
-  const accountData = serveOptions.accountData ?? accountDataEnabled();
+  const accountScope = serveOptions.accountData ?? accountDataScope();
   const hostFiles = serveOptions.hostFiles ?? true;
   // When the start-up stops waiting on the database's other tables: counted
   // from here, the server's start, as the client counts its own wait.
@@ -2330,10 +2332,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // it at startup. Upload sessions are opened for the platform's own origin:
   // a deployment lists the origins it takes uploads from, and a client of
   // its API is of that origin as far as a listing can name one.
-  // CX_ACCOUNT_DATA=0 keeps it off: the server then reads its own corpus and
-  // nothing else of the account (accountDataEnabled).
+  // Only in the `account` scope (CX_ACCOUNT_DATA, accountDataScope): in the
+  // others the server reaches its own database, or its own table, alone.
   const data =
-    hosted !== null && accountData
+    hosted !== null && accountScope === "account"
       ? new DataPlane({
           account: { baseUrl: hosted.baseUrl, apiKey: hosted.apiKey },
           clientOptions: hostedOptions ?? {},
@@ -2429,7 +2431,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // alone: asked beside its siblings it would come back carrying the
   // platform's joins, and no key reaches the tool text - the model calls
   // join_keys.
-  const siblingNames = othersDb ? await databaseTables(othersDb, TABLE) : [];
+  // In the `table` scope there are none: the server reaches its own table
+  // alone, so no other is listed, described or offered to a JOIN.
+  const siblingNames = othersDb && accountScope !== "table" ? await databaseTables(othersDb, TABLE) : [];
   // Every hosted table of another shape this server describes - the primary
   // when it is one, and the siblings - has its card asked for within the
   // budget the platform's own loop lays the cards of one prompt out within
@@ -2724,6 +2728,21 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     if (/\bgraph_(?:walk|rank)\s*\(/i.test(code)) return null;
     const named = tablesNamed(withoutGraphCalls(code), [TABLE, ...siblingNames]);
     return named.length === 1 ? named[0] : null;
+  };
+
+  /** In the `table` scope, the other tables of a context's database: the
+   * names a statement may not reach. Listed at most once a minute, since a
+   * statement may name a table created a moment ago. A listing that fails
+   * throws, so the statement is refused rather than run unchecked. */
+  const OUTSIDE_TTL_MS = 60_000;
+  const outsideListed = new Map<string, { at: number; names: string[] }>();
+  const tablesOutside = async (ctx: RepoCtx): Promise<string[]> => {
+    if (!ctx.hosted) return [];
+    const kept = outsideListed.get(ctx.root);
+    if (kept && Date.now() - kept.at < OUTSIDE_TTL_MS) return kept.names;
+    const names = (await ctx.hosted.listTables()).filter((name) => name !== TABLE);
+    outsideListed.set(ctx.root, { at: Date.now(), names });
+    return names;
   };
 
   /** A `sql` statement run on the platform, whichever table it is over: the
@@ -3559,6 +3578,22 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // Over a database named on the call: the statement runs there, on the
       // platform, held to the keys among that database's tables.
       if (database !== undefined) return sqlOnDatabase(ctx, database, table, query, code, embeds, question);
+      // In the `table` scope a statement reaches the server's own table
+      // alone: one naming another table of the database - as an identifier,
+      // or as a search or graph function's argument - is refused before it
+      // runs. A name matched inside a string literal is refused too; the
+      // check errs toward refusing.
+      if (accountScope === "table" && ctx.hosted) {
+        let outside: string[];
+        try {
+          outside = tablesNamed(code, await tablesOutside(ctx));
+        } catch (err) {
+          return fail(`sql failed: the database's tables could not be listed to check the statement: ${(err as Error).message}`);
+        }
+        if (outside.length > 0) {
+          return fail(`sql: this server reads the ${TABLE} table alone, and the statement names ${outside.join(", ")}, another table of its database`);
+        }
+      }
       // A statement across two or more of the hosted tables is held to the
       // keys the platform found on their values: one written without any of
       // them is refused with the keys, and the model rewrites it. The model
@@ -3778,11 +3813,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     );
   }
 
-  if (hosted) {
+  if (hosted && accountScope !== "table") {
     // The call before a JOIN, on every hosted server and not only under
     // CX_API_TOOLS: a model that knows which tables its question spans has
     // no other way to the keys (the owner, 2026-09-24: "the outer model
     // knows the tables it wants to search across. what does it do then?").
+    // Not in the `table` scope, where there is one table and nothing to join.
     const keysDb = hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0 });
     server.registerTool(
       "join_keys",
