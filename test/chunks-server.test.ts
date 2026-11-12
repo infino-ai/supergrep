@@ -611,6 +611,22 @@ describe("the chunks table without CX_REMOTE_SEARCH: only a statement that embed
     expect((value as { index: string }).index).toBe("platform");
   });
 
+  it("with a question, the rows are reranked, unless the statement orders or groups them itself", async () => {
+    const ranked = `SELECT path FROM hybrid_search('${TABLE}','content','body','embedding', {{q}}, 30)`;
+    const before = s.sent.length;
+    expect((await call(s, "sql", { query: ranked, embed: { q: "body" }, question: "where is the body?" })).ok).toBe(true);
+    expect(s.sent.slice(before).find((x) => x.op === "query_sql")?.body?.rerank).toEqual({ question: "where is the body?" });
+    // A top ten by count keeps its own order: no rerank for the question.
+    // (k 300 for the GROUP BY, which the top-k check holds a smaller k to.)
+    const wide = ranked.replace(", 30)", ", 300)");
+    for (const own of [`${ranked} ORDER BY path`, `SELECT path, count(*) AS n FROM (${wide}) GROUP BY path`]) {
+      const at = s.sent.length;
+      const { ok, value } = await call(s, "sql", { query: own, embed: { q: "body" }, question: "where is the body?" });
+      expect(ok, String(value)).toBe(true);
+      expect(s.sent.slice(at).find((x) => x.op === "query_sql")?.body?.rerank, own).toBeUndefined();
+    }
+  });
+
   it("so does one with the platform's own placeholder, or one spelled close to it, read as the platform's", async () => {
     for (const written of [HOSTED_PLACEHOLDER, "{q: 'body'}"]) {
       const statement = `SELECT path FROM hybrid_search('${TABLE}','content','body','embedding', ${written}, 30)`;

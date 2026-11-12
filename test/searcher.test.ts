@@ -9,6 +9,7 @@ import {
   matchLines,
   numberLines,
   numberRowLines,
+  ordersOrGroups,
   plainTerms,
   withoutComments,
 } from "../src/core/searcher.js";
@@ -360,7 +361,36 @@ const fakeEmbedder: Embedder = {
   model: "fake",
 };
 
+describe("ordersOrGroups", () => {
+  it("reads an ORDER BY or a GROUP BY in the statement's code, in any case and spacing", () => {
+    expect(ordersOrGroups("SELECT a FROM t ORDER BY a DESC LIMIT 10")).toBe(true);
+    expect(ordersOrGroups("select a, count(*) from t group\n  by a")).toBe(true);
+    expect(ordersOrGroups("SELECT a FROM t LIMIT 10")).toBe(false);
+  });
+
+  it("does not read one in a comment, a string, a quoted name or a placeholder's text", () => {
+    expect(ordersOrGroups("SELECT a FROM t -- ORDER BY a\n")).toBe(false);
+    expect(ordersOrGroups("SELECT a FROM t /* GROUP BY a */")).toBe(false);
+    expect(ordersOrGroups("SELECT a FROM t WHERE b = 'order by a'")).toBe(false);
+    expect(ordersOrGroups("SELECT a FROM t WHERE b = E'it\\'s group by'")).toBe(false);
+    expect(ordersOrGroups('SELECT "order by" FROM t')).toBe(false);
+    expect(ordersOrGroups("SELECT a FROM t WHERE b = $$order by$$")).toBe(false);
+    expect(ordersOrGroups(`SELECT a FROM vector_search('t','v', {{q:"group by region"}}, 5)`)).toBe(false);
+    expect(ordersOrGroups(`SELECT a FROM vector_search('t','v', {{ q: 'order by' }}, 5)`)).toBe(false);
+    // The code around them still counts.
+    expect(ordersOrGroups("SELECT a FROM t WHERE b = 'x' -- note\nORDER BY a")).toBe(true);
+  });
+});
+
 describe("applyEmbeds", () => {
+  it("reads a placeholder written as a whole literal as the bare one", async () => {
+    // A statement a model wrote on a demo: the quotes doubled the vector's
+    // own into `''0.25,0.5''` before.
+    const sql = "SELECT * FROM vector_search('chunks','embedding', '{{q}}', 5) WHERE label = 'a''b'";
+    const out = await applyEmbeds(sql, { q: "query text" }, fakeEmbedder);
+    expect(out).toBe("SELECT * FROM vector_search('chunks','embedding', '0.25,0.5', 5) WHERE label = 'a''b'");
+  });
+
   it("passes SQL without placeholders through untouched", async () => {
     const sql = "SELECT * FROM chunks";
     expect(await applyEmbeds(sql, undefined, fakeEmbedder)).toBe(sql);

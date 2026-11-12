@@ -174,6 +174,7 @@ import {
   runSql,
   runSqlRows,
   embedsAQuery,
+  ordersOrGroups,
   guardSql,
   jsonify,
   normalizeQueryPlaceholders,
@@ -497,6 +498,15 @@ export const SEVERAL_TABLES_SENTENCE =
   "descriptions and values say, never by a column named like the question's words; the notes under " +
   "the question say which table holds what. A column described as holding no value, or whose rows " +
   "come back empty, is not the one: go to the other table.";
+
+/** How to filter a list column of another table. A model compared a related
+ * table's list<large_utf8> column to a string and the engine refused the
+ * statement (2026-11-11); the rule is said once for every list column among
+ * the other tables. */
+export const LIST_COLUMN_SENTENCE =
+  " A column whose type is a list - list<...> in a column list, List(...) on a card - holds several " +
+  "values in each row: test it with array_has(column, 'value') or unnest it, never compare it with = " +
+  "or LIKE as if it were text.";
 
 /** Text columns a tool's text names before counting the rest - the loop's
  * TEXT_COLUMNS_LISTED, the same figure: a table of events carries hundreds
@@ -1292,6 +1302,7 @@ export function siblingsNote(table: string, siblings: TableShape[], unresolved: 
     // call: "it's not forceful enough").
     ` ${JOIN_KEYS_RULE}` +
     ` Also in this database, and joinable with ${table} in one statement: ${described.join("; ")}.` +
+    LIST_COLUMN_SENTENCE +
     // The same sentence the loop reads over several tables: a question may
     // be about any one of them, and a statement over that table alone is
     // the answer when it is.
@@ -2751,13 +2762,15 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // order come back with the rows, where before the rows went back up
       // to /validate in a second call. Validation is asked for wherever the
       // verdict is attached (not under the API tools, where the model asks
-      // for it); the rerank when there is a question to rank for.
+      // for it); the rerank when there is a question to rank for and the
+      // statement does not order or group its rows itself: a top ten by
+      // count keeps its own order (`ordersOrGroups`).
       const asked = question?.trim() ? question.trim() : undefined;
       const checks: ReadChecks = {
         ...(!apiTools && (opts.over ? opts.over.table !== undefined : verdictDb)
           ? { validate: { table_name: opts.over?.table ?? TABLE, field_name: opts.column ?? CONTENT_COLUMN, ...(asked ? { question: asked } : {}) } }
           : {}),
-        ...(asked ? { rerank: { question: asked } } : {}),
+        ...(asked && !ordersOrGroups(query) ? { rerank: { question: asked } } : {}),
       };
       const checked = await runSqlRows(db, query, embeds, checks);
       const own = opts.over ? callTelemetry(db.lastCall()) : hostedTelemetry(ctx);

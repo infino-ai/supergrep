@@ -45,6 +45,7 @@ import {
   RELATED_TO_SENTENCE,
   SEARCH_RULE_SENTENCE,
   SEVERAL_TABLES_SENTENCE,
+  LIST_COLUMN_SENTENCE,
   SQL_DESCRIPTION,
   SWEEP_TO_A_TOOL,
   TEXT_COLUMNS_LISTED,
@@ -450,6 +451,14 @@ describe("the doors over rows", () => {
     expect(() => foldEmbeds("SELECT {{q}}", undefined)).toThrow(/no 'embed' map/);
     expect(() => foldEmbeds("SELECT {{q}}", {})).toThrow(/no 'embed' text/);
     expect(() => foldEmbeds("SELECT {{q}}", { q: 'a"}}b' })).toThrow(/ends the platform's placeholder/);
+  });
+
+  it("foldEmbeds drops the quotes a model put around {{q}}", () => {
+    // The platform's vector carries its own quotes, so the model's doubled
+    // them into a parser error.
+    expect(foldEmbeds("SELECT * FROM vector_search('t','e', '{{q}}', 5) WHERE s = 'a''b'", { q: "security" })).toBe(
+      "SELECT * FROM vector_search('t','e', {{q:\"security\"}}, 5) WHERE s = 'a''b'",
+    );
   });
 
   // The three hybrid_search calls Sonnet wrote over the Wikipedia table on
@@ -1423,6 +1432,12 @@ describe("a table with no full-text column", () => {
     expect(siblingsNote("chunks", [JOBS], [])).toContain("USE graph_walk, NOT A JOIN, WHEN THE QUESTION STARTS FROM PARTICULAR ROWS");
     // The graph's own addition to a result is named, so the model reads it.
     expect(siblingsNote("chunks", [JOBS], [])).toContain("also carries `connected`");
+  });
+
+  it("says how to filter another table's list column, searchable or not", () => {
+    // The rule is said once for every list column among the other tables.
+    expect(siblingsNote("chunks", [JOBS], [])).toContain(LIST_COLUMN_SENTENCE.trim());
+    expect(siblingsNote("chunks", [JOBS], [], false, true)).toContain(LIST_COLUMN_SENTENCE.trim());
   });
 });
 
