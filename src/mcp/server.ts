@@ -191,8 +191,9 @@ import {
   hostedTelemetry,
   type CallTelemetry,
   CONTENT_COLUMN,
-  FIND_RESULT_CHAR_BUDGET,
   MAX_FIND_CONTEXT,
+  MAX_FIND_PAGES,
+  AUTO_CHUNK_CONTEXT,
 } from "../core/searcher.js";
 import { renderFind } from "../core/find-text.js";
 import {
@@ -939,17 +940,72 @@ export const PER_PROJECT_COUNT =
   "SELECT split_part(path,'/',1) AS project, count(*) AS lines FROM token_match('chunks','content','<the " +
   "term>','and') GROUP BY 1 ORDER BY 2 DESC (GROUP BY path for the count per file).";
 
+/** The form a find carries its matches in, from what the caller set. Given
+ * neither chunks nor context, each match comes in its block trimmed to
+ * AUTO_CHUNK_CONTEXT lines around it - the comment above it and the lines
+ * below - rather than as the matching line alone: a question about what each
+ * match does or relies on is answered by those lines, and a caller handed
+ * the bare lines reads a window per match to find them. Tool text saying
+ * when to set chunks is not followed by every model; a default applies to
+ * all of them. Either option set is the caller's choice and stands: chunks false is the
+ * matching line alone (with context, grep's -B/-A lines), chunks true the
+ * whole block. `aroundByDefault` is set when the default applied, so the
+ * result can say so and name the other forms. */
+export function findForm(
+  chunks: boolean | undefined,
+  context: number | undefined,
+): { chunks?: boolean; context?: number; aroundByDefault?: number } {
+  if (chunks === undefined && context === undefined) {
+    return { chunks: true, context: AUTO_CHUNK_CONTEXT, aroundByDefault: AUTO_CHUNK_CONTEXT };
+  }
+  return { chunks, context };
+}
+
 /** The hint on an empty find, or null when the result needs none: a query
  * with spaces is a phrase or a signature, which one exact line may never
  * hold; with `defines` on and nothing found, the name itself is in doubt.
  * A bare identifier that is simply absent gets no hint - zero is the answer. */
-export function findHint(query: string, total: number, defines: boolean, withText = total, listed = total): string | null {
+export function findHint(
+  query: string,
+  total: number,
+  defines: boolean,
+  withText = total,
+  listed = total,
+  blocks = false,
+  pages?: number[],
+  skip = 0,
+): string | null {
+  // Pages: the result names where each following page starts, so the rest
+  // is one reply of finds with skip - not one find per file, and never a
+  // read per line.
+  if (pages && pages.length > 0) {
+    const tail = pages.length >= MAX_FIND_PAGES ? " The last of them names where the next pages start." : "";
+    return (
+      `This result carried ${withText} of the ${total} matching lines${blocks ? " with their blocks" : " with their text"}. ` +
+      `For the rest, find again with the same query and options and skip set to each of ${pages.join(", ")} - all ` +
+      `of them in the same reply, one call each; together they carry every remaining match, so no find per file ` +
+      `is needed.${tail} A saved result is not for the shell to read.`
+    );
+  }
   // A flood: the counts are complete, every place within the limit is
   // listed, and the text of the rest is one sql away - never the shell over
   // a saved result (the demo, 2026-09-24: a 58,000-character find went to a
   // file and Bash read it).
-  if (total > withText) {
-    const beyond = total > listed ? ` ${total - listed} more are in the total and the per-file counts but not listed.` : "";
+  // A page from `skip` answers for the matches from there on: the last page
+  // carries all of those, and the ones before it came on earlier pages, so
+  // it needs no hint sending the caller back for them.
+  const from = Math.min(Math.max(0, skip), total);
+  if (total - from > withText) {
+    const beyond =
+      total - from > listed ? ` ${total - from - listed} more are in the total and the per-file counts but not listed.` : "";
+    // A chunks find past its budget: the rest's blocks are one more chunks
+    // find away, not a read per line.
+    if (blocks) {
+      return (
+        `${withText} of ${total} matching lines came with their block; the rest are listed by path and line after ` +
+        `them.${beyond} For their blocks, find again with chunks and skip. A saved result is not for the shell to read.`
+      );
+    }
     return (
       `${withText} of ${total} lines carry their text; the rest are listed by path and line after them.${beyond} ` +
       "For a line's text, sql: SELECT start_line, content FROM the table WHERE path = '...' AND start_line <= " +
@@ -3288,8 +3344,15 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           FIND_BY_BARE_NAME +
           // A flood keeps every place: the lines past the text budget come as
           // path and line numbers (`more`), and a line's text is a sql read.
-          " The lines around a match - what leads into an error and follows it - come with it when you ask " +
-          "for context (like grep -B/-A); no file need be opened for them. " +
+          // A question about what each match does or relies on is answered
+          // by the lines around it, so they come by default (findForm), and
+          // the pages of a wide result are named so they come in one reply.
+          ` Each match comes in the block of code it sits in, with the ${AUTO_CHUNK_CONTEXT} lines around it - the ` +
+          "comment above it, the lines below - numbered as a file read is and merged where they meet, so what each " +
+          "match does or relies on is in the result and no file need be opened. chunks: true carries whole blocks; " +
+          "chunks: false the matching line alone, as grep -n does, and with context the lines before and after it " +
+          "(grep -B/-A). When a result names further pages, ask for every one of them in the same reply with skip. " +
+          "Never follow a find with a read per match. " +
           "A wide result lists every matching place: the first lines with their text, the rest by path and " +
           "line after them; a line's text is one sql statement away, and the per-file counts count them all. " +
           "A count per project or per file - which projects use X, how many times each - is one sql statement, " +
@@ -3346,7 +3409,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             .positive()
             .max(MAX_FIND_LIMIT)
             .default(DEFAULT_FIND_LIMIT)
-            .describe("Maximum matching lines to return; the result reports the total either way."),
+            .describe(
+              "Matching lines one result carries at most: a page, not a cap on the find. With more than this, the " +
+                "result names the skip of each following page; the result reports the total either way.",
+            ),
           question: z.string().optional().describe(RERANK_QUESTION_PARAM),
           context: z
             .number()
@@ -3355,9 +3421,31 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             .max(MAX_FIND_CONTEXT)
             .optional()
             .describe(
-              "Lines before and after each match to carry, from the match's own window - what grep -B/-A " +
-                "shows - so the lines that lead into an error and follow it come with the match, without " +
-                "opening the file. Up to 20; more than a few matches with context is a wide result.",
+              `Lines around each match to carry. Unset, each match comes in its block with ${AUTO_CHUNK_CONTEXT} lines ` +
+                "around it. With chunks true, each block keeps this many lines around its matches; given alone or " +
+                "with chunks false, the matching line comes with this many lines before and after it, as grep -B/-A " +
+                "shows. Up to 20; more than a few matches with context is a wide result.",
+            ),
+          chunks: z
+            .boolean()
+            .optional()
+            .describe(
+              `Unset, each match comes in the block of code it sits in, trimmed to ${AUTO_CHUNK_CONTEXT} lines around ` +
+                "it, its lines numbered. true: the whole block - the chunk the index holds it in - for the body " +
+                "around a match; past two pages of whole blocks they are trimmed too, and the result says so. " +
+                "false: the matching line alone, as grep -n writes it - for a list of places or a count. A block " +
+                "holding several matches comes once, and overlapping blocks are not repeated. The text budget " +
+                "still applies; the matches of blocks past it are listed by path and line.",
+            ),
+          skip: z
+            .number()
+            .int()
+            .min(0)
+            .optional()
+            .describe(
+              "Matching lines to pass over before this result starts: the next page of a find its budget cut. A " +
+                "result that could not carry every match names the skip of each following page; ask for all of " +
+                "them in one reply, one call each, rather than one find per file.",
             ),
           path: z
             .string()
@@ -3371,7 +3459,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           table: TABLE_ARG,
         },
       },
-      async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, path, question, share, database, table }) => {
+      async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, chunks, skip, path, question, share, database, table }) => {
         let ctx: RepoCtx;
         try {
           ctx = repoFor(database !== undefined ? undefined : path);
@@ -3434,18 +3522,22 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         if (!autoIndexed) maybeAutoSync(ctx); // a fresh build is already current
         try {
           const t0 = performance.now();
-          // A batch shares the one text budget between its queries.
-          const budget = share && share > 1 ? Math.floor(FIND_RESULT_CHAR_BUDGET / share) : undefined;
-          const result = await find(handle, query, { ignoreCase, defines, under, limit, context, budget });
+          // A batch shares the one text budget between its queries; the
+          // pages a result names are worked out for calls of their own.
+          const form = findForm(chunks, context);
+          const result = await find(handle, query, { ignoreCase, defines, under, limit, context: form.context, chunks: form.chunks, skip, share });
           const listed = result.matches.length + (result.more ?? []).reduce((n, m) => n + m.lines.length, 0);
-          const hint = findHint(query, result.total, Boolean(defines), result.matches.length, listed) ?? undefined;
+          const hint =
+            findHint(query, result.total, Boolean(defines), result.matches.length, listed, Boolean(result.blocks), result.pages, result.skip) ??
+            undefined;
           const noted = autoIndexed ? autoIndexNote(autoIndexed) : undefined;
           const tookMs = Math.round((performance.now() - t0) * 1000) / 1000;
+          const aroundByDefault = form.aroundByDefault;
           // Written as grep writes it (`renderFind`); the receipt prices that
           // text, since it is what was returned, and rides on its last line.
           let usage: string | undefined;
           if (receiptOn) {
-            const entry = findEntry(result, false, renderFind(result, { hint, autoIndexed: noted?.note, tookMs }));
+            const entry = findEntry(result, false, renderFind(result, { hint, autoIndexed: noted?.note, tookMs, aroundByDefault }));
             recordUsage(ctx.dir, entry);
             usage = formatReceipt(entry, session);
           }
@@ -3457,7 +3549,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
               took_ms: tookMs,
               ...(usage ? { usage } : {}),
             },
-            renderFind(result, { hint, autoIndexed: noted?.note, tookMs, usage }),
+            renderFind(result, { hint, autoIndexed: noted?.note, tookMs, usage, aroundByDefault }),
           );
         } catch (err) {
           return fail(`find failed: ${(err as Error).message}`);

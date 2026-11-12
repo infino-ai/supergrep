@@ -7,7 +7,24 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { connect } from "@infino-ai/infino";
 import { indexRepo, indexRepoStaged, syncRepo } from "../src/core/indexer.js";
 import { readManifest } from "../src/core/manifest.js";
-import { analyzerOf, analyzerTokens, cutFindMatches, find, plainTerms, readFiles, readRanges, READ_LINES_CAP, runSql, search } from "../src/core/searcher.js";
+import {
+  analyzerOf,
+  analyzerTokens,
+  cutFindMatches,
+  find,
+  findBlocks,
+  MAX_FIND_PAGES,
+  plainTerms,
+  prepareChunks,
+  readFiles,
+  readRanges,
+  READ_LINES_CAP,
+  runSql,
+  search,
+  type FindOptions,
+  type FindResult,
+} from "../src/core/searcher.js";
+import { renderBlock } from "../src/core/find-text.js";
 /** The read budget the tests read under: a result past it is paged. */
 const RESULT_MAX_CHARS = 60_000;
 import { TABLE } from "../src/core/config.js";
@@ -64,6 +81,11 @@ export function replayLog(): number { return 42; }
   notes[29] = "run git -C repo status --max-files 5";
   notes[39] = 'log("hello wörld there")';
   notes[54] = "OVERLAP_MARK sits in two windows";
+  // One marker in the overlap of the first two windows (line 58) and one in
+  // the second window alone (line 70): a chunks find carries both windows,
+  // each line once.
+  notes[57] = "BLOCKSEEN early";
+  notes[69] = "BLOCKSEEN late";
   notes[129] = "z".repeat(600) + " FAR_MARK " + "z".repeat(300);
   writeFileSync(join(root, "notes.txt"), notes.join("\n") + "\n");
   writeFileSync(join(root, ".gitignore"), "ignored.ts\n");
@@ -342,6 +364,201 @@ describe("find", () => {
     expect(r.total).toBe(plain.total);
     // Clamped to the cap rather than refused.
     expect((await find(handle, "Session(", { context: 999 })).matches[0].before!.length).toBeLessThanOrEqual(20);
+  });
+
+  it("with chunks, carries each match's block once and no line twice where windows overlap", async () => {
+    const r = await find(handle, "BLOCKSEEN", { chunks: true });
+    expect(r.total).toBe(2);
+    expect(r.matches.map((m) => m.line)).toEqual([58, 70]);
+    const blocks = r.blocks!;
+    // Line 58 is in both windows and goes to the first; line 70 is in the
+    // second alone, whose block starts after the first one's last line.
+    expect(blocks.map((b) => [b.path, b.start, b.end, b.hits])).toEqual([
+      ["notes.txt", 1, 60, [58]],
+      ["notes.txt", 61, 110, [70]],
+    ]);
+    const textAt = (b: (typeof blocks)[number], n: number) => b.lines.find((l) => l.line === n)?.text;
+    expect(textAt(blocks[0], 58)).toBe("BLOCKSEEN early");
+    expect(textAt(blocks[1], 70)).toBe("BLOCKSEEN late");
+    const written = blocks.flatMap((b) => b.lines.map((l) => l.line));
+    expect(new Set(written).size).toBe(written.length);
+    // A line in two windows is still one block.
+    const overlap = await find(handle, "OVERLAP_MARK", { chunks: true });
+    expect(overlap.blocks!.length).toBe(1);
+    expect(overlap.blocks![0].hits).toEqual([55]);
+  });
+
+  it("with chunks and context, each block keeps only the lines near its matches, merged, none written twice", async () => {
+    const r = await find(handle, "BLOCKSEEN", { chunks: true, context: 2 });
+    expect(r.blocks!.map((b) => b.lines.map((l) => l.line))).toEqual([
+      [56, 57, 58, 59, 60],
+      [68, 69, 70, 71, 72],
+    ]);
+    // Near matches merge into one run rather than repeating their overlap.
+    const wide = await find(handle, "BLOCKSEEN", { chunks: true, context: 8 });
+    const lines = wide.blocks!.flatMap((b) => b.lines.map((l) => l.line));
+    expect(new Set(lines).size).toBe(lines.length);
+    expect(lines[0]).toBe(50);
+    expect(lines.at(-1)).toBe(78);
+  });
+
+  it("with chunks, the block around a match carries what a line-only find leaves out", async () => {
+    const line = await find(handle, "revokeSession");
+    expect(line.blocks).toBeUndefined();
+    const r = await find(handle, "revokeSession", { chunks: true });
+    expect(r.total).toBe(line.total);
+    const text = r.blocks!.flatMap((b) => b.lines.map((l) => l.text)).join("\n");
+    expect(text).toContain("tombstone the session record");
+    expect(r.matches.every((m) => m.before === undefined)).toBe(true);
+  });
+
+  it("with chunks, blocks past the budget keep their matches' places; the first block always comes back", () => {
+    const chunk = (path: string, start: number, lines: number, hitAt: number) => ({
+      path,
+      start,
+      content: Array.from({ length: lines }, (_, i) => (start + i === hitAt ? "HIT" : "y".repeat(100))).join("\n"),
+    });
+    const chunks = [chunk("a.rs", 1, 20, 5), chunk("b.rs", 1, 20, 7), chunk("c.rs", 1, 20, 9)];
+    const rows = [
+      { path: "a.rs", line: 5, text: "HIT" },
+      { path: "b.rs", line: 7, text: "HIT" },
+      { path: "c.rs", line: 9, text: "HIT" },
+    ];
+    // Each block is about 2,200 characters: a 3,000 budget carries one.
+    const tight = findBlocks(chunks, rows, 3_000);
+    expect(tight.blocks.map((b) => b.path)).toEqual(["a.rs"]);
+    expect(tight.matches.map((m) => m.path)).toEqual(["a.rs"]);
+    expect(tight.more).toEqual([
+      { path: "b.rs", lines: [7] },
+      { path: "c.rs", lines: [9] },
+    ]);
+    expect(findBlocks(chunks, rows, 10).blocks.length).toBe(1);
+    expect(findBlocks(chunks, rows).blocks.length).toBe(3);
+    // A chunk holding no match within the limit is not carried.
+    expect(findBlocks(chunks, rows.slice(0, 1)).blocks.map((b) => b.path)).toEqual(["a.rs"]);
+  });
+
+  it("a chunks find given no context trims its blocks when whole ones would take more than two pages, and says so", async () => {
+    // Every notes.txt line holds "filler": three windows, one a page at this
+    // budget, so whole blocks would be three pages.
+    const trimmed = await find(handle, "filler", { chunks: true, budget: 1 });
+    expect(trimmed.trimmedTo).toBe(4);
+    // Asked-for context is never overridden, and a find that fits keeps its
+    // whole blocks.
+    expect((await find(handle, "filler", { chunks: true, budget: 1, context: 10 })).trimmedTo).toBeUndefined();
+    expect((await find(handle, "BLOCKSEEN", { chunks: true })).trimmedTo).toBeUndefined();
+  });
+
+  it("pages: each result names where the following pages start, and the pages together carry every match once", async () => {
+    // A tiny budget, so every page carries one block; chunks and lines both.
+    for (const chunks of [true, false]) {
+      const first = await find(handle, "export function", { chunks, budget: 1 });
+      expect(first.total).toBe(4);
+      // Lines: one per page. Chunks: one block per page, holding however many
+      // matches its chunk has.
+      if (!chunks) expect(first.matches.length).toBe(1);
+      expect(first.pages!.length).toBeGreaterThan(0);
+      const carried = [...first.matches.map((m) => `${m.path}:${m.line}`)];
+      for (const skip of first.pages!) {
+        const page = await find(handle, "export function", { chunks, budget: 1, skip });
+        expect(page.skip).toBe(skip);
+        carried.push(...page.matches.map((m) => `${m.path}:${m.line}`));
+      }
+      const all = (await find(handle, "export function")).matches.map((m) => `${m.path}:${m.line}`);
+      expect(carried).toEqual(all);
+    }
+    // A find that carried everything names no pages.
+    expect((await find(handle, "export function")).pages).toBeUndefined();
+    await expect(find(handle, "export function", { skip: -1 })).rejects.toThrow(/non-negative/);
+  });
+
+  /** Follows a find as its results say to: every page a result names, asked
+   * for at once as calls of their own (`next`), then the pages the last of
+   * them names. Each page must name the next one as where it stops. Returns
+   * every match carried, in order, and the start of every page after the
+   * first. */
+  const walk = async (query: string, first: FindOptions, next: FindOptions = first) => {
+    const key = (r: FindResult) => r.matches.map((m) => `${m.path}:${m.line}`);
+    const head = await find(handle, query, first);
+    const carried = key(head);
+    const starts: number[] = [];
+    for (let named = head.pages ?? []; named.length > 0; ) {
+      const results = await Promise.all(named.map((skip) => find(handle, query, { ...next, skip })));
+      results.forEach((r, i) => {
+        if (i + 1 < named.length) expect(r.pages?.[0]).toBe(named[i + 1]);
+        carried.push(...key(r));
+      });
+      starts.push(...named);
+      named = results.at(-1)!.pages ?? [];
+    }
+    const all = (await find(handle, query, { limit: 500, budget: 1_000_000 })).matches.map((m) => `${m.path}:${m.line}`);
+    return { head, carried, starts, all };
+  };
+
+  it("pages of several matches each, past the page cap, carry every match once and start where the results said", async () => {
+    // About three "filler" lines fit in 200 characters: some 40 pages.
+    const { head, carried, starts, all } = await walk("filler", { budget: 200 });
+    expect(head.matches.length).toBeGreaterThan(1);
+    expect(carried).toEqual(all);
+    // The first result names the cap's worth of pages, each where the walk
+    // found it, and its last names the pages after it.
+    expect(head.pages!.length).toBe(MAX_FIND_PAGES);
+    expect(starts.slice(0, MAX_FIND_PAGES)).toEqual(head.pages);
+    expect(starts.length).toBeGreaterThan(MAX_FIND_PAGES);
+    const last = await find(handle, "filler", { budget: 200, skip: head.pages!.at(-1)! });
+    expect(last.pages![0]).toBe(starts[MAX_FIND_PAGES]);
+    // In chunks mode a page holds whole blocks of many matches each, and
+    // the pages still meet where the results said.
+    const blocks = await walk("filler", { chunks: true, context: 0, budget: 200 });
+    expect(blocks.head.matches.length).toBeGreaterThan(1);
+    expect(blocks.carried).toEqual(blocks.all);
+    expect(blocks.starts).toEqual(blocks.head.pages);
+  });
+
+  it("a batched find names pages worked out for calls of their own, so following them repeats no match", async () => {
+    for (const chunks of [false, true]) {
+      // A block of "filler" lines costs about 1,300 characters, a line 60.
+      const opts = { chunks, budget: chunks ? 3_000 : 600, ...(chunks ? { context: 0 } : {}) };
+      // A batch of three: this page gets a third of the budget...
+      const { head, carried, all } = await walk("filler", { ...opts, share: 3 }, opts);
+      const alone = await find(handle, "filler", opts);
+      expect(head.matches.length).toBeLessThan(alone.matches.length);
+      // ...and the pages it names are the pages a call of its own carries.
+      expect(carried).toEqual(all);
+    }
+    // A batched chunks find given no context trims, or not, as the same
+    // find alone does, so its pages and theirs are cut alike.
+    for (const budget of [1, 1_500, 3_000, 6_000, 24_000]) {
+      const batched = await find(handle, "filler", { chunks: true, budget, share: 4 });
+      const alone = await find(handle, "filler", { chunks: true, budget });
+      expect(batched.trimmedTo).toBe(alone.trimmedTo);
+    }
+  });
+
+  it("limit sizes a page: the pages after it carry the rest, and skip with limit starts there", async () => {
+    const { head, carried, all } = await walk("filler", { limit: 5 });
+    expect(head.matches.length).toBe(5);
+    expect(head.truncated).toBe(true);
+    expect(head.pages!.slice(0, 3)).toEqual([5, 10, 15]);
+    expect(carried).toEqual(all);
+    const page = await find(handle, "filler", { limit: 5, skip: 10 });
+    expect(page.matches.map((m) => `${m.path}:${m.line}`)).toEqual(all.slice(10, 15));
+    expect(page.skip).toBe(10);
+  });
+
+  it("a block's heading is costed with the matching lines it lists, so the blocks carried fit the budget", () => {
+    // Sixty matching lines from line 10,000: the heading lists all sixty.
+    const chunk = (path: string) => ({ path, start: 10_000, content: Array.from({ length: 60 }, () => "HIT").join("\n") });
+    const chunks = [chunk("a.rs"), chunk("b.rs")];
+    const rows = chunks.flatMap((c) => Array.from({ length: 60 }, (_, i) => ({ path: c.path, line: 10_000 + i, text: "HIT" })));
+    for (let budget = 200; budget <= 4_000; budget += 50) {
+      const { blocks } = findBlocks(chunks, rows, budget);
+      if (blocks.length < 2) continue;
+      const written = blocks.map((b) => renderBlock(b).join("\n")).join("\n\n");
+      expect(written.length).toBeLessThanOrEqual(budget);
+    }
+    // Prepared once or prepared per call, the blocks are the same.
+    expect(findBlocks(prepareChunks(chunks), rows, 1_500)).toEqual(findBlocks(chunks, rows, 1_500));
   });
 
   it("past the character budget a match keeps its place and loses its text; nothing within the limit is dropped", () => {

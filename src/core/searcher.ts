@@ -402,6 +402,30 @@ export interface FindMatch {
   after?: string[];
 }
 
+/** One line a block carries: its number in the file and its text, cut to
+ * FIND_LINE_CAP. */
+export interface FindBlockLine {
+  line: number;
+  text: string;
+}
+
+/** One block of code a chunks-mode find carries: the lines of the chunk that
+ * holds its matches, numbered - all of them, or with `context` the ones near
+ * a match. Overlapping windows are carried once: a line an earlier block in
+ * the same file wrote is not written again. */
+export interface FindBlock {
+  path: string;
+  /** First and last line carried, 1-based and inclusive. */
+  start: number;
+  end: number;
+  /** Definition name(s) of the chunk, when known. */
+  symbol?: string;
+  /** The lines carried, in order; a gap in the numbers is lines left out. */
+  lines: FindBlockLine[];
+  /** The matching lines the block holds, in order. */
+  hits: number[];
+}
+
 /** Matching lines in one file - the `grep -c` view. */
 export interface FindFileCount {
   path: string;
@@ -412,8 +436,12 @@ export interface FindResult {
   query: string;
   ignoreCase: boolean;
   /** Matching lines in path then line order, cut at the limit, with their
-   * text while the character budget lasts. */
+   * text while the character budget lasts. In chunks mode, the matches whose
+   * block is carried. */
   matches: FindMatch[];
+  /** Chunks mode only: the blocks of code the carried matches sit in, each
+   * once, in path then line order. */
+  blocks?: FindBlock[];
   /** The matching lines within the limit that the text budget did not
    * reach: every one of them, as path and line numbers by file, no excerpt. */
   more?: FindLocations[];
@@ -437,12 +465,41 @@ export interface FindResult {
   /** Echoed when `under` scoped the result, so a caller reading the answer
    * knows the counts describe a subtree and not the repository. */
   under?: string;
+  /** Echoed when `skip` passed over matching lines: where this page starts. */
+  skip?: number;
+  /** When matches remain after this page: the `skip` each following page
+   * starts at, computed with the budget a call of its own gets (not a
+   * batch's share of it), so every page is one call and they can all be
+   * asked for at once. At most MAX_FIND_PAGES. */
+  pages?: number[];
+  /** Set when a chunks find given no context trimmed its blocks to this many
+   * lines around each match, because whole blocks would have taken more
+   * pages (see AUTO_CHUNK_CONTEXT). */
+  trimmedTo?: number;
 }
+
+/** Following pages a find result names at most; a result wider than this
+ * says so, and the last page names the next. Sixteen rather than eight: at
+ * eight, a find over a few hundred sites took a third reply for the pages
+ * the eighth named. */
+export const MAX_FIND_PAGES = 16;
+
+/** Lines kept around each match when a chunks find was given no context and
+ * its whole blocks would need more than one further page: wide enough to
+ * hold the comment above a match, narrow enough that a page carries about
+ * four times the sites whole blocks do. */
+export const AUTO_CHUNK_CONTEXT = 4;
+/** Further pages whole blocks may take before a chunks find with no context
+ * trims them to AUTO_CHUNK_CONTEXT: one, so a find that fits in two pages
+ * keeps its whole blocks. */
+const WHOLE_BLOCK_MAX_PAGES = 1;
 
 export interface FindOptions {
   /** Match regardless of letter case. Default false: case-sensitive, like grep. */
   ignoreCase?: boolean;
-  /** Maximum matches returned: a positive integer, clamped to MAX_FIND_LIMIT. */
+  /** Matching lines one result carries at most - a page - from `skip`: a
+   * positive integer, clamped to MAX_FIND_LIMIT. Lines past it are not a
+   * cap on the find: the result names the pages that carry them. */
   limit?: number;
   /** Keep only matches inside a chunk that *defines* the query - the handful
    * of places a name is declared, rather than every place it appears. See
@@ -471,6 +528,22 @@ export interface FindOptions {
    * context on the match it has no reason to. Clamped to MAX_FIND_CONTEXT;
    * a window is about sixty lines, so context past its edge is cut there. */
   context?: number;
+  /** Carry each match with the whole chunk it sits in, once, instead of the
+   * matching line alone. For a question about what each match does or
+   * relies on, whose answer is often in the comment above the line rather
+   * than on it, so the matching lines alone send the caller to read a window
+   * per match. Overlapping windows are carried once (see `findBlocks`); the text budget
+   * is the same, and blocks past it keep their matches' places. With
+   * `context` set too, each block keeps only that many lines around its
+   * matches, merged where they meet: the form for a question over many
+   * sites. */
+  chunks?: boolean;
+  /** Matching lines to pass over before this result starts, in the result's
+   * own order (path, then line): the next page of a find its budget cut. A
+   * result names where each following page starts (`pages`), so the rest
+   * of a wide find is one reply of calls rather than one scoped find per
+   * file. */
+  skip?: number;
   /** Characters of match text this call may carry, when the caller has less
    * than the whole budget to give it: a batch of finds shares one budget
    * (FIND_RESULT_CHAR_BUDGET) between its queries, so four queries at once
@@ -478,6 +551,12 @@ export interface FindOptions {
    * characters from one batch, over the tool-result cap). Clamped to the
    * budget; unset is the whole budget. */
   budget?: number;
+  /** How many queries this call's batch carries: this page gets `budget`
+   * divided by it, while the following pages it names are worked out with
+   * `budget` whole, since each is asked for as a call of its own and gets
+   * the whole budget. Worked out with the shared budget, those calls each
+   * carried past the next page's start and the pages repeated matches. */
+  share?: number;
 }
 
 /** Most context lines a find carries on each side of a match. */
@@ -523,9 +602,12 @@ const FIND_LINE_CAP = 240;
  * just capping rows and dropping them that would suck"). */
 export const FIND_RESULT_CHAR_BUDGET = 24_000;
 
-/** Characters a match costs beyond its path and text: the line number and
- * the JSON around them, as the result is written. */
+/** Characters a match costs beyond its path and text: the line number, the
+ * separators and the bracketed definition, as the result is written. */
 const FIND_MATCH_OVERHEAD = 40;
+/** Characters a context line costs beyond its text and its path, which grep's
+ * shape writes on every line: the line number and the two separators. */
+const FIND_CONTEXT_LINE_OVERHEAD = 8;
 
 /** The matches past the text budget, by file: every place, no excerpt. A
  * line's text is one sql statement away (SELECT start_line, content FROM
@@ -547,19 +629,159 @@ export function cutFindMatches(
   const matches: FindMatch[] = [];
   const more: FindLocations[] = [];
   let chars = 0;
+  // Once one match does not fit, none after it is carried either: what a
+  // result carries is always the first run of its matches, so `skip` can
+  // pick up exactly where it stopped.
+  let full = false;
   for (const m of rows.slice(0, limit)) {
-    const around = [...(m.before ?? []), ...(m.after ?? [])].reduce((n, l) => n + l.length + 4, 0);
+    // A context line is written as `path-line-text`, so it costs its path
+    // too: counting its text alone lets a context find over long paths come
+    // back well over the budget.
+    const around = [...(m.before ?? []), ...(m.after ?? [])].reduce(
+      (n, l) => n + l.length + m.path.length + FIND_CONTEXT_LINE_OVERHEAD,
+      0,
+    );
     const size = m.path.length + m.text.length + (m.symbol?.length ?? 0) + around + FIND_MATCH_OVERHEAD;
-    if (matches.length === 0 || chars + size <= budget) {
+    if (!full && (matches.length === 0 || chars + size <= budget)) {
       matches.push(m);
       chars += size;
+      continue;
+    }
+    full = true;
+    const last = more.at(-1);
+    if (last && last.path === m.path) last.lines.push(m.line);
+    else more.push({ path: m.path, lines: [m.line] });
+  }
+  return { matches, more };
+}
+
+/** A chunk a find read its matches from: where it starts and what it holds. */
+export interface FindChunk {
+  path: string;
+  start: number;
+  content: string;
+  symbol?: string;
+}
+
+/** Characters a block costs beyond its lines and its matching lines: the
+ * heading's marker, its citation's line numbers and the words around them. */
+const FIND_BLOCK_OVERHEAD = 60;
+/** Characters a carried line costs beyond its text: its number and `: `. */
+const FIND_BLOCK_LINE_OVERHEAD = 8;
+/** Characters each matching line costs in a block's heading, beyond its
+ * digits: the `, ` that joins it to the next. */
+const FIND_BLOCK_HIT_OVERHEAD = 2;
+
+/** A chunk split into its lines, once per find rather than once per page:
+ * the pages of one find are all worked out from the same chunks. */
+export interface PreparedChunk {
+  path: string;
+  start: number;
+  end: number;
+  lines: string[];
+  symbol?: string;
+}
+
+/** `chunks` in the order `findBlocks` assigns matches to them - path, then
+ * start line - each split into its lines. */
+export function prepareChunks(chunks: readonly FindChunk[]): PreparedChunk[] {
+  return [...chunks]
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : a.start - b.start))
+    .map((chunk) => {
+      const lines = chunk.content.split("\n").map((l) => l.replace(/\r$/, ""));
+      if (lines.at(-1) === "") lines.pop();
+      return {
+        path: chunk.path,
+        start: chunk.start,
+        end: chunk.start + lines.length - 1,
+        lines,
+        ...(chunk.symbol ? { symbol: chunk.symbol } : {}),
+      };
+    });
+}
+
+/** The blocks a chunks-mode find carries for `rows` (the matches within the
+ * limit): each match goes to the first chunk, by path then start line, that
+ * holds it; a chunk with no match of its own is not carried; and a line an
+ * earlier carried block in the same file wrote is not written again, so
+ * fixed windows that overlap are written once. With `around`, a block keeps
+ * only the lines within that many of one of its matches - the comment above
+ * each and the lines below, merged where they meet - rather than the whole
+ * window: the shape a question over many sites needs, since a whole window
+ * is about 2,500 characters and the budget holds about nine.
+ * Blocks are carried while `budget` lasts - the
+ * first always, so one long block still comes back - and the matches of the
+ * rest keep their places in `more`, as a line-mode find's do. `chunks` may
+ * come already prepared (`prepareChunks`), as a find computing several
+ * pages passes them. */
+export function findBlocks(
+  chunks: readonly FindChunk[] | readonly PreparedChunk[],
+  rows: readonly FindMatch[],
+  budget = FIND_RESULT_CHAR_BUDGET,
+  around?: number,
+): { blocks: FindBlock[]; matches: FindMatch[]; more: FindLocations[] } {
+  const prepared = chunks.length > 0 && "lines" in chunks[0] ? (chunks as readonly PreparedChunk[]) : prepareChunks(chunks as readonly FindChunk[]);
+  const wanted = new Set(rows.map((m) => `${m.path} ${m.line}`));
+  const paths = new Set(rows.map((m) => m.path));
+  const assigned = new Set<string>();
+  const blocks: FindBlock[] = [];
+  const carried = new Set<string>();
+  const written = new Set<string>();
+  let chars = 0;
+  // As in `cutFindMatches`: after the first block that does not fit, no
+  // later one is carried, so the carried matches are always the first run
+  // of `rows` and a `skip` resumes exactly after them. (Chunks are in path
+  // then line order, as `rows` are, so blocks are carried in row order.)
+  for (const chunk of prepared) {
+    if (!paths.has(chunk.path)) continue;
+    const hits: number[] = [];
+    for (let line = chunk.start; line <= chunk.end; line++) {
+      const key = `${chunk.path} ${line}`;
+      if (wanted.has(key) && !assigned.has(key)) {
+        assigned.add(key);
+        hits.push(line);
+      }
+    }
+    if (hits.length === 0) continue;
+    const near = (line: number) => around === undefined || hits.some((h) => Math.abs(h - line) <= around);
+    const kept: FindBlockLine[] = [];
+    for (let line = chunk.start; line <= chunk.end; line++) {
+      if (written.has(`${chunk.path} ${line}`) || !near(line)) continue;
+      kept.push({ line, text: chunk.lines[line - chunk.start].slice(0, FIND_LINE_CAP) });
+    }
+    // The heading lists every matching line the block holds, so a block of
+    // many matches costs them too.
+    const size =
+      chunk.path.length +
+      (chunk.symbol?.length ?? 0) +
+      FIND_BLOCK_OVERHEAD +
+      hits.reduce((n, h) => n + String(h).length + FIND_BLOCK_HIT_OVERHEAD, 0) +
+      kept.reduce((n, l) => n + l.text.length + FIND_BLOCK_LINE_OVERHEAD, 0);
+    if (blocks.length > 0 && chars + size > budget) break;
+    chars += size;
+    for (const l of kept) written.add(`${chunk.path} ${l.line}`);
+    for (const line of hits) carried.add(`${chunk.path} ${line}`);
+    blocks.push({
+      path: chunk.path,
+      start: kept[0]?.line ?? hits[0],
+      end: kept.at(-1)?.line ?? hits.at(-1)!,
+      ...(chunk.symbol ? { symbol: chunk.symbol } : {}),
+      lines: kept,
+      hits,
+    });
+  }
+  const matches: FindMatch[] = [];
+  const more: FindLocations[] = [];
+  for (const m of rows) {
+    if (carried.has(`${m.path} ${m.line}`)) {
+      matches.push({ path: m.path, line: m.line, text: m.text, ...(m.symbol ? { symbol: m.symbol } : {}) });
       continue;
     }
     const last = more.at(-1);
     if (last && last.path === m.path) last.lines.push(m.line);
     else more.push({ path: m.path, lines: [m.line] });
   }
-  return { matches, more };
+  return { blocks, matches, more };
 }
 
 /** Characters kept ahead of the match when a long line is cut to a window, so
@@ -743,8 +965,13 @@ function checkFindQuery(query: string, analyzer: Analyzer, column: string, limit
 export async function find(handle: IndexHandle, query: string, opts: FindOptions = {}): Promise<FindResult> {
   const limit = checkFindQuery(query, analyzerOf(handle.manifest), CONTENT_COLUMN, opts.limit);
   const ignoreCase = opts.ignoreCase ?? false;
-  const context = Math.min(Math.max(0, Math.trunc(opts.context ?? 0)), MAX_FIND_CONTEXT);
+  const chunksMode = opts.chunks === true;
+  const asked = opts.context === undefined ? undefined : Math.min(Math.max(0, Math.trunc(opts.context)), MAX_FIND_CONTEXT);
+  // In chunks mode the context trims the block rather than being cut out
+  // around each match a second time.
+  const context = chunksMode ? 0 : (asked ?? 0);
   const partial = partialIndex(handle.manifest);
+  const held: FindChunk[] = [];
 
   const terms = plainTerms(query);
   const candidates = localDb(handle).openTable(TABLE).tokenMatch(CONTENT_COLUMN, terms, { mode: "and", projection: FIND_PROJECTION });
@@ -762,7 +989,11 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
     if (under !== undefined && path !== under && !path.startsWith(`${under}/`)) continue;
     const symbol = row.symbol ? String(row.symbol) : undefined;
     const declares = definesName(symbol, query, ignoreCase);
-    for (const m of matchLines(String(row.content), Number(row.start_line), query, ignoreCase, context)) {
+    const found = matchLines(String(row.content), Number(row.start_line), query, ignoreCase, context);
+    if (chunksMode && found.length > 0) {
+      held.push({ path, start: Number(row.start_line), content: String(row.content), ...(symbol ? { symbol } : {}) });
+    }
+    for (const m of found) {
       const key = `${path} ${m.line}`;
       if (declares) declaring.add(key);
       if (seen.has(key)) continue;
@@ -789,23 +1020,69 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
     .map(([path, count]) => ({ path, count }))
     .sort((a, b) => b.count - a.count || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
-  const budget =
+  // What a call of its own gets, and what this one gets: a batch of `share`
+  // queries divides the budget for this page only (see `share`).
+  const whole =
     opts.budget !== undefined && Number.isFinite(opts.budget) && opts.budget > 0
       ? Math.min(Math.floor(opts.budget), FIND_RESULT_CHAR_BUDGET)
       : FIND_RESULT_CHAR_BUDGET;
-  const { matches, more } = cutFindMatches(rows, limit, budget);
+  const share = opts.share !== undefined && Number.isFinite(opts.share) && opts.share > 1 ? Math.floor(opts.share) : 1;
+  const budget = Math.max(1, Math.floor(whole / share));
+  if (opts.skip !== undefined && (!Number.isInteger(opts.skip) || opts.skip < 0)) {
+    throw new Error(`skip must be a non-negative integer, got ${opts.skip}`);
+  }
+  const skip = opts.skip ?? 0;
+  const prepared = chunksMode ? prepareChunks(held) : [];
+  // One page: the `limit` matching lines from `start`, carried while `room`
+  // lasts. Every page carries a first run of its lines (see
+  // `cutFindMatches`), so the next page starts right after them.
+  const pageAt = (start: number, around: number | undefined, room: number) =>
+    chunksMode
+      ? findBlocks(prepared, rows.slice(start, start + limit), room, around)
+      : cutFindMatches(rows.slice(start), limit, room);
+  // Where each page after `start` begins, cut as the call that asks for it
+  // will cut it - a call of its own, with the whole budget - so the caller
+  // can ask for all of them in one reply and they meet without overlap.
+  const pagesAfter = (start: number, first: number, around: number | undefined, cap: number): number[] => {
+    const out: number[] = [];
+    for (let next = start + first; next < rows.length && out.length < cap; ) {
+      out.push(next);
+      next += Math.max(1, pageAt(next, around, whole).matches.length);
+    }
+    return out;
+  };
+  // A chunks find given no context keeps whole blocks while they fit in two
+  // pages; past that it trims them, since a wide find of whole windows runs
+  // to several times the pages trimmed ones do.
+  // The page computed from `skip` 0 with the whole budget decides, so every
+  // page of one find trims alike, batched or not.
+  let around = asked;
+  if (
+    chunksMode &&
+    asked === undefined &&
+    pagesAfter(0, pageAt(0, undefined, whole).matches.length, undefined, WHOLE_BLOCK_MAX_PAGES + 1).length > WHOLE_BLOCK_MAX_PAGES
+  ) {
+    around = AUTO_CHUNK_CONTEXT;
+  }
+  const cut: { matches: FindMatch[]; more: FindLocations[]; blocks?: FindBlock[] } = pageAt(skip, around, budget);
+  const { matches, more, blocks } = cut;
+  const pages = pagesAfter(skip, matches.length, around, MAX_FIND_PAGES);
   return {
     query,
     ignoreCase,
     matches,
+    ...(blocks ? { blocks } : {}),
     ...(more.length ? { more } : {}),
     total: rows.length,
     files: byFile.length,
     byFile,
-    ...(rows.length > limit ? { truncated: true } : {}),
+    ...(rows.length - skip > limit ? { truncated: true } : {}),
     ...(partial ? { partial } : {}),
     ...(opts.defines ? { definedFrom: matched } : {}),
     ...(under !== undefined ? { under } : {}),
+    ...(skip > 0 ? { skip } : {}),
+    ...(pages.length ? { pages } : {}),
+    ...(around !== asked ? { trimmedTo: around } : {}),
   };
 }
 
