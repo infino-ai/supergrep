@@ -15,7 +15,7 @@ import { connect, type Connection } from "@infino-ai/infino";
 import { indexDir, resolveRoot, TABLE, hostedTarget, hostedLabel, hostedClientOptions } from "./config.js";
 import { readManifest, type Manifest } from "./manifest.js";
 import { HostedDb, type HostedOptions, type HostedTarget } from "./hosted.js";
-import { PLATFORM_DEFAULT_ANALYZER } from "./analyzer.js";
+import { analyzerOf, ENGINE_DEFAULT_ANALYZER, PLATFORM_DEFAULT_ANALYZER } from "./analyzer.js";
 
 // The platform's default analyzer is defined with the analyzers themselves;
 // it is re-exported here because callers that describe the platform table
@@ -74,10 +74,30 @@ export class NoIndexError extends Error {
   }
 }
 
+/** A local index built under an analyzer this engine does not build: one an
+ * earlier version of this client built (`ascii_lower`), which the pinned
+ * engine refuses to open. A build replaces it; until then every read of it
+ * says so, rather than the engine's advice to copy the rows out with another
+ * engine. */
+export class RebuildRequiredError extends Error {
+  constructor(root: string, analyzer: string) {
+    super(
+      `the index under ${root} was built by an earlier version of code-context (analyzer ${analyzer}), which this version ` +
+        `cannot read - run \`cx index\` there to rebuild it.`,
+    );
+    this.name = "RebuildRequiredError";
+  }
+}
+
 /** The local engine connection of a handle or repo context. Kept as a
  * function so the call sites read as "the local side" where a platform client
- * sits beside it. */
-export function localDb(handle: { db: Connection }): Connection {
+ * sits beside it. A handle's index built under another analyzer than this
+ * engine's is refused with what to do about it (`RebuildRequiredError`). */
+export function localDb(handle: { db: Connection; root?: string; manifest?: Manifest }): Connection {
+  if (handle.manifest && handle.manifest.origin !== "hosted") {
+    const analyzer = analyzerOf(handle.manifest);
+    if (analyzer !== ENGINE_DEFAULT_ANALYZER) throw new RebuildRequiredError(handle.root ?? "this repository", analyzer);
+  }
   return handle.db;
 }
 

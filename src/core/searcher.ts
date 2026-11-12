@@ -372,19 +372,18 @@ export async function search(
 
 // --- find -------------------------------------------------------------------
 //
-// Two steps. The index's token match narrows to the chunks that contain every
-// token of the query - an inverted-list intersection, no scoring, no top-k -
-// then the literal is verified line by line inside those chunks. The analyzer
-// splits identifiers (`ascii_lower` indexes `parse_config` as `parse` and
-// `config`), so the first step alone would over-match; the second makes every
+// Two steps. The local index narrows to the chunks that hold every token of
+// the query as a case-insensitive substring - `content ILIKE '%token%'` per
+// token, ANDed, no scoring, no top-k - then the literal is verified line by
+// line inside those chunks. A substring, not a token match: `standard` keeps
+// `self.reconcile_tombstone_seqs` as one token, and a find for
+// `reconcile_tombstone_seqs` must still reach it. The second step makes every
 // hit a real occurrence of the exact text, and grep's line-based,
 // case-sensitive semantics fall out of it.
 //
-// The query goes to the engine as text, not pre-tokenized: the engine
-// tokenizes it with the index's own analyzer, so the candidate set is exact
-// for whichever analyzer the table has (a client mirror of the Unicode
-// `standard` rules could drift, e.g. on CJK segmentation). What the client
-// does strip is the engine's *query grammar* - see plainTerms below.
+// A hosted table of rows (findRows) still takes the platform's token match:
+// a row is one long text with no line to verify, so the index's answer is the
+// answer there.
 
 export interface FindMatch {
   path: string;
@@ -738,16 +737,26 @@ function checkFindQuery(query: string, analyzer: Analyzer, column: string, limit
   return Math.min(limit ?? DEFAULT_FIND_LIMIT, MAX_FIND_LIMIT);
 }
 
+/** The chunks holding every token of `query` as a case-insensitive
+ * substring. Each needle is one whole token of the index's analyzer with its
+ * LIKE wildcards escaped. */
+export function findCandidatesSql(query: string, analyzer: Analyzer): string {
+  const needles = analyzerTokens(query, analyzer).map(
+    (token) => `${sqlIdentifier(CONTENT_COLUMN)} ILIKE ${sqlLiteral(`%${token.replace(/[\\%_]/g, "\\$&")}%`)}`,
+  );
+  return `SELECT ${FIND_PROJECTION.map(sqlIdentifier).join(", ")} FROM ${sqlIdentifier(TABLE)} WHERE ${needles.join(" AND ")}`;
+}
+
 /** Async so a rejected validation surfaces as a rejection like every other
  * door's; the engine call underneath is synchronous. */
 export async function find(handle: IndexHandle, query: string, opts: FindOptions = {}): Promise<FindResult> {
-  const limit = checkFindQuery(query, analyzerOf(handle.manifest), CONTENT_COLUMN, opts.limit);
+  const analyzer = analyzerOf(handle.manifest);
+  const limit = checkFindQuery(query, analyzer, CONTENT_COLUMN, opts.limit);
   const ignoreCase = opts.ignoreCase ?? false;
   const context = Math.min(Math.max(0, Math.trunc(opts.context ?? 0)), MAX_FIND_CONTEXT);
   const partial = partialIndex(handle.manifest);
 
-  const terms = plainTerms(query);
-  const candidates = localDb(handle).openTable(TABLE).tokenMatch(CONTENT_COLUMN, terms, { mode: "and", projection: FIND_PROJECTION });
+  const candidates = localDb(handle).querySql(findCandidatesSql(query, analyzer)) as Array<Record<string, unknown>>;
 
   // Fixed-window chunks overlap, so one line can arrive in two chunks; key by path:line.
   const seen = new Set<string>();

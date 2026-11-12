@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { connect } from "@infino-ai/infino";
 import { diffFiles, emptyFileState, hashContent, readFileState } from "../src/core/filestate.js";
 import { indexRepo, syncRepo } from "../src/core/indexer.js";
-import { readManifest } from "../src/core/manifest.js";
+import { readManifest, writeManifest } from "../src/core/manifest.js";
 import { search } from "../src/core/searcher.js";
 import type { IndexHandle } from "../src/core/context.js";
 import type { Embedder } from "../src/core/embedder.js";
@@ -142,6 +142,24 @@ describe("syncRepo", () => {
     const other = { ...fakeEmbedder, model: "different-model" };
     const outcome = await syncRepo({ ...opts(), embedder: other });
     expect(outcome.action).toBe("noop");
+  });
+
+  it("demands a rebuild of an index built under an analyzer the engine no longer builds", async () => {
+    // An index from before the engine bump: its manifest records ascii_lower,
+    // or - older still - no analyzer, which reads as ascii_lower. The pinned
+    // engine refuses to open such a table, so a sync asks for the build that
+    // recreates it rather than diffing against it.
+    const manifest = readManifest(dir)!;
+    try {
+      for (const old of [{ ...manifest, analyzer: "ascii_lower" as const }, { ...manifest, analyzer: undefined }]) {
+        writeManifest(dir, old);
+        const outcome = await syncRepo(opts());
+        expect(outcome).toEqual({ action: "rebuild-required", reason: "analyzer changed (index: ascii_lower, this engine builds: standard)" });
+      }
+    } finally {
+      writeManifest(dir, manifest);
+    }
+    expect((await syncRepo(opts())).action).toBe("noop");
   });
 
   it("demands a rebuild when there is no prior state", async () => {
