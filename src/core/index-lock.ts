@@ -95,14 +95,16 @@ const heldHere = new Map<string, LockHolder>();
 /** Whether a holder may still be running. Only a process on this host can be
  * checked; signal 0 tests for it without touching it, and EPERM means it
  * exists under another user. A holder naming this process is alive only as
- * the acquisition this process holds at `path`; without a path, any holder
- * naming this process is. */
-export function holderAlive(h: LockHolder, path?: string): boolean {
+ * an acquisition this process holds, under whatever path it was taken: two
+ * spellings of one index dir (a symlink, /tmp and /private/tmp) name one
+ * file, so matching by path alone would hand a live lock to its second
+ * spelling. Without `checkHeld`, any holder naming this process is. */
+export function holderAlive(h: LockHolder, checkHeld = false): boolean {
   if (h.host !== hostname()) return true;
   if (h.pid === process.pid) {
-    if (path === undefined) return true;
-    const mine = heldHere.get(path);
-    return mine !== undefined && sameHolder(mine, h);
+    if (!checkHeld) return true;
+    for (const mine of heldHere.values()) if (sameHolder(mine, h)) return true;
+    return false;
   }
   try {
     process.kill(h.pid, 0);
@@ -140,7 +142,7 @@ function takeOver(path: string, dead: LockHolder, me: LockHolder): boolean {
   const guard = `${path}.takeover`;
   if (!createExclusive(guard, me)) {
     const g = readHolder(guard);
-    if (g === null || (g && !holderAlive(g, guard))) rmSync(guard, { force: true });
+    if (g === null || (g && !holderAlive(g, true))) rmSync(guard, { force: true });
     return false;
   }
   try {
@@ -171,7 +173,7 @@ export function tryLockIndex(indexDirPath: string): LockAttempt {
       // leaves such a file, so it is debris.
       acquired = takeOver(path, { pid: -1, host: "", since: "" }, me);
       if (!acquired) return { heldBy: null };
-    } else if (holderAlive(held, path)) {
+    } else if (holderAlive(held, true)) {
       return { heldBy: held };
     } else {
       acquired = takeOver(path, held, me);
@@ -203,7 +205,7 @@ export function tryLockIndex(indexDirPath: string): LockAttempt {
 export function otherHolder(indexDirPath: string): LockHolder | null {
   const path = lockPath(indexDirPath);
   const h = readHolder(path);
-  return h && h.pid !== process.pid && holderAlive(h, path) ? h : null;
+  return h && h.pid !== process.pid && holderAlive(h, true) ? h : null;
 }
 
 /** Take the index's lock, or throw IndexBusyError naming the holder. */

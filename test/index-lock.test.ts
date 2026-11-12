@@ -5,7 +5,7 @@
 // refusing to write under another process's lock, and the MCP server leaving
 // a first build alone while another process holds it.
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -83,6 +83,25 @@ describe("the index lock", () => {
     expect("heldBy" in tryLockIndex(dir)).toBe(true);
     if ("lock" in attempt) attempt.lock.release();
     expect(existsSync(lockPath(dir))).toBe(false);
+  });
+
+  it("refuses the lock this process holds to a second spelling of the same index dir (a symlink)", () => {
+    const link = join(mkdtempSync(join(tmpdir(), "cx-lock-link-")), "index");
+    symlinkSync(dir, link);
+    try {
+      const lock = lockIndex(dir);
+      const second = tryLockIndex(link);
+      expect("heldBy" in second && second.heldBy?.pid).toBe(process.pid);
+      expect(held().since).toBe(lock.holder.since);
+      lock.release();
+      expect(existsSync(lockPath(dir))).toBe(false);
+      // Released, the other spelling takes it, and the first is then refused it.
+      const viaLink = lockIndex(link);
+      expect("heldBy" in tryLockIndex(dir)).toBe(true);
+      viaLink.release();
+    } finally {
+      rmSync(join(link, ".."), { recursive: true, force: true });
+    }
   });
 
   it("counts a live process, or one on another host, as holding it", () => {

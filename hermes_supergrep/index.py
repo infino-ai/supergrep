@@ -57,7 +57,8 @@ BUSY = "already being indexed here; skipped"
 OTHER_PROCESS = "being indexed by another process (the server, or another `cx index`); skipped"
 NO_INDEX = "no index yet; the server builds it on the first query"
 STILL_BUILDING = ("its vectors are still being built; left to the server, which rebuilds it on a query "
-                  "if that build stopped before it finished")
+                  "if that build stopped before it finished, unless CX_TABLE names a platform table it does "
+                  "not own (then `hermes supergrep index` rebuilds it)")
 
 # One index or sync per repository at a time in this process: two sessions
 # that start close together find the first one's run and skip it.
