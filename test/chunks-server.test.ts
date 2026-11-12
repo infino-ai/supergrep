@@ -317,6 +317,18 @@ describe("the chunks table with the platform up", () => {
     expect(second.ops).toEqual(["hybrid_search"]);
   });
 
+  it("search with the question asks the platform to rerank its pool for it, and without one asks nothing", async () => {
+    const before = s.sent.length;
+    const asked = await call(s, "search", { query: "body", k: 3, question: "where is the body written?" });
+    expect(asked.ok, String(asked.value)).toBe(true);
+    const plain = await call(s, "search", { query: "body", k: 3 });
+    expect(plain.ok, String(plain.value)).toBe(true);
+    const searches = s.sent.slice(before).filter((x) => x.op === "hybrid_search").map((x) => x.body);
+    expect(searches).toHaveLength(2);
+    expect(searches[0]).toMatchObject({ k: 3, rerank: { question: "where is the body written?", k: 3 } });
+    expect(searches[1]?.rerank).toBeUndefined();
+  });
+
   it("sent no write and left no manifest", () => {
     expectNothingBuilt(s);
   });

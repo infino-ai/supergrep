@@ -3289,7 +3289,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             // the platform's default for a bare column, as analyzerOf says.
             const hostedAnalyzer = analyzerOf(readPlatformManifest(ctx.dir) ?? { origin: "hosted" });
             const [{ value: result, own }, recalled] = await Promise.all([
-              answeredBy(searchHosted(ctx.hosted, query, k, { lines, analyzer: hostedAnalyzer }), ctx),
+              answeredBy(searchHosted(ctx.hosted, query, k, { lines, analyzer: hostedAnalyzer, question }), ctx),
               recallFor(query),
             ]);
             // The hits seed the graph by their place: a chunk's path and

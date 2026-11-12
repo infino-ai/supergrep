@@ -317,12 +317,16 @@ function lineFocus(opts: SearchOptions, query: string, analyzer: Analyzer): Line
  * names it, and a caller that cannot gets the platform's default for a bare
  * column. */
 export async function searchHosted(
-  hosted: { hybridSearch: (t: string, tf: string, vf: string, q: string, k: number, p: string[]) => Promise<Array<Record<string, unknown>>> },
+  hosted: Pick<HostedDb, "hybridSearch">,
   query: string,
   k = DEFAULT_SEARCH_K,
-  opts: SearchOptions & { analyzer?: Analyzer } = {},
+  opts: SearchOptions & { analyzer?: Analyzer; question?: string } = {},
 ): Promise<SearchResult> {
-  const rows = await hosted.hybridSearch(TABLE, CONTENT_COLUMN, EMBEDDING_COLUMN, query, k, PROJECTION);
+  // With the question, the platform's grader orders a wider pool and the
+  // top k come back (ReadChecks), as for a search over a table's rows.
+  const question = opts.question?.trim();
+  const asked = question ? ([{ question, k }] as const) : ([] as const);
+  const rows = await hosted.hybridSearch(TABLE, CONTENT_COLUMN, EMBEDDING_COLUMN, query, k, PROJECTION, ...asked);
   const focus = lineFocus(opts, query, opts.analyzer ?? PLATFORM_DEFAULT_ANALYZER);
   return { query, ranking: "hybrid", hits: rows.map((r) => toHit(r, focus)) };
 }
@@ -1790,6 +1794,12 @@ export interface RowFindResult {
  * the table's own with it (a table may well have a `total`). */
 const FIND_TOTAL_COLUMN = "__cx_total";
 
+/** Rows a reranked find fetches for the platform's grader to order: the
+ * platform's default rerank pool, the most one read's rows are graded from.
+ * A search names its `k` and the platform widens it to the pool itself; a
+ * statement names its own LIMIT, so a find widens it here. */
+export const RERANK_POOL_ROWS = 1_000;
+
 /** The statement a row find runs: every column of the row (the shape's
  * rowColumns) for the rows whose text column holds every token of `terms`
  * (`token_match` in `and` mode - the engine's inverted-list intersection,
@@ -1816,19 +1826,27 @@ export function findRowsSql(shape: TableShape, terms: string, limit: number): st
  * platform's default for a bare column; both analyzers agree on whether a
  * query holds a token at all. */
 export async function findRows(
-  hosted: Pick<HostedDb, "querySqlChecked">,
+  hosted: Pick<HostedDb, "querySqlChecked"> & Partial<Pick<HostedDb, "reranksOnRead">>,
   shape: TableShape,
   query: string,
   opts: { limit?: number; question?: string } = {},
 ): Promise<RowFindResult> {
   if (shape.primaryText === "") throw new Error(`${shape.table} has no text column to match in`);
   const limit = checkFindQuery(query, PLATFORM_DEFAULT_ANALYZER, shape.primaryText, opts.limit);
-  // With the question, the matches come back in the platform grader's
-  // order, every one of them (ReadChecks).
-  const checks = opts.question?.trim() ? { rerank: { question: opts.question.trim() } } : {};
-  const { rows } = await hosted.querySqlChecked(findRowsSql(shape, plainTerms(query), limit), checks);
+  // With the question, the statement fetches the rerank pool and the
+  // platform's grader returns the `limit` it puts first (ReadChecks). The
+  // matches arrive in index order, so a statement cut at `limit` would have
+  // the grader order only the first matches of the index, not the best.
+  // A platform that has already said it runs no grader gets the plain
+  // statement: a pool fetched for nobody to grade is cut here unread.
+  const question = hosted.reranksOnRead === false ? undefined : opts.question?.trim();
+  const checks = question ? { rerank: { question, k: limit } } : {};
+  const fetched = question ? Math.max(limit, RERANK_POOL_ROWS) : limit;
+  const { rows } = await hosted.querySqlChecked(findRowsSql(shape, plainTerms(query), fetched), checks);
   const total = rows.length > 0 ? Number(rows[0][FIND_TOTAL_COLUMN]) : 0;
-  const matches = rows.map(({ [FIND_TOTAL_COLUMN]: _total, ...row }) => rowHit(row, shape));
+  // A platform that did not rerank (one without the grader) returns the
+  // whole pool: the caller still gets `limit`.
+  const matches = rows.slice(0, limit).map(({ [FIND_TOTAL_COLUMN]: _total, ...row }) => rowHit(row, shape));
   return {
     query,
     table: shape.table,
