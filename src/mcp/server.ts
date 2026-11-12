@@ -2069,9 +2069,15 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const doSync = async (ctx: RepoCtx, lock: IndexLock): Promise<SyncOutcome> => {
     await ensureDatabase(ctx);
     const outcome = await syncRepo({ ...indexTargets(ctx), embedder: getEmbedder() });
-    // A rebuild for every reason but "a build is already in flight" (the
-    // vector stage, or the platform load - a second build would race it).
-    if (outcome.action === "rebuild-required" && !syncInProgress(outcome)) {
+    // A rebuild for every reason, "a build is already in flight" (the vector
+    // stage, or the platform load) among them: this runs under the index's
+    // lock, which every writer holds until its build's completion settles,
+    // and never under this context's own completion (maybeAutoSync), so a
+    // manifest still marked in flight here was left by a build that stopped
+    // before it finished (a server killed mid-backfill). Left alone, it
+    // would refuse every sync until someone rebuilt it by hand.
+    if (outcome.action === "rebuild-required") {
+      if (syncInProgress(outcome)) console.error(`${ctx.root}: rebuilding an index whose last build did not finish (${outcome.reason})`);
       const emb = buildEmbedder();
       const run = await indexRepoStaged({ ...indexTargets(ctx), embedder: emb });
       backfill(ctx, run, emb, lock);
