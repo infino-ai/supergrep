@@ -140,7 +140,7 @@ export interface Started {
 /** Start the server for a fresh temp root against `platform`, with a client
  * connected to it. `prefix` names the temp dir; `startupBudgetMs`, when
  * given, is the server's wait on the database's other tables. */
-export async function start(platform: Platform, prefix: string, options: { startupBudgetMs?: number } = {}): Promise<Started> {
+export async function start(platform: Platform, prefix: string, options: { startupBudgetMs?: number; accountData?: boolean } = {}): Promise<Started> {
   const { serveMcp } = await import("../src/mcp/server.js");
   const root = mkdtempSync(join(tmpdir(), prefix));
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();

@@ -72,6 +72,7 @@ import {
   autoSyncEnabled as autoSyncSetting,
   apiToolsEnabled,
   readOnlyEnabled,
+  accountDataEnabled,
   configuredCardTier,
   LEAN_CARD_TIER,
   memoryEnabled,
@@ -1769,6 +1770,8 @@ export interface ServeOptions {
   hostedOptions?: HostedOptions;
   /** Offer no tool that writes (`readOnlyEnabled` when absent). */
   readOnly?: boolean;
+  /** Serve the account's other databases (`accountDataEnabled` when absent). */
+  accountData?: boolean;
   /** The key this session's platform calls carry instead of the configured
    * one (the server over HTTP with sign-in). The repository the server was
    * started for is then not served at all (see `signedIn`). */
@@ -1795,6 +1798,7 @@ const PACKAGE_VERSION: string = JSON.parse(readFileSync(new URL("../../package.j
 export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {}): Promise<void> {
   const { hostedOptions } = serveOptions;
   const readOnly = serveOptions.readOnly ?? readOnlyEnabled();
+  const accountData = serveOptions.accountData ?? accountDataEnabled();
   const hostFiles = serveOptions.hostFiles ?? true;
   // When the start-up stops waiting on the database's other tables: counted
   // from here, the server's start, as the client counts its own wait.
@@ -2326,8 +2330,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // it at startup. Upload sessions are opened for the platform's own origin:
   // a deployment lists the origins it takes uploads from, and a client of
   // its API is of that origin as far as a listing can name one.
+  // CX_ACCOUNT_DATA=0 keeps it off: the server then reads its own corpus and
+  // nothing else of the account (accountDataEnabled).
   const data =
-    hosted !== null
+    hosted !== null && accountData
       ? new DataPlane({
           account: { baseUrl: hosted.baseUrl, apiKey: hosted.apiKey },
           clientOptions: hostedOptions ?? {},
@@ -2337,8 +2343,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           verdictTimeoutMs: VERDICT_TIMEOUT_MS,
         })
       : null;
-  /** The refusal of a `database` argument on a server with no account. */
-  const noDataPlane = (tool: string) => fail(`${tool}: database names a database of an Infino account, and this server has none - ${noAccountSteps()}`);
+  /** The refusal of a `database` argument on a server with no account, or
+   * with the account's data switched off. */
+  const noDataPlane = (tool: string) =>
+    hosted !== null
+      ? fail(`${tool}: this server serves only its own data, not the account's other databases; leave database out`)
+      : fail(`${tool}: database names a database of an Infino account, and this server has none - ${noAccountSteps()}`);
   /** What each query tool's text says of the account's data, where there is
    * an account: one sentence, since the routing line below carries the rest
    * and every sentence here is prompt text on every turn. */

@@ -341,6 +341,16 @@ export function readOnlyEnabled(): boolean {
   return ON_VALUES.includes((process.env.CX_READ_ONLY ?? "").toLowerCase());
 }
 
+/** Whether the MCP server serves the account's other databases
+ * (CX_ACCOUNT_DATA, default on wherever a platform is configured): the
+ * `tables` and `hydrate` tools, and the `database` argument of the query
+ * tools. Off, the server reads only its own corpus - the repository's index
+ * or the table CX_TABLE names - though its key could see more. The shape of
+ * a plugin that serves one table of an account and nothing else of it. */
+export function accountDataEnabled(): boolean {
+  return !OFF_VALUES.includes((process.env.CX_ACCOUNT_DATA ?? "").toLowerCase());
+}
+
 /** Hosted tables beside the primary that `sql` may join (CX_SIBLING_TABLES,
  * comma-separated, default none). Named, the server reads each one's schema
  * at startup and puts it in the sql tool's text with the primary's, and
