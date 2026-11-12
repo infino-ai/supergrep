@@ -1549,7 +1549,7 @@ export function findRowsSql(shape: TableShape, terms: string, limit: number): st
  * platform's default for a bare column; both analyzers agree on whether a
  * query holds a token at all. */
 export async function findRows(
-  hosted: Pick<HostedDb, "querySqlChecked">,
+  hosted: Pick<HostedDb, "querySqlChecked"> & Partial<Pick<HostedDb, "reranksOnRead">>,
   shape: TableShape,
   query: string,
   opts: { limit?: number; question?: string } = {},
@@ -1560,7 +1560,9 @@ export async function findRows(
   // platform's grader returns the `limit` it puts first (ReadChecks). The
   // matches arrive in index order, so a statement cut at `limit` would have
   // the grader order only the first matches of the index, not the best.
-  const question = opts.question?.trim();
+  // A platform that has already said it runs no grader gets the plain
+  // statement: a pool fetched for nobody to grade is cut here unread.
+  const question = hosted.reranksOnRead === false ? undefined : opts.question?.trim();
   const checks = question ? { rerank: { question, k: limit } } : {};
   const fetched = question ? Math.max(limit, RERANK_POOL_ROWS) : limit;
   const { rows } = await hosted.querySqlChecked(findRowsSql(shape, plainTerms(query), fetched), checks);

@@ -385,6 +385,20 @@ describe("the doors over rows", () => {
     expect(result).toMatchObject({ total: 9, truncated: true });
   });
 
+  it("find with the question fetches only its limit once the platform has said it runs no grader", async () => {
+    const asked: Array<{ sql: string; checks: unknown }> = [];
+    const hosted = {
+      reranksOnRead: false,
+      querySqlChecked: async (sql: string, checks: unknown) => {
+        asked.push({ sql, checks });
+        return { rows: [{ __cx_total: 1, id: "a", title: "A" }] };
+      },
+    };
+    await findRows(hosted, JOBS, "rust", { limit: 2, question: "which jobs want rust?" });
+    expect(asked[0].checks).toEqual({});
+    expect(asked[0].sql).toMatch(/LIMIT 2$/);
+  });
+
   it("search falls back to the keyword route when the table has no embedding column", async () => {
     const shape = tableShapeFrom("t", [{ name: "body", type: "large_utf8" }, { name: "n", type: "i64" }]);
     const calls: unknown[][] = [];
