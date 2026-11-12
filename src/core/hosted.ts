@@ -240,6 +240,12 @@ function rerankRefusal(status: number): boolean {
   return status === HTTP_BAD_REQUEST || status === HTTP_NOT_IMPLEMENTED;
 }
 
+/** A read's failure that is the platform refusing its `rerank`: a
+ * `rerankRefusal` status with a message naming the field. */
+function refusesRerank(err: unknown): err is HostedError {
+  return err instanceof HostedError && rerankRefusal(err.status) && /\brerank\b/.test(err.message);
+}
+
 /** The fields `checks` adds to a read's body: none for a check not asked. */
 function readChecks(checks: ReadChecks): RowRecord {
   return {
@@ -506,8 +512,9 @@ const CHECKED_READ_TIMEOUT_MS = 15_000;
 
 export class HostedDb {
   /** Whether this platform refused a read's `rerank` - one that predates
-   * it, whose read requests take no field they do not know. Set by the
-   * first refusal; from then on a read goes out without it. */
+   * it, whose read requests take no field they do not know, or one that
+   * runs no grader. Set by the first such refusal (not by one of a `k` over
+   * the pool, see withRerank); from then on a read goes out without it. */
   private rerankUnsupported = false;
   /** Set once this deployment refuses `validate` on a read: no later read
    * asks for it. */
@@ -515,6 +522,12 @@ export class HostedDb {
   /** Whether this deployment has said it does not validate on a read. */
   get validatesOnRead(): boolean {
     return !this.validateUnsupported;
+  }
+  /** Whether a read that asks for a rerank may still get one: false once
+   * this platform has said it offers none, so a caller sizing a read for the
+   * grader (a find's pool) asks for only the rows it will return. */
+  get reranksOnRead(): boolean {
+    return !this.rerankUnsupported;
   }
 
   readonly target: HostedTarget;
@@ -969,13 +982,27 @@ export class HostedDb {
    * field, `rerankRefusal`) - again without it,
    * remembering the refusal so no later read asks: a platform without the
    * rerank answers as it did before the client knew of it. Any other
-   * failure is the read's own. */
+   * failure is the read's own.
+   *
+   * A 400 to a rerank that names its `k` may be about that `k` alone: a
+   * deployment refuses a `k` over the pool it grades. That read is first
+   * sent again with the question and no `k` - the caller cuts the rows to
+   * what it wants - and only a refusal of that turns the rerank off for the
+   * session, so one read asking for more than the pool does not end the
+   * reranking of every later one. */
   private async withRerank<T>(checks: ReadChecks, read: (checks: ReadChecks) => Promise<T>): Promise<T> {
     if (!checks.rerank || this.rerankUnsupported) return read({ ...checks, rerank: undefined });
     try {
       return await read(checks);
     } catch (err) {
-      if (!(err instanceof HostedError && rerankRefusal(err.status) && /\brerank\b/.test(err.message))) throw err;
+      if (!refusesRerank(err)) throw err;
+      if (checks.rerank.k !== undefined && err.status === HTTP_BAD_REQUEST) {
+        try {
+          return await read({ ...checks, rerank: { question: checks.rerank.question } });
+        } catch (again) {
+          if (!refusesRerank(again)) throw again;
+        }
+      }
       this.rerankUnsupported = true;
       return read({ ...checks, rerank: undefined });
     }
