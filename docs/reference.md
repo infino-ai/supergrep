@@ -100,6 +100,7 @@ network.
 | `CX_NO_EMBED` | off | keyword-only mode (with `--db`, the platform copy is keyword-only too) |
 | `CX_NO_RECEIPT` | off | `1` turns off usage accounting - the per-call receipt on results and the `cx usage` ledger |
 | `CX_TABLE` | `chunks` | the hosted table the server reads, for a table loaded from object storage rather than built by `cx index` |
+| `CX_LOCAL_DB` | unset | a folder holding an Infino database that another process writes (an agent's memory plugin, for example): the MCP server's `find`, `search`, `sql` and `read` run over its tables on this machine, with no account and no code index. `CX_TABLE` names the table a call reads when it names none; unset, `memory` when the database holds it, else its first table. A stored login is set aside; `--db` beside it is refused |
 | `CX_TEXT_COLUMN` | chosen from the table's shape | with `CX_TABLE`, the column the doors search on a table that has several indexed text columns |
 
 Every result carries a **usage receipt**: the tokens it returned, the files

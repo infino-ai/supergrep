@@ -46,6 +46,14 @@
 // do. The default table is never asked about - it is the chunks table this
 // client builds - so its startup is what it always was, and the chunks
 // table keeps every path and every word of tool text it had.
+//
+// With CX_LOCAL_DB the same rows doors run over the tables of an Infino
+// database on this machine that another process writes (core/local-db.ts),
+// with no account and no --db: find, search, sql and read, with find, search
+// and read taking the table they read (CX_TABLE when a call names none, and
+// with CX_TABLE unset, memory or else the database's first table).
+// No code index is opened, built or synced in that mode, and nothing of the
+// platform's is offered.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -58,6 +66,7 @@ import {
   indexDir,
   resolveRoot,
   TABLE,
+  NAMED_TABLE,
   DEFAULT_TABLE,
   DEFAULT_CAPS,
   DEFAULT_SEARCH_K,
@@ -74,6 +83,8 @@ import {
   readOnlyEnabled,
   configuredCardTier,
   LEAN_CARD_TIER,
+  LOCAL_DB_ENV,
+  localDatabasePath,
   memoryEnabled,
   webFetchEnabled,
 } from "../core/config.js";
@@ -191,11 +202,13 @@ import {
   callTelemetry,
   hostedTelemetry,
   type CallTelemetry,
+  type RowSearchResult,
   CONTENT_COLUMN,
   MAX_FIND_CONTEXT,
   MAX_FIND_PAGES,
   AUTO_CHUNK_CONTEXT,
 } from "../core/searcher.js";
+import { LocalDatabase, noCodeIndex, type LocalTable, type LocalVectors } from "../core/local-db.js";
 import { renderFind } from "../core/find-text.js";
 import {
   newSession,
@@ -243,7 +256,16 @@ import {
   type StagedIndexRun,
 } from "../core/indexer.js";
 import { otherHolder, tryLockIndex, type IndexLock, type LockAttempt } from "../core/index-lock.js";
-import { createEmbedder, createIndexingEmbedder, embedderInfo, platformEmbedderInfo, type Embedder } from "../core/embedder.js";
+import {
+  createEmbedder,
+  createIndexingEmbedder,
+  createLocalDatabaseEmbedder,
+  embedderInfo,
+  LOCAL_DATABASE_DTYPE,
+  LOCAL_DATABASE_MODEL,
+  platformEmbedderInfo,
+  type Embedder,
+} from "../core/embedder.js";
 import { RepoRegistry, type RepoCtx } from "./repos.js";
 import { ensureIndexed, type EnsureResult } from "./ensure.js";
 import { ARITHMETIC_SENTENCE, READING_HABITS, SEARCH_RULE_SENTENCE, TASK_CHECKLIST_SENTENCE } from "./wording.js";
@@ -1565,6 +1587,17 @@ export function rowsInstructions(shape: TableShape, siblings: readonly string[] 
   return instructionsFor(rowsSurface(shape, siblings), siblings);
 }
 
+/** The receipt sentence ending each rows door's text, a table's or a local
+ * database's. */
+const ROWS_USAGE_RECEIPT = "The result includes a 'usage' field, a one-line receipt of tokens returned and rows.";
+/** How a find over rows matches, said wherever one is described: by the
+ * index's words, not by the characters a code index's find checks. */
+const ROW_FIND_MATCHING =
+  "Matching is by the index's words - case-insensitive, whole words, punctuation ignored - so a match holds the words, not necessarily the phrase in that order; " +
+  "the literal is not checked character by character as it is over a code index. ";
+/** Where a find over rows hands the other questions. */
+const ROW_FIND_ROUTING = "For meaning or 'which rows are about X' use search; for counts and rankings use sql. ";
+
 export function rowsSearchDescription(shape: TableShape): string {
   const { table, keyColumn: key, primaryText: text, vectorColumn, vectorSource } = shape;
   const ranking = vectorColumn
@@ -1578,7 +1611,7 @@ export function rowsSearchDescription(shape: TableShape): string {
     `(${scalarsShown(shape).join(", ")}), and ${textColumnsPhrase(shape)} as snippets of at most ` +
     `${SNIPPET_CHARS} characters. ${citeRows(shape)} When one search is not enough, refine the query and ` +
     "search again. For every row holding an exact phrase use find; for counts, rankings and filters use " +
-    `sql. ${readDocumentsSentence(shape)}The result includes a 'usage' field, a one-line receipt of tokens returned and rows.`
+    `sql. ${readDocumentsSentence(shape)}${ROWS_USAGE_RECEIPT}`
   );
 }
 
@@ -1586,13 +1619,14 @@ export function rowsFindDescription(shape: TableShape): string {
   const { table, keyColumn: key, primaryText: text } = shape;
   return (
     `Every row of ${table} whose ${text} holds every word of an exact string, like grep over a table: ` +
-    "complete and unranked, with the table-wide total. Matching is by the index's words - case-insensitive, " +
-    "whole words, punctuation ignored - so a match holds the words, not necessarily the phrase in that order; " +
-    "the literal is not checked character by character as it is over a code index. Use it where you would " +
+    "complete and unranked, with the table-wide total. " +
+    ROW_FIND_MATCHING +
+    "Use it where you would " +
     `grep: a name, a product, a phrase that must appear. Each match is a row: ${key}, the scalar columns, and ` +
     "the text columns as snippets. ignoreCase, defines and under describe a code index and do nothing here. " +
-    `For meaning or 'which rows are about X' use search; for counts and rankings use sql. ${readDocumentsSentence(shape)}` +
-    "The result includes a 'usage' field, a one-line receipt of tokens returned and rows."
+    ROW_FIND_ROUTING +
+    readDocumentsSentence(shape) +
+    ROWS_USAGE_RECEIPT
   );
 }
 
@@ -1757,7 +1791,218 @@ export function rowsSqlDescription(shape: TableShape): string {
       : "") +
     readDocumentsSentence(shape) +
     textGuide +
-    "The result includes a 'usage' field, a one-line receipt of tokens returned and rows."
+    ROWS_USAGE_RECEIPT
+  );
+}
+
+// --- the tool text for a local database (CX_LOCAL_DB) ----------------------------
+//
+// The doors over the tables of an Infino database on this machine that
+// another process writes (core/local-db.ts): the rows doors, said for several
+// tables at once - find, search and read each take the table they read - and
+// for what runs here. A search ranks each table by its full-text columns and,
+// where a table beside it holds its vectors, by meaning, fused; a statement's
+// {{q}} is embedded on this machine. Nothing the platform does - the verdict,
+// the cards, the keys it finds, the graph - is offered, so none of it is
+// named. None of this text has been through the bench: measure before
+// polishing, as with the rest.
+
+/** The `index` a result over the local database names. */
+const LOCAL_INDEX = "local";
+
+/** What a local database does not have, said once in the instructions so a
+ * model that knows the platform's tools does not go looking for them. */
+const LOCAL_ONLY_SENTENCE =
+  "This is the database on this machine alone: join_keys, the verdict on a statement, table cards and the " +
+  "knowledge graph are the platform's and are not offered here.";
+
+/** The table a local database's calls read by default when CX_TABLE names
+ * none and the database holds it: the hermes-infino plugin's memory. */
+export const LOCAL_PRIMARY_TABLE = "memory";
+
+/** The tables of a local database by name, in its order. */
+function localTableNames(tables: readonly LocalTable[]): string[] {
+  return tables.map((t) => t.shape.table);
+}
+
+/** The table a call over a local database reads when it names none and
+ * CX_TABLE names none either: `memory` when the database holds it - the
+ * plugin's recall, the table its search reproduces - else the first table
+ * the database lists; null when it lists none. */
+export function localPrimaryTable(tables: readonly LocalTable[]): string | null {
+  const names = localTableNames(tables);
+  return names.includes(LOCAL_PRIMARY_TABLE) ? LOCAL_PRIMARY_TABLE : (names[0] ?? null);
+}
+
+/** How each table of a local database is searched, in a phrase per table:
+ * its full-text columns, and its vectors where a table beside it holds them;
+ * a table with neither is left out, since a search over it is refused. */
+function localSearchLegs(tables: readonly LocalTable[]): string {
+  return tables
+    .filter((t) => t.shape.textColumns.length > 0 || t.vectors)
+    .map(({ shape, vectors }) => {
+      const terms = shape.textColumns.length > 0 ? `exact terms over ${shape.textColumns.join(", ")}` : "";
+      const meaning = vectors ? `meaning over its vectors (${vectors.table})` : "";
+      return `${shape.table} by ${[terms, meaning].filter(Boolean).join(" and ")}`;
+    })
+    .join("; ");
+}
+
+/** The tables of a local database a whole session (a document) is read
+ * from, by the column naming it. */
+function localDocuments(tables: readonly LocalTable[]): string {
+  return tables.flatMap(({ shape }) => (shape.document ? [`${shape.table} by ${shape.document.pathColumn}`] : [])).join(", ");
+}
+
+/** The surface of a local database (CX_LOCAL_DB): its tables named in the
+ * frame, the doors as a table's rows have them, each said to take its table,
+ * and what the platform has that this does not. */
+export function localSurface(path: string, tables: readonly LocalTable[], primary: TableShape): InstructionSurface {
+  const documents = localDocuments(tables);
+  return {
+    frame:
+      `code-context is an index of the Infino database on this machine at ${path}: the tables ` +
+      `${localTableNames(tables).join(", ")}, one row per record in each, read where they lie, with no account. ` +
+      "Begin with these tools.",
+    doors: [
+      "- find - every row of a table whose text holds every word of an exact phrase, where you would grep: complete " +
+        "and unranked, with the table-wide count.\n",
+      `- search - which rows of a table are about X, ranked in one pass: ${localSearchLegs(tables)}.\n`,
+      `- sql - one statement you already know: a count, a filter, a lookup by ${primary.keyColumn}, a ranking, a join ` +
+        "across the tables, in one SELECT; every table's columns and the search functions are in the sql tool's text.\n",
+      ...(documents
+        ? [`- read - whole sessions, several in one call: every row sharing the value, in the order written (${documents}).\n`]
+        : []),
+    ],
+    beforeSweep: `find, search${documents ? " and read" : ""} each take the table they read, ${primary.table} when none is named.\n`,
+    hits:
+      `Hits are rows: a score, the row's ${primary.keyColumn}, its scalar columns, and its text columns cut to a snippet ` +
+      `of ${SNIPPET_CHARS} characters. Answer from the hits. ${rowCitation(primary)} The whole of a row is one sql away ` +
+      `(SELECT * FROM <its table> WHERE ${primary.keyColumn} = '...').`,
+    tail: [COUNTS_IN_THE_ANSWER, ARITHMETIC_SENTENCE, LOCAL_ONLY_SENTENCE],
+  };
+}
+
+/** The instructions of a local database whose table could not be read at
+ * startup: the cause, and that every door reports it. */
+export function localUnresolvedSurface(path: string, cause: string): InstructionSurface {
+  return {
+    frame:
+      `code-context is an index of the Infino database on this machine at ${path}, which could not be read when this ` +
+      `server started (${cause}), so find, search and sql each return that error until the server is restarted.`,
+    doors: [],
+    beforeSweep: "",
+    hits: "",
+    tail: [],
+  };
+}
+
+/** A door's text over a local database that could not be read at startup. */
+export function localUnresolvedDescription(door: string, path: string): string {
+  return (
+    `${door} over the tables of the Infino database on this machine at ${path}. It could not be read when this ` +
+    "server started, so every call returns that error (with the cause) until the server is restarted."
+  );
+}
+
+/** The `search` text over a local database: which tables rank by what, and
+ * a hit as a row. */
+export function localSearchDescription(tables: readonly LocalTable[], primary: TableShape): string {
+  const fused = tables.some((t) => t.vectors);
+  return (
+    `Ranked search over the rows of one table of the local database - its \`table\` input names it, ${primary.table} when absent: ` +
+    `${localSearchLegs(tables)}. Each full-text column is ranked by exact keyword matching (BM25)` +
+    (fused
+      ? ", and a table's vectors by meaning, the query embedded on this machine with the model the vectors were made " +
+        "with, so a table with vectors is found whether or not you know its words"
+      : "") +
+    "; where there are several rankings they are fused by reciprocal rank. Use it for which rows are about X, the " +
+    `best matches for a description. Each hit is a row: score (higher is better), ${primary.keyColumn}, the scalar ` +
+    `columns, and the text columns as snippets of at most ${SNIPPET_CHARS} characters. Answer from the hits. ` +
+    `${rowCitation(primary)} When one search is not enough, refine the query and search again. For every row ` +
+    `holding an exact phrase use find; for counts, rankings and filters use sql. ${ROWS_USAGE_RECEIPT}`
+  );
+}
+
+/** The `find` text over a local database: the column each table is matched
+ * in, and a match as a row. */
+export function localFindDescription(tables: readonly LocalTable[], primary: TableShape): string {
+  const columns = tables.flatMap(({ shape }) => (shape.primaryText ? [`${shape.table}.${shape.primaryText}`] : []));
+  return (
+    `Every row of one table of the local database - its \`table\` input names it, ${primary.table} when absent - whose ` +
+    `full-text column holds every word of an exact string, like grep over a table: complete and unranked, with the ` +
+    `table-wide total. The column matched: ${columns.join(", ")}. ` +
+    ROW_FIND_MATCHING +
+    "Use it where you would grep: a name, a phrase, an identifier that must appear. Each match is a row: " +
+    `${primary.keyColumn}, the scalar columns, and the text columns as snippets. ignoreCase, defines and under ` +
+    "describe a code index and do nothing here. " +
+    ROW_FIND_ROUTING +
+    ROWS_USAGE_RECEIPT
+  );
+}
+
+/** How a statement ranks a local table by meaning: a vector search over the
+ * table its vectors sit in, joined back to it by the key both carry, written
+ * out over `shape`'s own names. */
+function localMeaningSentence(shape: TableShape, vectors: LocalVectors): string {
+  const { table, column, key } = vectors;
+  return (
+    `vector_search('${table}','${column}', {{q}}, k) ranks a table's rows by meaning (score is a distance, lower is ` +
+    `better), joined to the table by ${key}: SELECT t.${key}, t.${shape.primaryText}, v.score FROM ` +
+    `vector_search('${table}','${column}', {{q}}, 20) v JOIN ${shape.table} t ON t.${key} = v.${key} ORDER BY ` +
+    `v.score, with embed {"q":"..."} - {{q}} and its text are yours to fill in, embedded on this machine with the ` +
+    "model the vectors were made with. "
+  );
+}
+
+/** The `sql` text over a local database: every table with its columns and
+ * the ones indexed for text, the search functions the engine runs here, and
+ * - where a table's vectors sit beside it - how a statement ranks by meaning,
+ * the {{q}} embedded on this machine. */
+export function localSqlDescription(tables: readonly LocalTable[], primary: TableShape): string {
+  const described = tables.map(
+    ({ shape, vectors }) =>
+      `${shape.table}(${columnList(shape)})` +
+      (shape.textColumns.length ? `, full-text indexed on ${shape.textColumns.join(", ")}` : "") +
+      (vectors ? `, its vectors in ${vectors.table}(${vectors.key}, ${vectors.column})` : ""),
+  );
+  const withVectors = tables.find((t) => t.vectors && t.shape.primaryText);
+  const meaning = withVectors?.vectors ? localMeaningSentence(withVectors.shape, withVectors.vectors) : "";
+  return (
+    `Read-only SQL, one SELECT or WITH, over the tables of the Infino database on this machine: ${described.join("; ")} ` +
+    "- for counts, rankings, filters, joins and GROUP BY across whole tables. " +
+    KEEP_CONDITIONS_SENTENCE +
+    ONE_STATEMENT_SENTENCE +
+    "The search functions are table-valued, so WHERE, GROUP BY, ORDER BY and joins compose with them in one pass, " +
+    "and each returns _id, the table's columns and score: " +
+    "bm25_search('<table>','<full-text column>','terms', k) ranks a table's rows by exact terms (score higher is " +
+    "better); token_match('<table>','<full-text column>','terms','and') is every row holding every term, unranked, " +
+    "with no k, so a COUNT over it is the table's count. " +
+    meaning +
+    (primary.primaryText ? severalTermsSentence(primary.table, primary.primaryText) : "") +
+    "A search relation holds its top k rows alone, so a COUNT over one is the rows ranked in the top k, never the " +
+    "table's count. Never find rows by filtering a text column with LIKE '%word%' or regexp_like: it matches " +
+    "letters, not meaning, and ranks nothing. " +
+    ROWS_REGEX_SENTENCE +
+    `${ARITHMETIC_SENTENCE} ` +
+    ROWS_USAGE_RECEIPT
+  );
+}
+
+/** The `read` text over a local database: a session as a document, the
+ * rows sharing its value read whole in the order written. */
+export function localReadDescription(tables: readonly LocalTable[], primary: TableShape): string {
+  return (
+    `The whole of one or more sessions of a table of the local database - its \`table\` input names it, ${primary.table} when ` +
+    `absent - each session every row sharing its value (${localDocuments(tables)}), in the order the rows were ` +
+    "written, each row's text starting a line, and numbered by line. Use it after find, " +
+    "search or sql have named the sessions you want, for every session at once. from and to cut every session to " +
+    "a line range; lists in both name several ranges in one call, paired in order (from [559, 1938], to [610, 1975] " +
+    `reads 559-610 and 1938-1975). A session over ${READ_LINES_CAP} lines, or past the result's budget, comes back a ` +
+    "page at a time, with more saying where its next page starts, and the result's next lists the read calls that " +
+    "fetch the rest of every session cut short - make them, all in one reply. A session the table does not hold " +
+    "comes back as a miss beside the others. The result includes a 'usage' field, a one-line receipt of tokens " +
+    "returned and sessions."
   );
 }
 
@@ -1836,6 +2081,21 @@ export interface ServeOptions {
    * where that machine is not the caller's: its files are the server's own. */
   hostFiles?: boolean;
   startupBudgetMs?: number;
+  /** The query embedder of a local database (CX_LOCAL_DB) in place of the
+   * model its vectors were made with. */
+  localEmbedder?: Embedder;
+}
+
+/** Where a rows door reads a table's rows: the platform's copy of it, or a
+ * local database (CX_LOCAL_DB). The doors share everything else - the
+ * shape, the hits, the find's and the read's statements (`db.querySql`) -
+ * and differ in how a search ranks (the platform fuses within one table; a
+ * local table's vectors can sit beside it) and in what the result's `index`
+ * names. */
+interface RowsSource {
+  index: string;
+  db: Pick<HostedDb, "querySql" | "querySqlChecked"> & Partial<Pick<HostedDb, "reranksOnRead">>;
+  search: (shape: TableShape, query: string, k: number, question?: string) => Promise<RowSearchResult>;
 }
 
 /** What a signed-in caller is told when a tool would read the repository
@@ -1870,12 +2130,39 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // Resolved once here - a bad URL or a missing key fails the server at
   // startup, not on the first tool call. The key stays inside the target;
   // only `hostedLabel` ever reaches a log line.
-  const configured = hostedTarget();
+  //
+  // CX_LOCAL_DB: the doors run over the rows of the tables of a database on
+  // this machine that another process writes (core/local-db.ts) - no
+  // account, no platform, and no code index: the context's engine
+  // connection refuses every use (`noCodeIndex`), so no path that builds or
+  // syncs one can run, here or against the folder. With --db as well there
+  // would be two databases and one set of doors; refused at startup. A
+  // login stored on this machine (`cx login`) is not named on the command
+  // line: the local database is what was asked for, so the stored account
+  // is set aside rather than refused, and the server says so.
+  const localPath = localDatabasePath();
+  const storedLoginAside = localPath !== null && hostedAccount() !== null && serveOptions.apiKey === undefined;
+  if (storedLoginAside) {
+    console.error(`${LOCAL_DB_ENV} names a local database: the account stored on this machine is not used by this server`);
+  }
+  const configured = storedLoginAside ? null : hostedTarget();
   const hosted = configured !== null && serveOptions.apiKey !== undefined ? { ...configured, apiKey: serveOptions.apiKey } : configured;
+  if (localPath && hosted) {
+    throw new Error(`${LOCAL_DB_ENV} serves a database on this machine with no account; it does not combine with --db`);
+  }
+  // The query embedder is the model the database's vectors were made with,
+  // loaded on the first search or statement that embeds a query.
+  let localEmbedder: Embedder | undefined = serveOptions.localEmbedder;
+  const local = localPath ? new LocalDatabase(localPath, () => (localEmbedder ??= createLocalDatabaseEmbedder())) : null;
+  // The table a call reads when it names none, which every TABLE below
+  // reads: CX_TABLE's (config.ts) - but over a local database with CX_TABLE
+  // unset, the default `chunks` names nothing there, so the table its own
+  // tables pick (`localPrimaryTable`) takes its place once they are described.
+  let TABLE: string = NAMED_TABLE ?? DEFAULT_TABLE;
   // The account the target came from, when no --db named a database: then
   // every repository a session opens gets its own database on it (see
   // RepoRegistry), registered here before its first build.
-  const account = serveOptions.apiKey !== undefined ? null : hostedAccount();
+  const account = serveOptions.apiKey !== undefined || storedLoginAside ? null : hostedAccount();
   // With an account every search runs on the platform's copy, and a hosted
   // table of another shape is read there too: the local index is always
   // lexical (no local vectors), so there is no local search to choose.
@@ -1917,7 +2204,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // and not under sign-in. Without host files, the default root is the only
   // one served.
   const registry = new RepoRegistry(defaultRoot, {
-    connect,
+    connect: local ? noCodeIndex : connect,
     ...(hosted && !signedIn ? { hosted: { target: hosted, ...(hostedOptions ? { options: hostedOptions } : {}) } } : {}),
     ...(account ? { account } : {}),
     ...(hostFiles ? {} : { defaultOnly: true }),
@@ -2528,7 +2815,32 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     const failed = laidOut.failures.get(table);
     if (failed) throw failed;
   };
-  if (hosted && !signedIn && remoteSearch && TABLE !== DEFAULT_TABLE) {
+  // A local database's tables, described once here as a hosted table is -
+  // their shapes decide the tool text, and every call reads that decision -
+  // with CX_TABLE the one a call reads when it names none. A database that
+  // cannot be read, or holds no such table, leaves the doors registered and
+  // each call saying why (`unresolved`), as a hosted table that could not be
+  // described does.
+  let localTables: LocalTable[] = [];
+  if (local) {
+    try {
+      localTables = local.describe();
+      if (NAMED_TABLE === null) TABLE = localPrimaryTable(localTables) ?? TABLE;
+      const primary = localTables.find((t) => t.shape.table === TABLE);
+      const names = localTableNames(localTables);
+      mode = primary
+        ? { kind: "rows", shape: primary.shape }
+        : {
+            kind: "unresolved",
+            cause:
+              `it holds no table ${TABLE} - its tables: ${names.length > 0 ? names.join(", ") : "none yet"}; ` +
+              "set CX_TABLE to the one a call reads when it names none",
+          };
+    } catch (err) {
+      mode = { kind: "unresolved", cause: (err as Error).message };
+    }
+    if (mode.kind === "unresolved") console.error(`the local database at ${local.path} could not be served: ${mode.cause}`);
+  } else if (hosted && !signedIn && remoteSearch && TABLE !== DEFAULT_TABLE) {
     try {
       // With the load's record: a table cut into passages says so in the
       // tool text (`chunkingNote`), and a `vector` column the load embedded
@@ -2695,14 +3007,40 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     return pending;
   };
 
+  /** The rows a call over the local database runs over: the table the call
+   * names, or the primary; whatever the context, since every door of this
+   * mode reads the database and no code index. */
+  const localSource: RowsSource | null = local
+    ? { index: LOCAL_INDEX, db: local, search: (shape, query, k) => local.search(shape, query, k) }
+    : null;
+  const localRowsOver = (tool: string, table: string | undefined): { shape: TableShape; source: RowsSource } | { failed: ReturnType<typeof fail> } => {
+    if (mode.kind === "unresolved") return { failed: fail(`${tool} failed: the local database at ${local!.path} could not be served when this server started: ${mode.cause}`) };
+    const named = table ?? TABLE;
+    const found = localTables.find((t) => t.shape.table === named);
+    if (!found) return { failed: fail(`${tool} failed: no table ${named} in the local database; its tables: ${localTableNames(localTables).join(", ")}`) };
+    return { shape: found.shape, source: localSource! };
+  };
+
   /** The rows a call on `ctx` runs over, read off the startup decision - no
    * platform call, no await: the shape when the context carries the platform
    * client (the default root) and the table is of another shape; `failed`
    * when it could not be described; null for every other case, where the
-   * call takes the path it always took. */
-  const rowsOver = (tool: string, ctx: RepoCtx): { shape: TableShape } | { failed: ReturnType<typeof fail> } | null => {
+   * call takes the path it always took. Over a local database, the table the
+   * call names (`table`), whatever the context. */
+  const rowsOver = (
+    tool: string,
+    ctx: RepoCtx,
+    table?: string,
+  ): { shape: TableShape; source: RowsSource } | { failed: ReturnType<typeof fail> } | null => {
+    if (local) return localRowsOver(tool, table);
     if (!ctx.hosted || mode.kind === "chunks") return null;
-    if (mode.kind === "rows") return { shape: mode.shape };
+    if (mode.kind === "rows") {
+      const hostedDb = ctx.hosted;
+      return {
+        shape: mode.shape,
+        source: { index: "platform", db: hostedDb, search: (shape, query, k, question) => searchRows(hostedDb, shape, query, k, question) },
+      };
+    }
     return {
       failed: fail(
         `${tool} failed: table ${TABLE} could not be described from the platform at ${platformLabel(ctx.hosted)} when ` +
@@ -2973,7 +3311,49 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     .min(1)
     .optional()
     .describe("A database of the Infino account to run over instead of a repository: the names are what `tables` lists. With it, `path` is not read.");
-  const TABLE_ARG = z.string().min(1).optional().describe("With `database`: the table to run over; its text column is the one searched.");
+  // Over a local database the same input names the table of that database a
+  // call reads - one of its tables, the primary when absent - since there is
+  // no account and so no `database` beside it; everywhere else it is the
+  // table of a database the call names.
+  const localTableNamesHere = localTableNames(localTables);
+  const TABLE_ARG =
+    local && localTableNamesHere.length > 0
+      ? z
+          .enum(localTableNamesHere as [string, ...string[]])
+          .optional()
+          .describe(`The table of the local database to run over - one of ${localTableNamesHere.join(", ")}; ${TABLE} when absent.`)
+      : z.string().min(1).optional().describe("With `database`: the table to run over; its text column is the one searched.");
+
+  /** A `sql` statement over the local database (CX_LOCAL_DB): run on a fresh
+   * connection to the folder, its `{{name}}` placeholders embedded on this
+   * machine with the model the database's vectors were made with
+   * (`LocalDatabase.runSql`), then ranked and held to the result's budget as
+   * a platform statement's rows are. No verdict and no graph: both are the
+   * platform's. */
+  const sqlOnLocal = async (ctx: RepoCtx, query: string, embeds: Record<string, string> | undefined) => {
+    try {
+      const t0 = performance.now();
+      const raw = await local!.runSql(query, embeds);
+      const rowsOut = rankRows(raw, withoutComments(query));
+      let usage: string | undefined;
+      if (receiptOn) {
+        const entry = sqlEntry(query, rowsOut);
+        recordUsage(ctx.dir, entry);
+        usage = formatReceipt(entry, session);
+      }
+      const held = budgetSqlRows(rowsOut, (row) => jsonify(row).length);
+      const hint = sqlBudgetHint(rowsOut.length, held.budget);
+      return ok({
+        rows: held.rows,
+        ...(hint ? { hint } : {}),
+        index: LOCAL_INDEX,
+        took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
+        ...(usage ? { usage } : {}),
+      });
+    } catch (err) {
+      return fail(`sql failed: ${(err as Error).message}`);
+    }
+  };
 
   const rows = mode.kind === "rows" ? mode.shape : null;
   // Whether find and search are offered: always over the chunks table, and
@@ -2981,8 +3361,11 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // none the engine refuses every token match and BM25 search, and a tool
   // that cannot run is a tool the model calls and a turn it loses (the Berka
   // tables, 2026-10-01, hydrated with no full-text index and no vector). An
-  // unresolved table keeps both: their calls report the cause.
-  const searchDoors = !rows || rows.primaryText !== "";
+  // unresolved table keeps both: their calls report the cause. Over a local
+  // database the doors take the table they read, so they are offered while
+  // any table has something to search.
+  const searchDoors =
+    local && rows ? localTables.some((t) => t.shape.textColumns.length > 0 || t.vectors) : !rows || rows.primaryText !== "";
   // Whether a statement across the tables can hold a search at all.
   const joinSearchable = siblingsSearchable(rows, siblings, siblingsUnresolved);
   // The sibling tables come second, right after what the statement runs
@@ -2994,7 +3377,11 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const semanticsServed = WITH_SEMANTICS && [card, ...siblings.map((s) => s.card)].some(carriesSemantics);
   const siblingText =
     siblingNames.length > 0 ? siblingsNote(TABLE, siblings, siblingsUnresolved, joinSearchable, semanticsServed) : "";
-  let sqlDescription = rows
+  let sqlDescription = local
+    ? rows
+      ? localSqlDescription(localTables, rows)
+      : localUnresolvedDescription("Read-only SQL", local.path)
+    : rows
     ? rowsSqlDescription(rows) + siblingText
     : mode.kind === "unresolved"
     ? unresolvedDescription("Read-only SQL", TABLE) + siblingText
@@ -3062,7 +3449,11 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // (`instructionsFor`), so what the shapes share is said once.
       instructions: withListedNames(withTaskChecklist(withPlaybook(
         instructionsFor(
-          rows
+          local
+            ? rows
+              ? localSurface(local.path, localTables, rows)
+              : localUnresolvedSurface(local.path, mode.kind === "unresolved" ? mode.cause : "")
+            : rows
             ? rowsSurface(rows, siblingNames, surfaceOptions)
             : mode.kind === "unresolved"
             ? unresolvedSurface(TABLE, mode.cause)
@@ -3156,13 +3547,19 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     // search is registered only with an account: the local index holds no
     // vectors (see wantsLocalEmbed above), so a local "search" would just be
     // a thinner bm25_search under a misleading name. Without an account, reach for sql's bm25_search/token_match instead.
-    if (platformTools) {
+    // A local database (CX_LOCAL_DB) is the exception: its search fuses a
+    // table's keyword ranking with its vectors beside it (core/local-db.ts).
+    if (platformTools || local) {
       server.registerTool(
         "search",
         {
           title: "Code search (exact terms + meaning)",
           annotations: READ_ONLY,
-          description: (rows
+          description: (local
+            ? rows
+              ? localSearchDescription(localTables, rows)
+              : localUnresolvedDescription("Ranked search", local.path)
+            : rows
             ? rowsSearchDescription(rows)
             : mode.kind === "unresolved"
             ? unresolvedDescription("Ranked search", TABLE)
@@ -3254,13 +3651,14 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           // fuses the table's own text and embedding columns. No local index, no
           // readiness probe - the startup decision already said the table is
           // there and what it is (rowsOver). A row has no lines to cut to, so
-          // `lines` has no meaning here and is left out.
-          const over = rowsOver("search", ctx);
+          // `lines` has no meaning here and is left out. Over a local
+          // database, the table the call names, searched there (`RowsSource`).
+          const over = rowsOver("search", ctx, table);
           if (over && "failed" in over) return over.failed;
           if (over) {
             try {
               const t0 = performance.now();
-              const [{ value: result, own }, recalled] = await Promise.all([answeredBy(searchRows(ctx.hosted!, over.shape, query, k, question), ctx), recallFor(query)]);
+              const [{ value: result, own }, recalled] = await Promise.all([answeredBy(over.source.search(over.shape, query, k, question), ctx), recallFor(query)]);
               const graph = await connectAcrossGraph(ctx, TABLE, result.hits, { query });
               let usage: string | undefined;
               if (receiptOn) {
@@ -3271,7 +3669,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
               return ok({
                 ...result,
                 ...graph.section,
-                index: "platform",
+                index: over.source.index,
                 ...(recalled.block ? { memory: recalled.block } : {}),
                 took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
                 ...(usage ? { usage } : {}),
@@ -3349,7 +3747,11 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       {
         title: "Find exact text (every occurrence, like grep -n)",
         annotations: READ_ONLY,
-        description: (rows
+        description: (local
+          ? rows
+            ? localFindDescription(localTables, rows)
+            : localUnresolvedDescription("Every row holding every word of an exact string", local.path)
+          : rows
           ? rowsFindDescription(rows)
           : mode.kind === "unresolved"
           ? unresolvedDescription("Every row holding every word of an exact string", TABLE)
@@ -3515,13 +3917,14 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         // code-index options (ignoreCase, defines, under) have no meaning for a
         // row and are left out, as the tool text says. Read off the startup
         // decision: in chunks mode this is the local tool it always was, and
-        // nothing here waits on the platform.
-        const over = rowsOver("find", ctx);
+        // nothing here waits on the platform. Over a local database, the
+        // table the call names.
+        const over = rowsOver("find", ctx, table);
         if (over && "failed" in over) return over.failed;
         if (over) {
           try {
             const t0 = performance.now();
-            const result = await findRows(ctx.hosted!, over.shape, query, { limit, question });
+            const result = await findRows(over.source.db, over.shape, query, { limit, question });
             let usage: string | undefined;
             if (receiptOn) {
               const entry = withPlatform(rowFindEntry(result), ctx);
@@ -3530,7 +3933,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             }
             return ok({
               ...result,
-              index: "platform",
+              index: over.source.index,
               took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
               ...(usage ? { usage } : {}),
             });
@@ -3677,9 +4080,11 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // on the platform - and this comes before the local index for the
       // reason find's does. The rows come back as the platform gave them: a
       // table of rows has no lines to number. The verdict is diagnosed
-      // against the table's own text column.
+      // against the table's own text column. Over a local database the
+      // statement runs there, over any of its tables.
       const over = rowsOver("sql", ctx);
       if (over && "failed" in over) return over.failed;
+      if (over && local) return sqlOnLocal(ctx, query, embeds);
       if (over) return sqlOnPlatform(ctx, query, embeds, question, { column: over.shape.primaryText, numbered: false, key: over.shape.keyColumn });
       // With sibling tables named, every statement runs on the platform: a
       // JOIN across them has nowhere else to run, and a plain statement over
@@ -3778,24 +4183,34 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // documents (`TableShape.document`) a document is the rows sharing a path;
   // without a door for it a caller pages each one through sql, many calls a
   // document. A table of records has no document to read, and the rows of one that could
-  // not be described none either: neither registers it.
-  if (mode.kind === "chunks" || rows?.document) {
+  // not be described none either: neither registers it. Over a local
+  // database a document is a session (core/local-db.ts), read from any table
+  // that holds them, the table named by the call's `table`.
+  const localSessions = local && rows ? localTables.some((t) => t.shape.document) : false;
+  // Typed as present either way, so the handler reads `table` alike: where
+  // the schema has no such input no call's arguments carry one.
+  type ReadTableInput = { table: z.ZodOptional<z.ZodType<string>> };
+  const readTableInput = (localSessions ? { table: TABLE_ARG } : {}) as ReadTableInput;
+  if (mode.kind === "chunks" || (local ? localSessions : rows?.document)) {
     server.registerTool(
       "read",
       {
         title: rows ? "Read documents the index named (several at once)" : "Read files the index named (several at once)",
         annotations: READ_ONLY,
-        description: readDescription(rows),
+        description: local ? localReadDescription(localTables, rows!) : readDescription(rows),
         inputSchema: {
           paths: z
             .array(z.string().min(1))
             .min(1)
             .max(READ_PATHS_MAX)
             .describe(
-              rows?.document
+              local
+                ? "The sessions' values, as find, search and sql return them - every session you want, in one call."
+                : rows?.document
                 ? `The documents' ${rows.document.pathColumn} values, as find, search and sql return them - every document you want, in one call.`
                 : "Repo-relative paths, as find, search and sql cite them - every file you want, in one call.",
             ),
+          ...readTableInput,
           from: lineOrLines
             .optional()
             .describe("First line to return, in every file named - or a list, one per range, paired with to. Default 1."),
@@ -3811,7 +4226,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             ),
         },
       },
-      async ({ paths, from, to, path }) => {
+      async ({ paths, from, to, path, table }) => {
         let ctx: RepoCtx;
         try {
           ctx = repoFor(path);
@@ -3827,17 +4242,17 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         // Over a hosted table of documents the read is one statement on the
         // platform, before the local index for the reason find's is: a build
         // would drop the table (see ownsTable).
-        const over = rowsOver("read", ctx);
+        const over = rowsOver("read", ctx, table);
         if (over && "failed" in over) return over.failed;
         if (over) {
           const document = over.shape.document;
           try {
             const t0 = performance.now();
-            const { value: files, own } = await answeredBy(readRows(ctx.hosted!, over.shape, paths, { ranges, budget: readBudget(paths) }), ctx);
+            const { value: files, own } = await answeredBy(readRows(over.source.db, over.shape, paths, { ranges, budget: readBudget(paths) }), ctx);
             const got = readHits(files).filter((f) => f.lines !== "");
             let usage: string | undefined;
             if (receiptOn) {
-              const entry = withCalls(readEntry(got, TABLE), own);
+              const entry = withCalls(readEntry(got, over.shape.table), own);
               recordUsage(ctx.dir, entry);
               usage = formatReceipt(entry, session);
             }
@@ -3845,7 +4260,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             return ok({
               files,
               ...(next.length > 0 ? { next } : {}),
-              index: "platform",
+              index: over.source.index,
               took_ms: Math.round((performance.now() - t0) * 1000) / 1000,
               ...(usage ? { usage } : {}),
             });
@@ -4322,6 +4737,19 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
 
   const transport = serveOptions.transport ?? new StdioServerTransport();
   await server.connect(transport);
+  if (local) {
+    // A local database has no code index and no platform: what is said is
+    // the folder, its tables and the model its queries are embedded with.
+    console.error(
+      `code-context MCP server ready on ${serveOptions.transport ? "its transport" : "stdio"} over the local database at ${local.path} (` +
+        (rows
+          ? `tables ${localTableNames(localTables).join(", ")}, ${TABLE} when a call names none; queries embedded with ` +
+            `${LOCAL_DATABASE_MODEL} at ${LOCAL_DATABASE_DTYPE}`
+          : "it could not be served, so every tool call says why") +
+        ")",
+    );
+    return;
+  }
   const manifest: Manifest | undefined = readManifest(indexDir(defaultRoot));
   // The platform's host and its embedder, never the key. The table's
   // readiness is not probed here: a cold database can take a while to answer,

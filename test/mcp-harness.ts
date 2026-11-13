@@ -14,6 +14,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+// A type alone: erased at load, so it reads no environment.
+import type { Embedder } from "../src/core/embedder.js";
 
 /** One request the platform saw: the op (`/v1/<op>/...`) and its JSON body -
  * or, for a GET, its query parameters, the only body such a request has -
@@ -140,7 +142,11 @@ export interface Started {
 /** Start the server for a fresh temp root against `platform`, with a client
  * connected to it. `prefix` names the temp dir; `startupBudgetMs`, when
  * given, is the server's wait on the database's other tables. */
-export async function start(platform: Platform, prefix: string, options: { startupBudgetMs?: number } = {}): Promise<Started> {
+export async function start(
+  platform: Platform,
+  prefix: string,
+  options: { startupBudgetMs?: number; localEmbedder?: Embedder } = {},
+): Promise<Started> {
   const { serveMcp } = await import("../src/mcp/server.js");
   const root = mkdtempSync(join(tmpdir(), prefix));
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
