@@ -185,6 +185,31 @@ describe("the hint on an empty find", () => {
   it("doubts the name itself when defines found nothing for a bare identifier", () => {
     expect(findHint("maybeRefresh", 0, true)).toContain('Nothing declares "maybeRefresh"');
   });
+  it("names every following page's skip, to be asked for in one reply, when a find could not carry every match", () => {
+    const hint = findHint("unsafe {", 136, false, 40, 136, true, [40, 81, 118]);
+    expect(hint).toContain("carried 40 of the 136 matching lines with their blocks");
+    expect(hint).toContain("skip set to each of 40, 81, 118 - all of them in the same reply");
+    expect(hint).not.toContain("under");
+    const lines = findHint("unsafe {", 136, false, 40, 136, false, [40]);
+    expect(lines).toContain("with their text");
+    expect(findHint("unsafe {", 900, false, 40, 900, true, Array.from({ length: 16 }, (_, i) => 40 * (i + 1)))).toContain(
+      "The last of them names where the next pages start.",
+    );
+    // A line-mode flood keeps its own wording.
+    expect(findHint("unsafe {", 136, false, 40, 136)).toContain("40 of 136 lines carry their text");
+  });
+  it("says nothing on the last page, whose matches are all carried though the total counts earlier pages", () => {
+    // The last page of a 136-match find: matches 121-136 with their blocks,
+    // no pages after it. Taken as a flood, it would say the rest are listed
+    // after them and send the caller back to find again with skip.
+    expect(findHint("unsafe {", 136, false, 16, 16, true, undefined, 120)).toBeNull();
+    expect(findHint("unsafe {", 136, false, 16, 16, false, [], 120)).toBeNull();
+    // A page from skip that still could not carry its rest keeps the flood
+    // hint, counted from its own start.
+    expect(findHint("unsafe {", 136, false, 6, 16, false, undefined, 120)).toContain("6 of 136 lines carry their text");
+    // Without skip, the same counts are a flood, as before.
+    expect(findHint("unsafe {", 136, false, 16, 16, true)).toContain("16 of 136 matching lines came with their block");
+  });
   it("says nothing when a bare identifier is simply absent, or when anything matched", () => {
     expect(findHint("refresh(", 0, false)).toBeNull();
     expect(findHint("private void refresh(String source)", 3, false)).toBeNull();
@@ -290,6 +315,18 @@ describe("the chunks table with the platform up", () => {
     const second = await call(s, "search", { query: "body", k: 3 });
     expect(second.ok).toBe(true);
     expect(second.ops).toEqual(["hybrid_search"]);
+  });
+
+  it("search with the question asks the platform to rerank its pool for it, and without one asks nothing", async () => {
+    const before = s.sent.length;
+    const asked = await call(s, "search", { query: "body", k: 3, question: "where is the body written?" });
+    expect(asked.ok, String(asked.value)).toBe(true);
+    const plain = await call(s, "search", { query: "body", k: 3 });
+    expect(plain.ok, String(plain.value)).toBe(true);
+    const searches = s.sent.slice(before).filter((x) => x.op === "hybrid_search").map((x) => x.body);
+    expect(searches).toHaveLength(2);
+    expect(searches[0]).toMatchObject({ k: 3, rerank: { question: "where is the body written?", k: 3 } });
+    expect(searches[1]?.rerank).toBeUndefined();
   });
 
   it("sent no write and left no manifest", () => {

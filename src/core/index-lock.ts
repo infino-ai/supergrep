@@ -14,9 +14,13 @@
 // sees it half-written and two creators cannot both succeed. A holder that
 // died without releasing it (killed, crashed) leaves the file behind; a
 // later writer on the same host finds its process gone and takes the lock
-// over. A holder on another host (an index dir on a shared filesystem) cannot
-// be checked and counts as alive. A dead holder's process id reused by an
-// unrelated process also counts as alive, until that process exits.
+// over. A file naming this process is ours only if this process took that
+// acquisition and still holds it: a restarted container often comes back with
+// the same host name and process id (1, say), and the lock its last run left
+// is then stale, not ours. A holder on another host (an index dir on a shared
+// filesystem) cannot be checked and counts as alive. A dead holder's process
+// id reused by an unrelated process also counts as alive, until that process
+// exits.
 
 import { linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
@@ -85,12 +89,23 @@ function readHolder(path: string): LockHolder | null | undefined {
 
 const sameHolder = (a: LockHolder, b: LockHolder): boolean => a.pid === b.pid && a.host === b.host && a.since === b.since;
 
+/** The acquisitions this process holds, by lock path. */
+const heldHere = new Map<string, LockHolder>();
+
 /** Whether a holder may still be running. Only a process on this host can be
  * checked; signal 0 tests for it without touching it, and EPERM means it
- * exists under another user. */
-export function holderAlive(h: LockHolder): boolean {
+ * exists under another user. A holder naming this process is alive only as
+ * an acquisition this process holds, under whatever path it was taken: two
+ * spellings of one index dir (a symlink, /tmp and /private/tmp) name one
+ * file, so matching by path alone would hand a live lock to its second
+ * spelling. Without `checkHeld`, any holder naming this process is. */
+export function holderAlive(h: LockHolder, checkHeld = false): boolean {
   if (h.host !== hostname()) return true;
-  if (h.pid === process.pid) return true;
+  if (h.pid === process.pid) {
+    if (!checkHeld) return true;
+    for (const mine of heldHere.values()) if (sameHolder(mine, h)) return true;
+    return false;
+  }
   try {
     process.kill(h.pid, 0);
     return true;
@@ -127,7 +142,7 @@ function takeOver(path: string, dead: LockHolder, me: LockHolder): boolean {
   const guard = `${path}.takeover`;
   if (!createExclusive(guard, me)) {
     const g = readHolder(guard);
-    if (g === null || (g && !holderAlive(g))) rmSync(guard, { force: true });
+    if (g === null || (g && !holderAlive(g, true))) rmSync(guard, { force: true });
     return false;
   }
   try {
@@ -158,7 +173,7 @@ export function tryLockIndex(indexDirPath: string): LockAttempt {
       // leaves such a file, so it is debris.
       acquired = takeOver(path, { pid: -1, host: "", since: "" }, me);
       if (!acquired) return { heldBy: null };
-    } else if (holderAlive(held)) {
+    } else if (holderAlive(held, true)) {
       return { heldBy: held };
     } else {
       acquired = takeOver(path, held, me);
@@ -166,6 +181,7 @@ export function tryLockIndex(indexDirPath: string): LockAttempt {
     }
   }
 
+  heldHere.set(path, me);
   let owners = 1;
   return {
     lock: {
@@ -177,6 +193,7 @@ export function tryLockIndex(indexDirPath: string): LockAttempt {
       release() {
         if (owners === 0) return;
         if (--owners > 0) return;
+        if (heldHere.get(path) === me) heldHere.delete(path);
         const now = readHolder(path);
         if (now && sameHolder(now, me)) rmSync(path, { force: true });
       },
@@ -186,8 +203,9 @@ export function tryLockIndex(indexDirPath: string): LockAttempt {
 
 /** The live holder of the index's lock, when another process has it. */
 export function otherHolder(indexDirPath: string): LockHolder | null {
-  const h = readHolder(lockPath(indexDirPath));
-  return h && h.pid !== process.pid && holderAlive(h) ? h : null;
+  const path = lockPath(indexDirPath);
+  const h = readHolder(path);
+  return h && h.pid !== process.pid && holderAlive(h, true) ? h : null;
 }
 
 /** Take the index's lock, or throw IndexBusyError naming the holder. */

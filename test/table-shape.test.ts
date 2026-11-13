@@ -31,7 +31,7 @@ import {
   wholeAllowances,
   type SchemaField,
 } from "../src/core/table-shape.js";
-import { embedsAQuery, findRows, findRowsSql, foldEmbeds, normalizeQueryPlaceholders, searchRows } from "../src/core/searcher.js";
+import { embedsAQuery, findRows, findRowsSql, foldEmbeds, normalizeQueryPlaceholders, RERANK_POOL_ROWS, searchHosted, searchRows } from "../src/core/searcher.js";
 import { topKAggregateRefusal } from "../src/core/topk-aggregate.js";
 import { rowFindEntry, rowSearchEntry, formatReceipt } from "../src/core/usage.js";
 import {
@@ -348,17 +348,55 @@ describe("the doors over rows", () => {
     ]);
   });
 
-  it("find with the question asks the platform to rerank its matches; without one it asks nothing of them", async () => {
-    const checks: unknown[] = [];
+  it("code search with the question asks the platform to rerank its pool for it; without one it asks nothing", async () => {
+    const calls: unknown[][] = [];
     const hosted = {
-      querySqlChecked: async (_sql: string, asked: unknown) => {
-        checks.push(asked);
+      hybridSearch: async (...args: unknown[]) => {
+        calls.push(args);
+        return [{ path: "a.rs", start_line: 1, end_line: 2, lang: "rust", symbol: "f", content: "fn f() {}", score: 1 }];
+      },
+    };
+    await searchHosted(hosted, "parse config", 4, { question: "  where is the config parsed?  " });
+    await searchHosted(hosted, "parse config", 4);
+    expect(calls[0].at(-1)).toEqual({ question: "where is the config parsed?", k: 4 });
+    expect(calls[1]).toHaveLength(6);
+  });
+
+  it("find with the question fetches the rerank pool for the grader and asks for its limit; without one it fetches the limit", async () => {
+    const asked: Array<{ sql: string; checks: unknown }> = [];
+    const hosted = {
+      querySqlChecked: async (sql: string, checks: unknown) => {
+        asked.push({ sql, checks });
         return { rows: [{ __cx_total: 1, id: "a", title: "A" }] };
       },
     };
     await findRows(hosted, JOBS, "rust", { limit: 2, question: "which jobs want rust?" });
     await findRows(hosted, JOBS, "rust", { limit: 2 });
-    expect(checks).toEqual([{ rerank: { question: "which jobs want rust?" } }, {}]);
+    expect(asked.map((a) => a.checks)).toEqual([{ rerank: { question: "which jobs want rust?", k: 2 } }, {}]);
+    expect(asked[0].sql).toMatch(new RegExp(`LIMIT ${RERANK_POOL_ROWS}$`));
+    expect(asked[1].sql).toMatch(/LIMIT 2$/);
+  });
+
+  it("find with the question still returns its limit when the platform did not rerank, and counts every match", async () => {
+    const pool = Array.from({ length: 5 }, (_, i) => ({ __cx_total: 9, id: `r${i}`, title: "A" }));
+    const hosted = { querySqlChecked: async () => ({ rows: pool }) };
+    const result = await findRows(hosted, JOBS, "rust", { limit: 2, question: "which jobs want rust?" });
+    expect(result.matches.map((m) => m.id)).toEqual(["r0", "r1"]);
+    expect(result).toMatchObject({ total: 9, truncated: true });
+  });
+
+  it("find with the question fetches only its limit once the platform has said it runs no grader", async () => {
+    const asked: Array<{ sql: string; checks: unknown }> = [];
+    const hosted = {
+      reranksOnRead: false,
+      querySqlChecked: async (sql: string, checks: unknown) => {
+        asked.push({ sql, checks });
+        return { rows: [{ __cx_total: 1, id: "a", title: "A" }] };
+      },
+    };
+    await findRows(hosted, JOBS, "rust", { limit: 2, question: "which jobs want rust?" });
+    expect(asked[0].checks).toEqual({});
+    expect(asked[0].sql).toMatch(/LIMIT 2$/);
   });
 
   it("search falls back to the keyword route when the table has no embedding column", async () => {

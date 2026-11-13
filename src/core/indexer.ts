@@ -1054,7 +1054,10 @@ const rebuildRequired = (reason: string): SyncOutcome => ({ action: "rebuild-req
 
 /** Whether a `rebuild-required` outcome means a build is already in flight
  * (the local vector stage, or the platform load) rather than that the index
- * needs one: a caller that rebuilds on rebuild-required must wait on these. */
+ * needs one: a caller that rebuilds on rebuild-required must wait on these,
+ * unless it holds the index's lock (core/index-lock.ts) and no build of its
+ * own is running, when the marker was left by a build that stopped before it
+ * finished and a rebuild is the way out. */
 export function syncInProgress(outcome: SyncOutcome): boolean {
   return outcome.action === "rebuild-required" && (outcome.reason === SYNC_REASON_VECTORS_BUILDING || outcome.reason === SYNC_REASON_PLATFORM_LOADING);
 }

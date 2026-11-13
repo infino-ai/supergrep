@@ -804,6 +804,51 @@ describe("reads that ask for a rerank", () => {
     expect(bodyJson(calls[2]).rerank).toBeUndefined();
   });
 
+  it("fall back to no rerank on a deployment whose gateway runs no grader (501)", async () => {
+    const refused: Scripted = {
+      status: 501,
+      body: JSON.stringify({ message: "rerank is not available on this deployment; send the query without `rerank`" }),
+      headers: { "content-type": "application/json" },
+    };
+    const { db, calls } = client([refused, json([{ id: 1 }])]);
+    const rows = await db.hybridSearch("t", "body", "emb", "x", 5, [], { question: "q", k: 5 });
+    expect(rows).toEqual([{ id: 1 }]);
+    expect(calls).toHaveLength(2);
+    expect(bodyJson(calls[0]).rerank).toEqual({ question: "q", k: 5 });
+    expect(bodyJson(calls[1]).rerank).toBeUndefined();
+  });
+
+  it("retry a rerank whose k is over the pool without k, and keep reranking later reads", async () => {
+    const overPool: Scripted = {
+      status: 400,
+      body: JSON.stringify({ message: "rerank: 500 rows asked for, and this deployment grades at most 200" }),
+      headers: { "content-type": "application/json" },
+    };
+    const { db, calls } = client([overPool, json([{ id: 2 }, { id: 1 }]), json([{ id: 3 }])]);
+    const first = await db.querySqlChecked("SELECT id FROM t", { rerank: { question: "q", k: 500 } });
+    expect(first.rows).toEqual([{ id: 2 }, { id: 1 }]);
+    expect(calls).toHaveLength(2);
+    expect(bodyJson(calls[0]).rerank).toEqual({ question: "q", k: 500 });
+    expect(bodyJson(calls[1]).rerank).toEqual({ question: "q" });
+    // Not remembered as "no rerank": the next read still asks.
+    expect(db.reranksOnRead).toBe(true);
+    await db.bm25Search("t", "body", "x", 5, [], { question: "q", k: 5 });
+    expect(bodyJson(calls[2]).rerank).toEqual({ question: "q", k: 5 });
+  });
+
+  it("turn the rerank off when the retry without k is refused as well", async () => {
+    const refused: Scripted = {
+      status: 400,
+      body: JSON.stringify({ message: "unknown field `rerank`, expected one of `query`, `validate`" }),
+      headers: { "content-type": "application/json" },
+    };
+    const { db, calls } = client([refused, refused, json([{ id: 1 }])]);
+    const first = await db.querySqlChecked("SELECT id FROM t", { rerank: { question: "q", k: 5 } });
+    expect(first.rows).toEqual([{ id: 1 }]);
+    expect(calls.map((c) => bodyJson(c).rerank)).toEqual([{ question: "q", k: 5 }, { question: "q" }, undefined]);
+    expect(db.reranksOnRead).toBe(false);
+  });
+
   it("let any other refusal stand", async () => {
     const refused: Scripted = {
       status: 400,
