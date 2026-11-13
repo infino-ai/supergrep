@@ -426,6 +426,28 @@ export const DEFAULT_TABLE = "chunks";
  * an explicit `cx index` does. */
 export const TABLE = process.env.CX_TABLE?.trim() || DEFAULT_TABLE;
 
+/** The table CX_TABLE names, or null when it names none. Over a local
+ * database (CX_LOCAL_DB) a table is picked from the database's own when it
+ * names none (mcp/server.ts, `localPrimaryTable`): the default `chunks` is
+ * this client's code index, which such a database does not hold. */
+export const NAMED_TABLE = process.env.CX_TABLE?.trim() || null;
+
+/** The variable naming a local database for the MCP server to serve
+ * (core/local-db.ts): a folder holding an Infino database that another
+ * process writes - such as an agent's memory plugin, under its profile's
+ * home - whose tables find, search, sql and read then run over on this
+ * machine, with no account and no --db. CX_TABLE names the table the doors
+ * read when a call names none; unset, `memory` when the database holds it,
+ * else its first table (NAMED_TABLE). */
+export const LOCAL_DB_ENV = "CX_LOCAL_DB";
+
+/** The local database CX_LOCAL_DB names, as an absolute path, or null when
+ * it names none. */
+export function localDatabasePath(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env[LOCAL_DB_ENV]?.trim();
+  return raw ? resolve(raw) : null;
+}
+
 /** Manifest file inside the index dir - the product's own record of what the
  * local index holds (the engine ignores foreign files in its catalog root). */
 export const MANIFEST_NAME = "codecontext.json";

@@ -36,7 +36,22 @@ const MODEL = process.env.CX_EMBED_MODEL ?? LOCAL_MODEL_DEFAULT;
 // Quantization is the main speed lever for local indexing; q8 measured
 // faster than fp32 on CPU with similar retrieval quality on our eval
 // (docs/embedder-eval.md).
-const DTYPE = (process.env.CX_EMBED_DTYPE ?? "q8") as "fp32" | "fp16" | "q8" | "q4";
+/** The precisions transformers.js loads a model's ONNX file at. */
+type Dtype = "fp32" | "fp16" | "q8" | "q4";
+
+const DTYPE = (process.env.CX_EMBED_DTYPE ?? "q8") as Dtype;
+
+/** The model and precision a local database's queries are embedded with
+ * (CX_LOCAL_DB, core/local-db.ts): those its vectors were made with. A
+ * writer that embeds with all-MiniLM-L6-v2's full-precision file
+ * (`onnx/model.onnx`) is matched only by a query embedded the same way:
+ * measured, the fp32 file under onnxruntime in Python and under
+ * transformers.js here agree to 6e-8, where the 8-bit file this client's own
+ * index defaults to lands at a cosine of 0.993 from them. Fixed rather than
+ * read from CX_EMBED_MODEL / CX_EMBED_DTYPE: those tune this client's own
+ * index, and the database's vectors are another process's. */
+export const LOCAL_DATABASE_MODEL = LOCAL_MODEL_DEFAULT;
+export const LOCAL_DATABASE_DTYPE: Dtype = "fp32";
 
 /** How long dispose() waits for a clean child exit before SIGKILL. */
 const CHILD_EXIT_GRACE_MS = 3000;
@@ -76,17 +91,21 @@ export interface Embedder {
   dtype?: string;
 }
 
-// Lazily load the pipeline once; the first call downloads + caches the model
-// under the transformers.js cache dir.
-let pipe: Promise<
-  (texts: string[], opts: object) => Promise<{ data: Float32Array; dims: number[]; tolist(): number[][] }>
-> | null = null;
-function getPipe() {
+// Lazily load each pipeline once - one per model and precision, since a
+// local database's queries are embedded at a precision of their own beside
+// this client's index (LOCAL_DATABASE_DTYPE); the first call downloads +
+// caches the model under the transformers.js cache dir.
+type Pipe = (texts: string[], opts: object) => Promise<{ data: Float32Array; dims: number[]; tolist(): number[][] }>;
+const pipes = new Map<string, Promise<Pipe>>();
+function getPipe(model: string, dtype: Dtype): Promise<Pipe> {
+  const key = `${model}@${dtype}`;
+  let pipe = pipes.get(key);
   if (!pipe) {
     pipe = (async () => {
       const { pipeline } = await import("@huggingface/transformers");
-      return (await pipeline("feature-extraction", MODEL, { dtype: DTYPE })) as never;
+      return (await pipeline("feature-extraction", model, { dtype })) as never;
     })();
+    pipes.set(key, pipe);
   }
   return pipe;
 }
@@ -99,13 +118,20 @@ export function createEmbedder(): Embedder | null {
   return createLocalEmbedder();
 }
 
+/** The query embedder of a local database (CX_LOCAL_DB): in-process, at the
+ * model and precision its vectors were made with (LOCAL_DATABASE_MODEL,
+ * LOCAL_DATABASE_DTYPE), whatever this client's own index is set to. */
+export function createLocalDatabaseEmbedder(): Embedder {
+  return createLocalEmbedder(LOCAL_DATABASE_MODEL, LOCAL_DATABASE_DTYPE);
+}
+
 /** The in-process pipeline, unconditionally. The child-process embedder falls
  * back to this when its worker cannot start, so it must not go through the
  * provider switch again. */
-function createLocalEmbedder(): Embedder {
+function createLocalEmbedder(model: string = MODEL, dtype: Dtype = DTYPE): Embedder {
   let knownDim: number | undefined;
   const embedToFloat32 = async (texts: string[]) => {
-    const extractor = await getPipe();
+    const extractor = await getPipe(model, dtype);
     // Mean-pool token vectors and L2-normalize → one embedding per text.
     const output = await extractor(texts, { pooling: "mean", normalize: true });
     // `data` is the tensor's backing Float32Array (row-major [n, dim]) - no
@@ -126,8 +152,8 @@ function createLocalEmbedder(): Embedder {
       return knownDim!;
     },
     provider: "local",
-    model: MODEL,
-    dtype: DTYPE,
+    model,
+    dtype,
   };
 }
 
