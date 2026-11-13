@@ -1093,6 +1093,15 @@ export async function syncRepo(opts: IndexOptions): Promise<SyncOutcome> {
   if (!manifest || !prev || !db.listTables().includes(TABLE)) return rebuildRequired("no prior index state");
   if (manifest.vectors === "building") return rebuildRequired(SYNC_REASON_VECTORS_BUILDING);
 
+  // The local index's analyzer: one built under another than the engine's
+  // own is a rebuild - an index from before the engine bump is `ascii_lower`,
+  // which the pinned engine no longer opens, and a build recreates it under
+  // the engine's analyzer.
+  const localAnalyzer = analyzerOf(manifest);
+  if (localAnalyzer !== ENGINE_DEFAULT_ANALYZER) {
+    return rebuildRequired(`analyzer changed (index: ${localAnalyzer}, this engine builds: ${ENGINE_DEFAULT_ANALYZER})`);
+  }
+
   // The local index's vectors: a model switch is a rebuild.
   const hasVectors = manifest.vectors === "ready";
   if (hasVectors) {

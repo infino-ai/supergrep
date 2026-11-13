@@ -13,6 +13,7 @@ import {
   cutFindMatches,
   find,
   findBlocks,
+  findCandidatesSql,
   MAX_FIND_PAGES,
   plainTerms,
   prepareChunks,
@@ -75,7 +76,9 @@ export function replayLog(): number { return 42; }
   // overlapping), so a line in the overlap lives in two chunks. Line 55 is in
   // windows 1-60 and 51-110; line 20 carries analyzer edge cases; lines 30
   // and 40 carry the engine's query-grammar characters as literal text; line
-  // 130 is longer than the excerpt cap with its marker past the cap.
+  // 90 holds an identifier inside a longer dotted token and line 100 LIKE's
+  // wildcards as literal text; line 130 is longer than the excerpt cap with
+  // its marker past the cap.
   const notes = Array.from({ length: 130 }, (_, i) => `filler ${i + 1}`);
   notes[19] = "parse_config(Path) ABC-123 x.y Süd ok";
   notes[29] = "run git -C repo status --max-files 5";
@@ -86,6 +89,8 @@ export function replayLog(): number { return 42; }
   // each line once.
   notes[57] = "BLOCKSEEN early";
   notes[69] = "BLOCKSEEN late";
+  notes[89] = "self.reconcile_tombstone_seqs(ids)";
+  notes[99] = "rate 100%_done";
   notes[129] = "z".repeat(600) + " FAR_MARK " + "z".repeat(300);
   writeFileSync(join(root, "notes.txt"), notes.join("\n") + "\n");
   writeFileSync(join(root, ".gitignore"), "ignored.ts\n");
@@ -109,10 +114,11 @@ describe("indexing", () => {
     const m = handle.manifest;
     expect(m.files).toBe(4); // auth.ts, storage.ts, README.md, notes.txt (.gitignore is not indexable)
     expect(m.vectors).toBe("none");
-    // A local build goes through the binding's bare IndexSpec.fts, which the
-    // pinned engine indexes with its default analyzer; the manifest says so.
-    expect(m.analyzer).toBe("ascii_lower");
-    expect(analyzerOf(m)).toBe("ascii_lower");
+    // A local build names the engine's one analyzer, `standard`, and the
+    // manifest says so.
+    expect(m.analyzer).toBe("standard");
+    expect(analyzerOf(m)).toBe("standard");
+    expect(handle.db.schema(TABLE).fields.find((f) => f.name === "content")?.index).toMatchObject({ kind: "fts", analyzer: "standard" });
     const rows = handle.db.querySql("SELECT DISTINCT path FROM chunks ORDER BY path") as Array<{ path: string }>;
     expect(rows.map((r) => r.path)).not.toContain("ignored.ts");
   });
@@ -128,9 +134,9 @@ describe("indexing", () => {
     // The local table is built through the binding's bare IndexSpec.fts and
     // takes the engine default; the analyzer option describes the platform
     // table, which this index has none of, so a sync is unaffected by it.
-    const out = await syncRepo({ root, db: handle.db, indexDirPath: dir, embedder: fakeEmbedder, analyzer: "standard" });
+    const out = await syncRepo({ root, db: handle.db, indexDirPath: dir, embedder: fakeEmbedder, analyzer: "ascii_lower" });
     expect(out.action).toBe("noop");
-    expect(readManifest(dir)!.analyzer).toBe("ascii_lower");
+    expect(readManifest(dir)!.analyzer).toBe("standard");
     const same = await syncRepo({ root, db: handle.db, indexDirPath: dir, embedder: fakeEmbedder });
     expect(same.action).toBe("noop");
   });
@@ -583,21 +589,67 @@ describe("find", () => {
   });
 
   it("refuses a query the index cannot look up, naming the index's analyzer", async () => {
-    await expect(find(handle, "->")).rejects.toThrow(/ascii_lower analyzer keeps none/);
-    // Under ascii_lower a non-ASCII word is not indexed either.
-    await expect(find(handle, "Süd")).rejects.toThrow(/ascii_lower analyzer keeps none/);
+    await expect(find(handle, "->")).rejects.toThrow(/standard analyzer keeps none/);
     await expect(find(handle, "a\nb")).rejects.toThrow(/newline/);
     await expect(find(handle, "")).rejects.toThrow(/non-empty/);
   });
 
   it("takes the analyzer from the manifest", async () => {
-    // A handle whose manifest records `standard` would accept `Süd`: the
-    // rejection is decided by the recorded analyzer, not a built-in rule. (The
-    // fixture table is ascii_lower, so the engine finds no candidates - the
-    // point is that the client no longer refuses the query.)
-    const std = { ...handle, manifest: { ...handle.manifest, analyzer: "standard" as const } };
-    expect((await find(std, "Süd")).total).toBe(0);
-    await expect(find(std, "->")).rejects.toThrow(/standard analyzer keeps none/);
+    // The fixture table is `standard`, which keeps a non-ASCII word, so `Süd`
+    // is looked up and found. A handle whose manifest records `ascii_lower`
+    // refuses it: the rejection is decided by the recorded analyzer, not a
+    // built-in rule.
+    expect((await find(handle, "Süd")).total).toBe(1);
+    const ascii = { ...handle, manifest: { ...handle.manifest, analyzer: "ascii_lower" as const } };
+    await expect(find(ascii, "Süd")).rejects.toThrow(/ascii_lower analyzer keeps none/);
+    await expect(find(ascii, "->")).rejects.toThrow(/ascii_lower analyzer keeps none/);
+  });
+
+  it("finds an identifier inside a longer token", async () => {
+    // `standard` indexes `self.reconcile_tombstone_seqs` as one token; the
+    // candidate step matches substrings, so the shorter identifier reaches it.
+    const at = (r: Awaited<ReturnType<typeof find>>) => r.matches.map((m) => `${m.path}:${m.line}`);
+    expect(at(await find(handle, "reconcile_tombstone_seqs"))).toEqual(["notes.txt:90"]);
+    expect(at(await find(handle, "tombstone_seqs(ids"))).toEqual(["notes.txt:90"]);
+    // Case-sensitive unless asked: the candidates are case-insensitive, the
+    // literal check is not.
+    expect(at(await find(handle, "RECONCILE_tombstone_seqs"))).toEqual([]);
+    expect(at(await find(handle, "RECONCILE_tombstone_seqs", { ignoreCase: true }))).toEqual(["notes.txt:90"]);
+    // A non-ASCII word is a candidate too.
+    expect(at(await find(handle, "Süd ok"))).toEqual(["notes.txt:20"]);
+  });
+
+  it("reads LIKE's wildcards in a query as literal text", async () => {
+    const at = (r: Awaited<ReturnType<typeof find>>) => r.matches.map((m) => `${m.path}:${m.line}`);
+    expect(at(await find(handle, "100%_done"))).toEqual(["notes.txt:100"]);
+    // The literal check after the candidates would drop a wrong candidate
+    // anyway, so the escaping shows in the statement, not in the matches: a
+    // `_` inside a token (the one wildcard `standard` keeps in one) is matched
+    // as itself.
+    expect(findCandidatesSql("a_b", "standard")).toContain(`"content" ILIKE '%a\\_b%'`);
+  });
+});
+
+describe("an index an earlier version built", () => {
+  // Earlier versions built every local index with `ascii_lower`, which the
+  // pinned engine refuses to open. Until a build replaces it, every door that
+  // reads it says to rebuild. The fixture table is `standard`, so the refusal
+  // comes from the manifest's record, not from the engine; a manifest that
+  // records no analyzer is one written before the analyzer was recorded,
+  // which is `ascii_lower` too.
+  const older = () => ({ ...handle, manifest: { ...handle.manifest, analyzer: "ascii_lower" as const } });
+  const unrecorded = () => {
+    const { analyzer: _analyzer, ...rest } = handle.manifest;
+    return { ...handle, manifest: rest };
+  };
+
+  it("says to run cx index on search, find, sql and read", async () => {
+    for (const h of [older(), unrecorded()]) {
+      await expect(search(h, fakeEmbedder, "session", 3)).rejects.toThrow(/run `cx index` there to rebuild it/);
+      await expect(find(h, "session")).rejects.toThrow(/run `cx index` there to rebuild it/);
+      await expect(runSql(h, fakeEmbedder, "SELECT COUNT(*) AS n FROM chunks")).rejects.toThrow(/run `cx index` there to rebuild it/);
+      await expect(readFiles(h, ["src/auth.ts"], { budget: 10_000 })).rejects.toThrow(/run `cx index` there to rebuild it/);
+    }
   });
 });
 

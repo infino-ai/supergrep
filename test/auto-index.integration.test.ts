@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { connect, type Connection } from "@infino-ai/infino";
 import { indexRepoStaged, type IndexStats } from "../src/core/indexer.js";
 import { readManifest } from "../src/core/manifest.js";
+import { analyzerOf, ENGINE_DEFAULT_ANALYZER } from "../src/core/analyzer.js";
 import { search } from "../src/core/searcher.js";
 import type { IndexHandle } from "../src/core/context.js";
 import type { Embedder } from "../src/core/embedder.js";
@@ -32,7 +33,9 @@ let ctx: RepoCtx;
 const getHandle = (c: RepoCtx): IndexHandle | null => {
   if (!existsSync(c.dir)) return null;
   const manifest = readManifest(c.dir);
-  return manifest ? { root: c.root, dir: c.dir, db: c.db, manifest } : null;
+  if (!manifest) return null;
+  if (manifest.origin !== "hosted" && analyzerOf(manifest) !== ENGINE_DEFAULT_ANALYZER) return null;
+  return { root: c.root, dir: c.dir, db: c.db, manifest };
 };
 const exclusive = (c: RepoCtx, fn: () => Promise<IndexStats>): Promise<IndexStats> | null => {
   if (c.mutation) return null;

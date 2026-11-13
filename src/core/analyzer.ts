@@ -7,23 +7,27 @@
 // whether a query holds anything the index can look up (find rejects a
 // punctuation-only query instead of returning an empty "no matches"), and
 // which analyzer the index has is a property of the table, not of the engine:
-// a local table takes the engine default (ascii_lower), a hosted table takes
-// the platform default for a bare column (standard). The manifest records it;
-// this module mirrors both analyzers so the client's checks agree with the
-// index's own splitting.
+// a local table takes the engine's one analyzer (standard), a hosted table
+// takes the platform default for a bare column (standard). The manifest
+// records it; this module mirrors both analyzers so the client's checks agree
+// with the index's own splitting.
 
 import type { Manifest } from "./manifest.js";
 
-/** The two analyzers the engine ships, by their stored FTS-config names. */
+/** The two analyzers the engine has shipped, by their stored FTS-config
+ * names. */
 export type Analyzer = "ascii_lower" | "standard";
 
-/** The analyzer a local table is built with. The indexer names it on
- * `IndexSpec.fts` rather than taking the engine's default, which moved from
- * `ascii_lower` to `standard` in `@infino-ai/infino` 0.8. A manifest written
- * before the analyzer was recorded describes a table the older engine built
- * with a bare column, which was `ascii_lower`, so a missing `analyzer` reads as
- * this too. */
-export const ENGINE_DEFAULT_ANALYZER: Analyzer = "ascii_lower";
+/** The analyzer a local table is built with. `@infino-ai/infino` 0.11 has one
+ * analyzer, `standard`: it removed `ascii_lower` and refuses to open a table
+ * built with it. A local build names it on `IndexSpec.fts` and records it. */
+export const ENGINE_DEFAULT_ANALYZER: Analyzer = "standard";
+
+/** The analyzer of a local table whose manifest records none: one built
+ * before the analyzer was recorded, by an engine whose bare FTS column was
+ * `ascii_lower`. Not this engine's analyzer: such a table needs a rebuild
+ * (`syncRepo` asks for one), and until then is read as what it is. */
+export const UNRECORDED_LOCAL_ANALYZER: Analyzer = "ascii_lower";
 
 /** The analyzer the platform gives a bare FTS column. A hosted manifest that
  * does not record one (a table created by something other than `cx index
@@ -45,10 +49,11 @@ export const HOSTED_DEFAULT_ANALYZER: Analyzer = "ascii_lower";
 /** The analyzer a manifest's table was built with. Every reader goes through
  * here so the fallback for an absent value lives in one place, and the
  * fallback follows where the table lives: a hosted table's bare column took
- * the platform default, a local one the engine default. */
+ * the platform default, a local one the default of the engine that built it
+ * before the analyzer was recorded (UNRECORDED_LOCAL_ANALYZER). */
 export function analyzerOf(manifest: Pick<Manifest, "analyzer" | "origin">): Analyzer {
   if (manifest.analyzer !== undefined) return manifest.analyzer;
-  return manifest.origin === "hosted" ? PLATFORM_DEFAULT_ANALYZER : ENGINE_DEFAULT_ANALYZER;
+  return manifest.origin === "hosted" ? PLATFORM_DEFAULT_ANALYZER : UNRECORDED_LOCAL_ANALYZER;
 }
 
 /** First code point outside ASCII. `ascii_lower` extends a token run across
