@@ -1102,6 +1102,11 @@ export async function find(handle: IndexHandle, query: string, opts: FindOptions
 // --- sql --------------------------------------------------------------------
 
 const PLACEHOLDER = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
+/** A placeholder written as a whole string literal, `'{{q}}'`: the same
+ * vector as the bare one. A model wrote it so on a demo, and the vector's own
+ * quotes inside it made `''0.03,...''`, an empty string and a bare number the
+ * parser refused. Both paths replace the literal as one. */
+const QUOTED_PLACEHOLDER = /'\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}'/g;
 
 /** The platform's own placeholder - `{{q:"text"}}`, the text embedded with
  * the table's model before the statement runs - is the only name it reads;
@@ -1424,7 +1429,9 @@ export async function applyEmbeds(
     const [vec] = await embedder.embed([embedTextFor(name, embeds)]);
     literals.set(name, `'${vec.join(",")}'`);
   }
-  return sql.replace(PLACEHOLDER, (full, name) => literals.get(name) ?? full);
+  return sql
+    .replace(QUOTED_PLACEHOLDER, (full, name) => literals.get(name) ?? full)
+    .replace(PLACEHOLDER, (full, name) => literals.get(name) ?? full);
 }
 
 /** Read-only guard: one statement, and its first word SELECT or WITH. The
@@ -2092,13 +2099,17 @@ export function foldEmbeds(sql: string, embeds: Record<string, string> | undefin
   const referenced = placeholderNames(sql);
   if (referenced.length === 0) return sql;
   if (!embeds) throw noEmbedMap(referenced);
-  return sql.replace(PLACEHOLDER, (full, name: string) => {
+  const fold = (full: string, name: string): string => {
     const text = embedTextFor(name, embeds);
     if (text.includes(HOSTED_PLACEHOLDER_CLOSE)) {
       throw new Error(`the embed text for {{${name}}} contains ${HOSTED_PLACEHOLDER_CLOSE}, which ends the platform's placeholder`);
     }
     return `${HOSTED_PLACEHOLDER_OPEN}${text}${HOSTED_PLACEHOLDER_CLOSE}`;
-  });
+  };
+  // A quoted placeholder loses its quotes: the platform's vector carries its
+  // own, and a platform that predates reading `'{{q:"..."}}'` as one would
+  // double them.
+  return sql.replace(QUOTED_PLACEHOLDER, fold).replace(PLACEHOLDER, fold);
 }
 
 /** `sql` over the rows of a hosted table: the same read-only guard, then the

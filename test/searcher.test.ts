@@ -361,6 +361,14 @@ const fakeEmbedder: Embedder = {
 };
 
 describe("applyEmbeds", () => {
+  it("reads a placeholder written as a whole literal as the bare one", async () => {
+    // A statement a model wrote on a demo: the quotes doubled the vector's
+    // own into `''0.25,0.5''` before.
+    const sql = "SELECT * FROM vector_search('chunks','embedding', '{{q}}', 5) WHERE label = 'a''b'";
+    const out = await applyEmbeds(sql, { q: "query text" }, fakeEmbedder);
+    expect(out).toBe("SELECT * FROM vector_search('chunks','embedding', '0.25,0.5', 5) WHERE label = 'a''b'");
+  });
+
   it("passes SQL without placeholders through untouched", async () => {
     const sql = "SELECT * FROM chunks";
     expect(await applyEmbeds(sql, undefined, fakeEmbedder)).toBe(sql);

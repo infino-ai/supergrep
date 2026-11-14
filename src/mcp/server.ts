@@ -500,6 +500,15 @@ export const SEVERAL_TABLES_SENTENCE =
   "the question say which table holds what. A column described as holding no value, or whose rows " +
   "come back empty, is not the one: go to the other table.";
 
+/** How to filter a list column of another table. A model compared a related
+ * table's list<large_utf8> column to a string and the engine refused the
+ * statement (2026-11-11); the rule is said once for every list column among
+ * the other tables. */
+export const LIST_COLUMN_SENTENCE =
+  " A column whose type is a list - list<...> in a column list, List(...) on a card - holds several " +
+  "values in each row: test it with array_has(column, 'value') or unnest it, never compare it with = " +
+  "or LIKE as if it were text.";
+
 /** Text columns a tool's text names before counting the rest - the loop's
  * TEXT_COLUMNS_LISTED, the same figure: a table of events carries hundreds
  * of indexed text columns, and naming every one in every tool put tens of
@@ -1349,6 +1358,7 @@ export function siblingsNote(table: string, siblings: TableShape[], unresolved: 
     // call: "it's not forceful enough").
     ` ${JOIN_KEYS_RULE}` +
     ` Also in this database, and joinable with ${table} in one statement: ${described.join("; ")}.` +
+    LIST_COLUMN_SENTENCE +
     // The same sentence the loop reads over several tables: a question may
     // be about any one of them, and a statement over that table alone is
     // the answer when it is.

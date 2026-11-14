@@ -81,7 +81,57 @@ export function aliasesOf(query: string, tables: readonly string[]): Map<string,
       if (!NOT_AN_ALIAS.has(alias.toLowerCase()) && alias.toLowerCase() !== table.toLowerCase()) aliases.set(alias.toLowerCase(), table);
     }
   }
+  // A subquery or a CTE over one table stands for that table: its alias,
+  // the CTE's name and any alias given the CTE are the table's. A join
+  // written between two of them (each table grouped in a subquery, then the
+  // two joined on their key) was refused before, its `e.id = c.id` naming no
+  // table the gate knew (2026-11-10). A subquery or CTE over several tables
+  // stands for none: the join inside it is held to a key on its own.
+  for (const [name, table] of derivedTables(query, tables)) {
+    if (!aliases.has(name)) aliases.set(name, table);
+  }
   return aliases;
+}
+
+/** The single known table each subquery alias and CTE name of a statement
+ * reads, and each alias given such a CTE (`FROM recent r`). Names in
+ * lowercase. */
+function derivedTables(query: string, tables: readonly string[]): Map<string, string> {
+  const derived = new Map<string, string>();
+  const only = (inner: string): string | null => {
+    const named = tablesNamed(inner, tables);
+    return named.length === 1 ? named[0] : null;
+  };
+  const ctes = new Map<string, string>();
+  for (const m of query.matchAll(CTE_START)) {
+    const open = (m.index ?? 0) + m[0].length - 1;
+    const table = only(query.slice(open + 1, groupEnd(query, open) - 1));
+    if (table) ctes.set(m[1].toLowerCase(), table);
+  }
+  for (let i = 0; i < query.length; i++) {
+    const c = query[i];
+    if (c === "'" || c === '"') {
+      const close = query.indexOf(c, i + 1);
+      i = close < 0 ? query.length : close;
+      continue;
+    }
+    if (c !== "(") continue;
+    const end = groupEnd(query, i);
+    const inner = query.slice(i + 1, end - 1);
+    if (!SUBQUERY_START.test(inner)) continue;
+    const alias = /^\s*(?:as\s+)?([A-Za-z_]\w*)/i.exec(query.slice(end))?.[1];
+    const table = only(inner);
+    if (alias && table && !NOT_AN_ALIAS.has(alias.toLowerCase())) derived.set(alias.toLowerCase(), table);
+  }
+  for (const [cte, table] of ctes) {
+    derived.set(cte, table);
+    const aliased = new RegExp(`(?<![\\w.'"])${escapeRegex(cte)}(?![\\w])\\s+(?:as\\s+)?([A-Za-z_]\\w*)`, "gi");
+    for (const m of query.matchAll(aliased)) {
+      const alias = m[1].toLowerCase();
+      if (!NOT_AN_ALIAS.has(alias) && alias !== cte) derived.set(alias, table);
+    }
+  }
+  return derived;
 }
 
 /** A statement or predicate reduced to what its join condition is made of:
@@ -109,6 +159,9 @@ export function predicateHolds(query: string, predicate: string, aliases: Readon
 const SET_OPERATOR = /\b(?:union(?:\s+all)?|intersect|except)\b/gi;
 /** The opening of a subquery inside parentheses. */
 const SUBQUERY_START = /^\s*(?:select|with)\b/i;
+/** A CTE's name and the parenthesis its query opens with: `WITH r AS (`,
+ * `, s AS (`. */
+const CTE_START = /(?:\bwith\s+(?:recursive\s+)?|,\s*)([A-Za-z_]\w*)\s+as\s*\(/gi;
 /** A FROM list that names several sources (`FROM a, b`): a join. */
 const FROM_LIST = /\bfrom\b([\s\S]*?)(?:\bwhere\b|\bgroup\b|\border\b|\blimit\b|\bhaving\b|\bwindow\b|\bqualify\b|$)/gi;
 

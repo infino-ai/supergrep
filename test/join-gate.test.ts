@@ -46,6 +46,29 @@ describe("predicateHolds", () => {
 });
 
 describe("joinGate", () => {
+  it("reads a key written between subqueries and CTEs, each over one table, as the tables' key", async () => {
+    // Each table grouped by its key in a subquery, then the two joined on it.
+    const grouped =
+      "SELECT c.instance_id, c.n, e.logs FROM (SELECT instance_id, count(*) AS n FROM swe_issues GROUP BY instance_id HAVING count(*) > 0) c " +
+      "LEFT JOIN (SELECT instance_id, count(*) AS logs FROM chunks_swelogs WHERE resolved = 'false' GROUP BY instance_id) e " +
+      "ON e.instance_id = c.instance_id ORDER BY c.n DESC LIMIT 40";
+    expect([...aliasesOf(grouped, TABLES)]).toEqual([["c", "swe_issues"], ["e", "chunks_swelogs"]]);
+    expect(await joinGate(grouped, TABLES, keys([BY_ID]).fetch)).toEqual({ kind: "run", tables: ["swe_issues", "chunks_swelogs"], keysAsked: true });
+    const ctes = [
+      "WITH i AS (SELECT instance_id FROM swe_issues), l AS (SELECT instance_id FROM chunks_swelogs) SELECT count(*) FROM i JOIN l ON l.instance_id = i.instance_id",
+      "WITH recent AS (SELECT * FROM chunks_swelogs WHERE resolved = 'false') SELECT r.instance_id FROM swe_issues s JOIN recent r ON r.instance_id = s.instance_id",
+    ];
+    for (const q of ctes) expect((await joinGate(q, TABLES, keys([BY_ID]).fetch)).kind, q).toBe("run");
+    // On another column than the key, the subqueries are refused as tables are.
+    const off = grouped.replace("ON e.instance_id = c.instance_id", "ON e.logs = c.n");
+    expect((await joinGate(off, TABLES, keys([BY_ID]).fetch)).kind).toBe("refuse");
+  });
+
+  it("gives a subquery over several tables no table of its own", () => {
+    const q = "SELECT x.instance_id FROM (SELECT i.instance_id FROM swe_issues i JOIN chunks_swelogs l ON l.instance_id = i.instance_id) x";
+    expect(aliasesOf(q, TABLES).get("x")).toBeUndefined();
+  });
+
   it("lets a one-table statement through without asking for keys", async () => {
     const k = keys([BY_ID]);
     const v = await joinGate("SELECT count(*) FROM chunks_swelogs WHERE resolved = 'false'", TABLES, k.fetch);
