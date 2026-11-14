@@ -1924,14 +1924,15 @@ export function localSearchDescription(tables: readonly LocalTable[], primary: T
   );
 }
 
-/** The `find` text over a local database: the column each table is matched
- * in, and a match as a row. */
+/** The `find` text over a local database: the columns each table is
+ * matched in - every full-text column, as `LocalDatabase.find` matches -
+ * and a match as a row. */
 export function localFindDescription(tables: readonly LocalTable[], primary: TableShape): string {
-  const columns = tables.flatMap(({ shape }) => (shape.primaryText ? [`${shape.table}.${shape.primaryText}`] : []));
+  const columns = tables.flatMap(({ shape }) => shape.textColumns.map((column) => `${shape.table}.${column}`));
   return (
-    `Every row of one table of the local database - its \`table\` input names it, ${primary.table} when absent - whose ` +
-    `full-text column holds every word of an exact string, like grep over a table: complete and unranked, with the ` +
-    `table-wide total. The column matched: ${columns.join(", ")}. ` +
+    `Every row of one table of the local database - its \`table\` input names it, ${primary.table} when absent - with ` +
+    `every word of an exact string in any of its full-text columns, like grep over a table: complete and unranked, ` +
+    `with the table-wide total. The columns matched: ${columns.join(", ")}. ` +
     ROW_FIND_MATCHING +
     "Use it where you would grep: a name, a phrase, an identifier that must appear. Each match is a row: " +
     `${primary.keyColumn}, the scalar columns, and the text columns as snippets. ignoreCase, defines and under ` +
@@ -3924,7 +3925,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         if (over) {
           try {
             const t0 = performance.now();
-            const result = await findRows(over.source.db, over.shape, query, { limit, question });
+            // A local table is matched in every full-text column, as its
+            // search ranks them all (`LocalDatabase.find`).
+            const result = local ? await local.find(over.shape, query, limit) : await findRows(over.source.db, over.shape, query, { limit, question });
             let usage: string | undefined;
             if (receiptOn) {
               const entry = withPlatform(rowFindEntry(result), ctx);
@@ -4189,8 +4192,23 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const localSessions = local && rows ? localTables.some((t) => t.shape.document) : false;
   // Typed as present either way, so the handler reads `table` alike: where
   // the schema has no such input no call's arguments carry one.
+  // Only the tables that hold sessions are offered: one without a session
+  // column has nothing for read to read.
   type ReadTableInput = { table: z.ZodOptional<z.ZodType<string>> };
-  const readTableInput = (localSessions ? { table: TABLE_ARG } : {}) as ReadTableInput;
+  const sessionTables = localTables.filter((t) => t.shape.document).map((t) => t.shape.table);
+  const readTableInput = (
+    localSessions
+      ? {
+          table: z
+            .enum(sessionTables as [string, ...string[]])
+            .optional()
+            .describe(
+              `The table of the local database whose sessions to read - one of ${sessionTables.join(", ")}` +
+                (sessionTables.includes(TABLE) ? `; ${TABLE} when absent.` : "."),
+            ),
+        }
+      : {}
+  ) as ReadTableInput;
   if (mode.kind === "chunks" || (local ? localSessions : rows?.document)) {
     server.registerTool(
       "read",

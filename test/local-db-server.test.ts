@@ -243,7 +243,9 @@ describe("the plugin's database on this machine, served with no account", () => 
     const { tools } = await s.client.listTools();
     for (const name of ["find", "search", "read"]) {
       const schema = tools.find((t) => t.name === name)?.inputSchema as { properties: Record<string, { enum?: string[] }> };
-      expect(schema.properties.table?.enum, name).toEqual(served);
+      // read offers only the tables with sessions: skills has no session_id.
+      const expected = name === "read" ? served.filter((t) => t !== "skills") : served;
+      expect(schema.properties.table?.enum, name).toEqual(expected);
     }
     const sql = tools.find((t) => t.name === "sql")?.description ?? "";
     expect(sql).toContain("its vectors in memory_vectors(row_id, embedding)");
@@ -282,11 +284,13 @@ describe("the plugin's database on this machine, served with no account", () => 
   it("finds every row holding every word, with the table-wide count, in the table named", async () => {
     const found = await call(s, "find", { query: "database migration" });
     expect(found.ok, String(found.value)).toBe(true);
-    expect(found.value).toMatchObject({ table: PRIMARY, column: "content", total: 1, index: "local" });
+    // Every full-text column is matched: conversations' content and
+    // tool_result, skills' description and content.
+    expect(found.value).toMatchObject({ table: PRIMARY, column: "content, tool_result", total: 1, index: "local" });
     expect((found.value as { matches: Hit[] }).matches.map((m) => m.row_id)).toEqual(["c1"]);
     const skill = await call(s, "find", { query: "migration", table: "skills" });
     expect(skill.ok, String(skill.value)).toBe(true);
-    expect(skill.value).toMatchObject({ table: "skills", column: "description", total: 1 });
+    expect(skill.value).toMatchObject({ table: "skills", column: "description, content", total: 1 });
   });
 
   it("runs a statement over any table, and one ranking memory by meaning with {{q}} embedded here", async () => {
@@ -316,6 +320,26 @@ describe("the plugin's database on this machine, served with no account", () => 
     expect(file.total).toBe(3);
     expect(file.lines).toContain("plan the database migration for the orders service");
     expect(file.lines.indexOf("plan the database migration")).toBeLessThan(file.lines.indexOf("I will read the schema first"));
+    // A tool's row reads its result: its content is null, its text is in
+    // tool_result.
+    expect(file.lines).toContain("3: migration 0042 applied");
+  });
+
+  it("finds words a tool returned, in every full-text column, each row counted once", async () => {
+    const tool = await call(s, "find", { query: "migration 0042", table: "conversations" });
+    expect(tool.ok, String(tool.value)).toBe(true);
+    expect(tool.value).toMatchObject({ column: "content, tool_result", total: 1 });
+    expect((tool.value as { matches: Hit[] }).matches.map((m) => m.row_id)).toEqual(["c3"]);
+    // "migration" is in c1's content and c3's tool_result: two rows, once each.
+    const both = await call(s, "find", { query: "migration", table: "conversations" });
+    expect((both.value as { total: number }).total).toBe(2);
+    expect((both.value as { matches: Hit[] }).matches.map((m) => m.row_id).sort()).toEqual(["c1", "c3"]);
+  });
+
+  it("refuses read on a table with no sessions, by its schema", async () => {
+    const { tools } = await s.client.listTools();
+    const schema = tools.find((t) => t.name === "read")?.inputSchema as { properties: Record<string, { enum?: string[] }> };
+    expect(schema.properties.table?.enum).not.toContain("skills");
   });
 
   it("sees what another process wrote after the server started, on the next call", async () => {

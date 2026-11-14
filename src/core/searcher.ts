@@ -1955,6 +1955,16 @@ function passageOf(row: RowRecord, head: RowRecord, document: TableDocument): bo
 
 /** A row's text cell, or "" when it has none. */
 function passageText(row: RowRecord, document: TableDocument): string {
+  // A document of records whose text sits in several columns (a session of
+  // a conversations table: a message's `content`, a tool's `tool_result`)
+  // reads each row as the text of those it holds, so a tool row is not an
+  // empty line.
+  if (document.textColumns && document.textColumns.length > 0) {
+    return document.textColumns
+      .map((column) => row[column])
+      .filter((cell): cell is string => typeof cell === "string" && cell !== "")
+      .join(" ");
+  }
   const cell = row[document.textColumn];
   return typeof cell === "string" ? cell : "";
 }

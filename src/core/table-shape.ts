@@ -107,6 +107,11 @@ export interface TableDocument {
    * default, when the table has it; null for a table with neither, whose rows
    * are read in the order the platform returns them. */
   orderColumn: string | null;
+  /** For a document of records only (no `orderColumn`): the columns a row's
+   * line is read from, each that holds text joined in this order, where a
+   * row's text can sit in more than one (a conversation's message or a
+   * tool's result). Absent, the line is `textColumn`'s. */
+  textColumns?: readonly string[];
 }
 
 /** The chunking a hydrate job's record says it loaded `fields` with, or null

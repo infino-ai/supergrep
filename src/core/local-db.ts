@@ -37,7 +37,8 @@ import { existsSync } from "node:fs";
 import { connect, type Connection, type SchemaField as EngineField } from "@infino-ai/infino";
 import type { Embedder } from "./embedder.js";
 import type { CheckedRows, RowRecord } from "./hosted.js";
-import { applyEmbeds, guardSql, type RowSearchResult } from "./searcher.js";
+import { DEFAULT_FIND_LIMIT, MAX_FIND_LIMIT } from "./config.js";
+import { applyEmbeds, findRows, guardSql, plainTerms, type RowFindResult, type RowHit, type RowSearchResult } from "./searcher.js";
 import { rowHit, SCORE_COLUMN, sqlIdentifier, sqlLiteral, tableShapeFrom, type SchemaField, type TableShape } from "./table-shape.js";
 
 /** The name a table of a base table's vectors carries: the base's name and
@@ -291,6 +292,50 @@ export class LocalDatabase {
     return result(best.filter(({ id }) => rows.has(id)).map(({ id, score }) => ({ ...rows.get(id)!, [SCORE_COLUMN]: score })));
   }
 
+  /** `find` over a local table: every row holding every token of `query` in
+   * any of its full-text columns, as `search` ranks over all of them. A
+   * table with one is `findRows` as the platform's tables have it. With
+   * several - a conversation's `content` and `tool_result` - each column is
+   * matched on its own and the rows are merged by key, the columns in the
+   * table's order; the table-wide total counts each row once, read from the
+   * keys every column matched. */
+  async find(shape: TableShape, query: string, limit: number | undefined): Promise<RowFindResult> {
+    if (shape.textColumns.length <= 1) return findRows(this, shape, query, { limit });
+    const perColumn = await Promise.all(
+      shape.textColumns.map((column) => findRows(this, { ...shape, primaryText: column }, query, { limit })),
+    );
+    const key = shape.keyColumn;
+    const terms = sqlLiteral(plainTerms(query));
+    const keys = new Set<string>();
+    for (const column of shape.textColumns) {
+      const rows = await this.querySql(
+        `SELECT ${sqlIdentifier(key)} FROM token_match(${sqlLiteral(shape.table)}, ${sqlLiteral(column)}, ${terms}, 'and')`,
+      );
+      for (const row of rows) keys.add(String(row[key]));
+    }
+    const seen = new Set<string>();
+    const matches: RowHit[] = [];
+    for (const result of perColumn) {
+      for (const hit of result.matches) {
+        const id = String(hit[key]);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        matches.push(hit);
+      }
+    }
+    // The limit every find applies (each column's findRows checked it).
+    const kept = matches.slice(0, Math.min(limit ?? DEFAULT_FIND_LIMIT, MAX_FIND_LIMIT));
+    return {
+      query,
+      table: shape.table,
+      column: shape.textColumns.join(", "),
+      key,
+      matches: kept,
+      total: keys.size,
+      ...(keys.size > kept.length ? { truncated: true } : {}),
+    };
+  }
+
   /** The query embedded for `vectors`, refused when the embedder's width is
    * not the column's: a vector of another model's width ranks nothing, and
    * one of the same width from another model ranks wrongly in silence. */
@@ -314,7 +359,12 @@ export class LocalDatabase {
  * order) - as it reads a document of a hosted table. */
 function withSessions(shape: TableShape): TableShape {
   if (shape.document || shape.primaryText === "" || !shape.columns.some((c) => c.name === SESSION_COLUMN)) return shape;
-  return { ...shape, document: { pathColumn: SESSION_COLUMN, textColumn: shape.primaryText, orderColumn: null } };
+  // Every full-text column makes a row's line: a tool's row in a
+  // conversation holds its text in `tool_result`, not `content`.
+  return {
+    ...shape,
+    document: { pathColumn: SESSION_COLUMN, textColumn: shape.primaryText, orderColumn: null, textColumns: shape.textColumns },
+  };
 }
 
 /** The vectors of `base` in the table named `name`, when that table exists
