@@ -341,6 +341,32 @@ export function readOnlyEnabled(): boolean {
   return ON_VALUES.includes((process.env.CX_READ_ONLY ?? "").toLowerCase());
 }
 
+/** How much of the account a server with a platform reaches
+ * (CX_ACCOUNT_DATA):
+ * - `account` (the default): every database the key may see, through the
+ *   `tables` and `hydrate` tools and the `database` argument of the query
+ *   tools.
+ * - `database`: its own database only - every table in it, joins between
+ *   them - and none of the account's other databases.
+ * - `table`: the one table it was started for (CX_TABLE, or the code
+ *   index's) and nothing else of its database: the other tables are not
+ *   described, `join_keys` is not offered, and a `sql` statement that names
+ *   one is refused.
+ * Whatever the key could see beyond that, the server does not reach. */
+export type AccountDataScope = "account" | "database" | "table";
+
+/** The scope CX_ACCOUNT_DATA names. `1`/`true`/`yes` read as `account` and
+ * `0`/`false`/`no` as `database`, the switch's first two states. Any other
+ * value stops the server at startup rather than serving more than was
+ * meant. */
+export function accountDataScope(env: NodeJS.ProcessEnv = process.env): AccountDataScope {
+  const value = (env.CX_ACCOUNT_DATA ?? "").trim().toLowerCase();
+  if (value === "" || value === "account" || ON_VALUES.includes(value)) return "account";
+  if (value === "database" || OFF_VALUES.includes(value)) return "database";
+  if (value === "table") return "table";
+  throw new Error(`CX_ACCOUNT_DATA=${value} is not a scope: account, database or table`);
+}
+
 /** Hosted tables beside the primary that `sql` may join (CX_SIBLING_TABLES,
  * comma-separated, default none). Named, the server reads each one's schema
  * at startup and puts it in the sql tool's text with the primary's, and
