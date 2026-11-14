@@ -64,6 +64,26 @@ describe("joinGate", () => {
     expect((await joinGate(off, TABLES, keys([BY_ID]).fetch)).kind).toBe("refuse");
   });
 
+  it("does not read a column renamed inside a subquery or CTE as the table's key", async () => {
+    // Wrapping an off-key join in a subquery that renames a column does not
+    // get it past the gate: the plain form is refused, and so is this.
+    const renamed = [
+      "SELECT c.n FROM (SELECT title AS instance_id, count(*) AS n FROM swe_issues GROUP BY title) c " +
+        "JOIN (SELECT instance_id FROM chunks_swelogs) e ON e.instance_id = c.instance_id",
+      "WITH i AS (SELECT project AS instance_id FROM swe_issues) SELECT count(*) FROM i JOIN chunks_swelogs l ON l.instance_id = i.instance_id",
+      "WITH i AS (SELECT project AS instance_id FROM swe_issues) SELECT count(*) FROM i x JOIN chunks_swelogs l ON l.instance_id = x.instance_id",
+    ];
+    for (const q of renamed) expect((await joinGate(q, TABLES, keys([BY_ID]).fetch)).kind, q).toBe("refuse");
+    expect((await joinGate("SELECT count(*) FROM swe_issues i JOIN chunks_swelogs l ON l.instance_id = i.project", TABLES, keys([BY_ID]).fetch)).kind).toBe("refuse");
+    // The column carried as itself, as `*`, or as `x AS x` still reads as the table's.
+    const carried = [
+      "SELECT c.instance_id FROM (SELECT i.instance_id FROM swe_issues i) c JOIN chunks_swelogs l ON l.instance_id = c.instance_id",
+      "SELECT c.instance_id FROM (SELECT * FROM swe_issues) c JOIN chunks_swelogs l ON l.instance_id = c.instance_id",
+      "WITH i AS (SELECT instance_id AS instance_id FROM swe_issues) SELECT count(*) FROM i JOIN chunks_swelogs l ON l.instance_id = i.instance_id",
+    ];
+    for (const q of carried) expect((await joinGate(q, TABLES, keys([BY_ID]).fetch)).kind, q).toBe("run");
+  });
+
   it("gives a subquery over several tables no table of its own", () => {
     const q = "SELECT x.instance_id FROM (SELECT i.instance_id FROM swe_issues i JOIN chunks_swelogs l ON l.instance_id = i.instance_id) x";
     expect(aliasesOf(q, TABLES).get("x")).toBeUndefined();
