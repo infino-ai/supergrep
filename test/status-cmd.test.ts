@@ -61,6 +61,21 @@ describe("cx status over an index an earlier version built", () => {
     });
   }
 
+  it("with CX_AUTO_INDEX=0 says only to run cx index: the server would not rebuild it", async () => {
+    writeManifest(dir, { ...current, analyzer: "ascii_lower" });
+    process.env.CX_AUTO_INDEX = "0";
+    try {
+      const hook = await printed({ hook: true });
+      expect(hook).toContain("run `cx index` there to rebuild it");
+      expect(hook).not.toContain("the MCP server rebuilds it");
+      const report = await printed({});
+      expect(report).toContain("run `cx index` here to rebuild it");
+      expect(report).not.toContain("the MCP server rebuilds it");
+    } finally {
+      delete process.env.CX_AUTO_INDEX;
+    }
+  });
+
   it("describes a current index as before", async () => {
     const hook = await printed({ hook: true });
     expect(hook).toContain("MCP tools:");

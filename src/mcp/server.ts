@@ -162,7 +162,7 @@ export function pastDeadline(err: unknown): boolean {
   return err instanceof HostedError && err.pastDeadline;
 }
 import { hostedDbFor, localDb, newHostedMemo, platformLabel, platformTableReady, type IndexHandle } from "../core/context.js";
-import { ENGINE_DEFAULT_ANALYZER } from "../core/analyzer.js";
+import { builtByEarlierVersion } from "../core/analyzer.js";
 import { budgetSqlRows, foldValidationFacts, rankRows, sqlBudgetHint } from "../core/facts.js";
 import { HostedError, type HostedDb, type HostedOptions, type PromptCards, type ReadChecks, type RowRecord } from "../core/hosted.js";
 import {
@@ -1929,8 +1929,6 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // this engine's (an earlier version's `ascii_lower`, which the engine no
   // longer opens) reads as no index, so the first query rebuilds it the way
   // it builds a missing one, rather than refusing until the next sync.
-  const builtByEarlierVersion = (manifest: Manifest): boolean =>
-    manifest.origin !== "hosted" && analyzerOf(manifest) !== ENGINE_DEFAULT_ANALYZER;
   const getHandle = (ctx: RepoCtx): IndexHandle | null => {
     if (!existsSync(ctx.dir)) return null;
     const manifest = readManifest(ctx.dir);

@@ -15,7 +15,7 @@ import { connect, type Connection } from "@infino-ai/infino";
 import { indexDir, resolveRoot, TABLE, hostedTarget, hostedLabel, hostedClientOptions } from "./config.js";
 import { readManifest, type Manifest } from "./manifest.js";
 import { HostedDb, type HostedOptions, type HostedTarget } from "./hosted.js";
-import { analyzerOf, ENGINE_DEFAULT_ANALYZER, PLATFORM_DEFAULT_ANALYZER } from "./analyzer.js";
+import { analyzerOf, builtByEarlierVersion, PLATFORM_DEFAULT_ANALYZER } from "./analyzer.js";
 
 // The platform's default analyzer is defined with the analyzers themselves;
 // it is re-exported here because callers that describe the platform table
@@ -94,9 +94,8 @@ export class RebuildRequiredError extends Error {
  * sits beside it. A handle's index built under another analyzer than this
  * engine's is refused with what to do about it (`RebuildRequiredError`). */
 export function localDb(handle: { db: Connection; root?: string; manifest?: Manifest }): Connection {
-  if (handle.manifest && handle.manifest.origin !== "hosted") {
-    const analyzer = analyzerOf(handle.manifest);
-    if (analyzer !== ENGINE_DEFAULT_ANALYZER) throw new RebuildRequiredError(handle.root ?? "this repository", analyzer);
+  if (handle.manifest && builtByEarlierVersion(handle.manifest)) {
+    throw new RebuildRequiredError(handle.root ?? "this repository", analyzerOf(handle.manifest));
   }
   return handle.db;
 }
