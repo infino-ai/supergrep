@@ -56,6 +56,16 @@ export function analyzerOf(manifest: Pick<Manifest, "analyzer" | "origin">): Ana
   return manifest.origin === "hosted" ? PLATFORM_DEFAULT_ANALYZER : UNRECORDED_LOCAL_ANALYZER;
 }
 
+/** Whether a local index was built under another analyzer than this
+ * engine's: an earlier version's `ascii_lower`, which the engine no longer
+ * opens. The one test every reader of the index asks - the query tools
+ * refuse it (`localDb`), the MCP server reads it as no index and rebuilds it,
+ * and `cx status` says so. A hosted table's analyzer is the platform's
+ * business and never makes it one. */
+export function builtByEarlierVersion(manifest: Pick<Manifest, "analyzer" | "origin">): boolean {
+  return manifest.origin !== "hosted" && analyzerOf(manifest) !== ENGINE_DEFAULT_ANALYZER;
+}
+
 /** First code point outside ASCII. `ascii_lower` extends a token run across
  * such characters and then drops the whole run. */
 const NON_ASCII_MIN = 0x80;
