@@ -82,6 +82,6 @@ copy of the data. Try it live at https://infino.ai/supergrep.
   every sync updates both copies.
 - Config via env: `CX_ROOT`, `CX_INDEX_DIR`, `CX_AUTO_INDEX`, `CX_AUTO_SYNC`,
   `CX_SYNC_INTERVAL_SECS`, `CX_NO_EMBED`, `CX_MAX_FILES`,
-  `CX_MAX_FILE_BYTES`, `CX_TABLE`, `CX_TEXT_COLUMN`. Platform settings are
+  `CX_MAX_FILE_BYTES`, `CX_TABLE`, `CX_ACCOUNT_DATA`. Platform settings are
   command-line flags on `cx index` and `cx mcp`; see
   [the reference](docs/reference.md).
