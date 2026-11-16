@@ -202,7 +202,11 @@ export function fakePlatform(tables: string[] = [], failOn?: string, loadState =
           const files = (call.json as { files: Array<{ name: string }> }).files;
           return respond({ upload: "u1", prefix: "_source/u1/", files: files.map((f, i) => ({ name: f.name, url: `${STORAGE}/u1/${i}` })) }, true);
         }
-        if (call.method === "GET") return respond({ state: loadState, ...(loadState === "failed" ? { error: "the load failed" } : {}) });
+        if (call.method === "GET") {
+          // The record names its request's source, as the platform's does.
+          const source = (loads.at(-1) as { source?: unknown } | undefined)?.source;
+          return respond({ job: `hydrate/${TARGET.database}/${TABLE}`, state: loadState, ...(source ? { request: { source } } : {}), ...(loadState === "failed" ? { error: "the load failed" } : {}) });
+        }
         if (call.method === "DELETE") {
           // An ended load's record is cleared; with none, there is nothing to clear.
           return loads.length > 0 ? new Response(null, { status: 200 }) : new Response(JSON.stringify({ error: "no job" }), { status: 404 });
@@ -395,9 +399,17 @@ describe("a build with a platform database (client vectors)", () => {
   it("a first build into a database the account does not have yet registers it, then builds", async () => {
     writeSmallFixture(root);
     const platform = fakePlatform([], undefined, "succeeded", false);
-    const stats = await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
+    const stats = await indexRepo({ root, db, hosted: platform.db(), registerDatabase: true, indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
     expect(stats.hostedError).toBeUndefined();
     expect(platform.ops()).toEqual(["list_tables", "databases", "list_tables", "create_table", "append"]);
+  });
+
+  it("a build into a database --db named that the platform does not have fails its load and registers nothing", async () => {
+    writeSmallFixture(root);
+    const platform = fakePlatform([], undefined, "succeeded", false);
+    const stats = await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
+    expect(stats.hostedError).toBeDefined();
+    expect(platform.ops()).toEqual(["list_tables"]);
   });
 
   it("names the analyzer it was given to the platform and records it in the platform manifest only", async () => {

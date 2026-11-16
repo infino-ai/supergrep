@@ -111,15 +111,25 @@ export async function loadRows(hosted: HostedDb, opts: LoadOptions): Promise<Loa
     ...(opts.ifExists === "append" ? { if_exists: "append" } : {}),
   });
   const job = String(answer.job ?? opts.table);
-  const record = await waitForLoad(hosted, opts.table, opts);
+  const record = await waitForLoad(hosted, opts.table, prefix, opts);
   return { job, prefix, record };
 }
 
-/** Wait until `table`'s load job has ended: its record when its rows
- * landed, a throw when it failed, stopped, or outlasted the wait. */
+/** Wait until the load of `table` from the upload at `prefix` has ended: its
+ * record when its rows landed, a throw when it failed, stopped, or outlasted
+ * the wait.
+ *
+ * A table keeps one load record, and a job's name is the table's own
+ * (`hydrate/<account>/<database>/<table>`), the same for every load of it, so
+ * the name cannot tell this load's record from the one an earlier load of the
+ * table left. The upload's prefix can: each upload has its own, and a record
+ * names its request's source. A record of another source is an earlier load's,
+ * and is read again until this one's replaces it. A record that names no
+ * source prefix is taken as this load's. */
 export async function waitForLoad(
   hosted: Pick<HostedDb, "hydrateJob">,
   table: string,
+  prefix: string,
   opts: Pick<LoadOptions, "pollMs" | "waitMs" | "sleep"> = {},
 ): Promise<RowRecord> {
   const pollMs = opts.pollMs ?? DEFAULT_POLL_MS;
@@ -128,6 +138,11 @@ export async function waitForLoad(
   const deadline = Date.now() + waitMs;
   for (;;) {
     const record = await hosted.hydrateJob(table);
+    if (!loadsFrom(record, prefix)) {
+      if (Date.now() >= deadline) throw new Error(`the platform never showed the load of ${table} from ${prefix} within ${Math.round(waitMs / 1000)} s`);
+      await sleep(pollMs);
+      continue;
+    }
     const state = typeof record?.state === "string" ? record.state : "";
     if (LANDED_STATES.has(state)) return record;
     if (!LIVE_LOAD_STATES.has(state)) {
@@ -137,4 +152,15 @@ export async function waitForLoad(
     if (Date.now() >= deadline) throw new Error(`the platform load of ${table} was still ${state} after ${Math.round(waitMs / 1000)} s`);
     await sleep(pollMs);
   }
+}
+
+/** Whether `record` is of a load from the upload at `prefix`: its request's
+ * source prefix ends with it, trailing slashes aside (the platform may
+ * store the prefix resolved under the database's root), or it names none. */
+function loadsFrom(record: RowRecord | null | undefined, prefix: string): boolean {
+  const request = record?.request as RowRecord | undefined;
+  const source = request?.source as RowRecord | undefined;
+  const from = source?.prefix;
+  const bare = (p: string) => p.replace(/\/+$/, "");
+  return typeof from !== "string" || bare(from).endsWith(bare(prefix));
 }
