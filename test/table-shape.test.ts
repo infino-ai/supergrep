@@ -362,6 +362,15 @@ describe("the doors over rows", () => {
     expect(calls[1]).toHaveLength(6);
   });
 
+  it("code search returns one hit per chunk when a load cut a chunk into passages", async () => {
+    const passage = (score: number) => ({ path: "a.ts", start_line: 10, end_line: 60, lang: "ts", symbol: "f", content: "x", score });
+    const hosted = {
+      hybridSearch: async () => [passage(0.9), passage(0.8), { ...passage(0.5), path: "b.ts" }],
+    };
+    const result = await searchHosted(hosted, "f", 3);
+    expect(result.hits.map((h) => h.path)).toEqual(["a.ts", "b.ts"]);
+  });
+
   it("find with the question fetches the rerank pool for the grader and asks for its limit; without one it fetches the limit", async () => {
     const asked: Array<{ sql: string; checks: unknown }> = [];
     const hosted = {

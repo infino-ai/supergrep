@@ -121,15 +121,23 @@ interface Call {
 
 type Row = Record<string, unknown>;
 
+const STORAGE = "https://storage.example.test";
 /** A platform database with one table registry and a row mirror of the chunks
  * table (path and lang only - enough to answer the sync's recount), driven by
  * op. Every write response carries a write-tokens header. `failOn` makes one
- * op answer 500, to see what a platform failure leaves behind. */
-export function fakePlatform(tables: string[] = [], failOn?: string, databaseExists = true) {
+ * op answer 500, to see what a platform failure leaves behind. Loads from
+ * this machine's disk are answered too: an upload opens one session per file on STORAGE, whose
+ * `PUT` keeps the bytes; a submitted load takes the rows of the last upload
+ * into the mirror (all of them for `replace`, added for `append`); and a
+ * load's record reports `loadState`. The schema names the platform's
+ * embedding `emb`. */
+export function fakePlatform(tables: string[] = [], failOn?: string, loadState = "succeeded", databaseExists = true, passages = 1) {
   const calls: Call[] = [];
   let registered = databaseExists;
   const live = new Set(tables);
   let rows: Row[] = [];
+  let uploaded = "";
+  const loads: Row[] = [];
 
   const respond = (value: unknown, write = false): Response =>
     new Response(JSON.stringify(value), {
@@ -142,6 +150,11 @@ export function fakePlatform(tables: string[] = [], failOn?: string, databaseExi
 
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input);
+    if (url.startsWith(STORAGE)) {
+      uploaded = await new Response(init?.body as BodyInit).text();
+      calls.push({ op: "storage", url, method: init?.method ?? "PUT", headers: {} });
+      return new Response(null, { status: 200 });
+    }
     const op = url.split("/v1/")[1].split(/[/?]/)[0];
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries((init?.headers ?? {}) as Record<string, string>)) headers[k.toLowerCase()] = v;
@@ -156,9 +169,6 @@ export function fakePlatform(tables: string[] = [], failOn?: string, databaseExi
     }
 
     switch (op) {
-      case "databases":
-        registered = true;
-        return respond({ name: TARGET.database }, true);
       case "list_tables":
         return respond([...live]);
       case "drop_table":
@@ -171,7 +181,7 @@ export function fakePlatform(tables: string[] = [], failOn?: string, databaseExi
         return respond({}, true);
       case "append": {
         const appended: Row[] = call.ipc
-          ? call.ipc.toArray().map((r) => ({ path: String(r.path), lang: String(r.lang) }))
+          ? call.ipc.toArray().map((r) => ({ path: String(r.path), lang: String(r.lang), start_line: Number(r.start_line) }))
           : (call.json as { data: Row[] }).data;
         rows.push(...appended);
         return respond({}, true);
@@ -184,14 +194,48 @@ export function fakePlatform(tables: string[] = [], failOn?: string, databaseExi
         const n = before - rows.length;
         return respond({ matched: n, n_tombstoned: n, n_not_found: 0 }, true);
       }
+      case "databases":
+        registered = true;
+        return respond({ name: TARGET.database }, true);
+      case "hydrate": {
+        if (new URL(url).pathname.endsWith("/uploads")) {
+          const files = (call.json as { files: Array<{ name: string }> }).files;
+          return respond({ upload: "u1", prefix: "_source/u1/", files: files.map((f, i) => ({ name: f.name, url: `${STORAGE}/u1/${i}` })) }, true);
+        }
+        if (call.method === "GET") return respond({ state: loadState, ...(loadState === "failed" ? { error: "the load failed" } : {}) });
+        if (call.method === "DELETE") {
+          // An ended load's record is cleared; with none, there is nothing to clear.
+          return loads.length > 0 ? new Response(null, { status: 200 }) : new Response(JSON.stringify({ error: "no job" }), { status: 404 });
+        }
+        const load = call.json as { table: string; if_exists?: string };
+        loads.push(load as unknown as Row);
+        live.add(load.table);
+        for (const line of uploaded.split("\n")) {
+          if (line === "") continue;
+          const r = JSON.parse(line) as Row;
+          // The platform may cut a chunk into passages: a row each, all with
+          // the chunk's path and first line.
+          for (let i = 0; i < passages; i++) rows.push({ path: r.path, lang: r.lang, start_line: r.start_line });
+        }
+        return respond({ job: `hydrate/${load.table}`, state: "pending" }, true);
+      }
+      case "schema":
+        return respond([...TEXT_COLUMNS, { name: "emb", type: "embedding", source: ["content"] }]);
+      case "table_card":
+        return new Response("no card yet", { status: 404 });
+      case "vector_search":
+        return respond([]);
       case "query_sql": {
         const sql = (call.json as { query: string }).query;
+        // COUNT(DISTINCT path || ':' || start_line) counts chunks, COUNT(*) rows.
+        const byChunk = sql.includes("COUNT(DISTINCT path ||");
+        const counted = byChunk ? [...new Map(rows.map((r) => [`${r.path}:${r.start_line}`, r])).values()] : rows;
         if (sql.includes("GROUP BY lang")) {
           const byLang = new Map<string, number>();
-          for (const r of rows) byLang.set(String(r.lang), (byLang.get(String(r.lang)) ?? 0) + 1);
+          for (const r of counted) byLang.set(String(r.lang), (byLang.get(String(r.lang)) ?? 0) + 1);
           return respond([...byLang].map(([lang, n]) => ({ lang, n })));
         }
-        return respond([{ n: rows.length, f: new Set(rows.map((r) => r.path)).size }]);
+        return respond([{ n: counted.length, f: new Set(rows.map((r) => r.path)).size }]);
       }
       default:
         return new Response(`unexpected op ${op}`, { status: 400 });
@@ -203,6 +247,10 @@ export function fakePlatform(tables: string[] = [], failOn?: string, databaseExi
     calls,
     ops: () => calls.map((c) => c.op),
     rows: () => rows,
+    /** The loads submitted, in order. */
+    loads,
+    /** The bytes of the last upload. */
+    uploaded: () => uploaded,
     db: () => new HostedDb(TARGET, { fetch: fetchImpl }),
   };
 }
@@ -345,7 +393,7 @@ describe("a build with a platform database (client vectors)", () => {
 
   it("a first build into a database the account does not have yet registers it, then builds", async () => {
     writeSmallFixture(root);
-    const platform = fakePlatform([], undefined, false);
+    const platform = fakePlatform([], undefined, "succeeded", false);
     const stats = await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
     expect(stats.hostedError).toBeUndefined();
     expect(platform.ops()).toEqual(["list_tables", "databases", "list_tables", "create_table", "append"]);
@@ -424,7 +472,7 @@ describe("a build with a platform database (client vectors)", () => {
 });
 
 describe("a build with a platform database (the platform embeds)", () => {
-  it("declares an embedding column the platform fills, appending JSON rows without it; the local index stays keyword-only regardless of an embedder passed in", async () => {
+  it("declares an embedding column the platform fills and loads the chunks into it by one load job; the local index stays keyword-only regardless of an embedder passed in", async () => {
     writeSmallFixture(root);
     const platform = fakePlatform([TABLE]);
     const phases: string[] = [];
@@ -448,17 +496,20 @@ describe("a build with a platform database (the platform embeds)", () => {
     // it would be a 400.
     expect(created.indexes).toEqual({ fts: [{ column: "content", analyzer: "ascii_lower" }] });
 
-    const appends = platform.calls.filter((c) => c.op === "append");
-    expect(appends).toHaveLength(1);
-    expect(appends[0].headers["content-type"]).toBe("application/json");
-    expect(appends[0].ipc).toBeUndefined();
-    const { data } = appends[0].json as { data: Row[] };
+    // A build's chunks go in one load job from this machine's disk, appended to
+    // the table just created (which keeps its columns and indexes); no append.
+    expect(platform.calls.filter((c) => c.op === "append")).toHaveLength(0);
+    const ops = platform.ops();
+    expect(ops.indexOf("create_table")).toBeLessThan(ops.indexOf("storage"));
+    expect(platform.loads).toHaveLength(1);
+    expect(platform.loads[0]).toMatchObject({ table: TABLE, format: "ndjson", if_exists: "append" });
+    const data = platform.uploaded().trim().split("\n").map((l) => JSON.parse(l) as Row);
     expect(data).toHaveLength(stats.chunks);
     for (const row of data) {
       expect(Object.keys(row).sort()).toEqual([...TEXT_FIELDS].sort());
       expect(row).not.toHaveProperty("embedding");
     }
-    expect(stats.hosted!.appendCalls).toBe(1);
+    expect(stats.hosted!.appendCalls).toBe(0);
 
     // The local manifest never records an embedder any more - only the
     // platform's, since only the platform's copy ever gets vectors.

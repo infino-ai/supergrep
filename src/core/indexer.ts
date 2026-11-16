@@ -88,6 +88,7 @@ import {
 import { EMBEDDING_COLUMN, PLATFORM_EMBEDDER_MODEL, PLATFORM_EMBEDDER_PROVIDER } from "./context.js";
 import { HostedError, rowsToIpc, type HostedDb, type HostedIndexes, type JsonColumn } from "./hosted.js";
 import { createDatabase } from "./account-api.js";
+import { loadRows, writeRows, type TextRow } from "./platform-load.js";
 import {
   diffFiles,
   emptyFileState,
@@ -660,7 +661,10 @@ async function loadPlatform(
   }
   await hosted.createTable(TABLE, columns, indexes);
   meterHostedCall(meter, hosted);
-  if (chunkCount > 0) await appendSpillHosted(hosted, spill, chunkCount, columns, dim, platform, meter, onProgress);
+  // Where the platform embeds, a build's chunks go in one load job (loadSpill);
+  // with client vectors, in append waves that carry them.
+  if (chunkCount > 0 && platform) await loadSpill(hosted, spill);
+  else if (chunkCount > 0) await appendSpillHosted(hosted, spill, chunkCount, columns, dim, platform, meter, onProgress);
 
   const loadStats: HostedLoadStats = { ...meter, loadWallMs: Math.round(performance.now() - tLoad) };
   const embedderInfo = platform
@@ -673,6 +677,19 @@ async function loadPlatform(
     toManifest({ ...stats, vectors: platform || dim !== undefined ? "ready" : "none", hosted: loadStats }, analyzer, embedderInfo, "hosted"),
   );
   return loadStats;
+}
+
+/** Load a build's spilled chunks into the table just created, by one load
+ * job from this machine's disk (platform-load.ts), and wait for it; the rows
+ * file is removed either way. */
+async function loadSpill(hosted: HostedDb, spill: Spill): Promise<void> {
+  const rowsPath = spill.chunksPath.replace(/\.chunks\.ndjson$/, ".rows.ndjson");
+  try {
+    await writeRows(spill.chunksPath, rowsPath, toTextRow as (chunk: never) => TextRow);
+    await loadRows(hosted, { table: TABLE, rowsPath, ifExists: "append" });
+  } finally {
+    rmSync(rowsPath, { force: true });
+  }
 }
 
 /** The platform database's tables. A first build may name a database the
@@ -1314,7 +1331,7 @@ export async function syncRepo(opts: IndexOptions): Promise<SyncOutcome> {
       // fails leaves the sync unrecorded and re-applied, never a table that is
       // current with a manifest that is not.
       if (hosted && platformManifest) {
-        platformCounts = await Promise.all([hosted.querySql(TABLE_COUNTS_SQL), hosted.querySql(TABLE_LANGUAGES_SQL)]);
+        platformCounts = await Promise.all([hosted.querySql(PLATFORM_COUNTS_SQL), hosted.querySql(PLATFORM_LANGUAGES_SQL)]);
       }
     } catch (err) {
       // One or both tables may hold part of this diff. Mark every touched
@@ -1396,6 +1413,12 @@ async function applyPlatformDiff(
 /** The recount a sync writes back to a manifest. */
 const TABLE_COUNTS_SQL = `SELECT COUNT(*) AS n, COUNT(DISTINCT path) AS f FROM ${TABLE}`;
 const TABLE_LANGUAGES_SQL = `SELECT lang, COUNT(*) AS n FROM ${TABLE} GROUP BY lang`;
+/** The platform table's recount: a build's load may cut a chunk into
+ * passages, each a row with the chunk's path and first line, so chunks are
+ * counted by those, not by rows. */
+const CHUNK_KEY = `path || ':' || CAST(start_line AS VARCHAR)`;
+const PLATFORM_COUNTS_SQL = `SELECT COUNT(DISTINCT ${CHUNK_KEY}) AS n, COUNT(DISTINCT path) AS f FROM ${TABLE}`;
+const PLATFORM_LANGUAGES_SQL = `SELECT lang, COUNT(DISTINCT ${CHUNK_KEY}) AS n FROM ${TABLE} GROUP BY lang`;
 
 /** The manifest fields a recount refreshes, from the two queries' rows. An
  * empty counts result (a table with no rows can answer with none) is zero. */

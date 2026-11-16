@@ -173,7 +173,13 @@ stack.
 - **Index:** [infino](https://github.com/infino-ai/infino) tables - BM25 and
   IVF vector indexes over a single copy of the data - queried in-process
   through the Node binding locally, and the same table on an Infino platform
-  database for `search`, written by the same builds and syncs.
+  database for `search`, written by the same builds and syncs. Where the
+  platform embeds (the default), a build creates the table and loads all its
+  chunks in one load job from this machine's disk (the `hydrate` tool's
+  upload path), which embeds them across the platform's hosts at once; a
+  sync deletes the changed files' rows and appends their new chunks, which
+  answers in under a second. A load may cut a long chunk into passages;
+  `search` returns one hit per chunk.
 - **Embeddings:** computed on the platform, with its own model, so the
   compute-heavy stage never runs on your laptop; `--embed-provider local`
   embeds on this machine and ships the vectors instead.
