@@ -304,6 +304,18 @@ describe("openForIndexing", () => {
     expect(platformLabel(target.hosted!)).toBe(URL);
     expect(fake.calls).toHaveLength(0);
   });
+
+  it("yields the local connection alone with a database under CX_PLATFORM_READ_ONLY: a build writes no platform table", () => {
+    withPlatform();
+    process.env.CX_PLATFORM_READ_ONLY = "1";
+    try {
+      const target = openForIndexing(root);
+      expect(target.db).toBeDefined();
+      expect(target.hosted).toBeUndefined();
+    } finally {
+      delete process.env.CX_PLATFORM_READ_ONLY;
+    }
+  });
 });
 
 // --- the platform table's readiness ------------------------------------------------------

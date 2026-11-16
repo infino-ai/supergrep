@@ -183,7 +183,7 @@ export function hostedSettingsFromFlags(
       return null;
     }
     baseUrl = stored.baseUrl.replace(/\/+$/, "");
-    database = databaseNameFor(fallback.accountRoot!);
+    database = databaseOverride(env) ?? databaseNameFor(fallback.accountRoot!);
     apiKey = key;
     account = { baseUrl, apiKey };
   } else {
@@ -296,6 +296,27 @@ export function hostedAnalyzer(): Analyzer | undefined {
  * places and are never allowed to differ. */
 export function autoIndexEnabled(): boolean {
   return !OFF_VALUES.includes((process.env.CX_AUTO_INDEX ?? "").toLowerCase());
+}
+
+/** The database the stored account's platform tools use for this
+ * repository (CX_DATABASE), instead of the one named from its directory:
+ * a checkout that reads a shared index - one repository's default branch,
+ * kept current by its own pushes - names that index's database. Unset or
+ * empty, the database is named from the directory, as before. */
+export const DATABASE_ENV = "CX_DATABASE";
+export function databaseOverride(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const name = (env[DATABASE_ENV] ?? "").trim();
+  return name === "" ? undefined : name;
+}
+
+/** Whether builds and syncs leave the platform table alone
+ * (CX_PLATFORM_READ_ONLY, default off): the local index is built and synced
+ * as always, and nothing is loaded into, or deleted from, the platform's
+ * copy, which `search` still reads. A checkout reading a shared index
+ * (CX_DATABASE) sets it, so its own changes never reach the index every
+ * other checkout reads. */
+export function platformReadOnly(): boolean {
+  return ON_VALUES.includes((process.env.CX_PLATFORM_READ_ONLY ?? "").toLowerCase());
 }
 
 /** Whether queries re-sync the index against the working tree (CX_AUTO_SYNC,
@@ -519,6 +540,21 @@ export const DEFAULT_CAPS: IndexCaps = {
 /** Rows per engine append - each append is one atomic commit, so the table
  * becomes searchable as soon as the first batch lands. */
 export const APPEND_BATCH = 512;
+
+/** The fewest chunks a write to a platform-embedded table sends by one load
+ * job rather than by appends (CX_LOAD_JOB_MIN_CHUNKS). An append answers at
+ * once and embeds about 18 rows a second (APPEND_BATCH rows took about 27 s
+ * each); a load job takes about 30 s before it starts, then embeds about 75
+ * rows a second across the platform's hosts. They cross at about 700 chunks:
+ * below that a write is appended, from that up it is loaded (measured on the
+ * platform, 2026-11-16: 9,281 chunks appended in 8 min 34 s, loaded in
+ * 124 s; 5 rows appended in 0.6 s, loaded in 35 s). */
+export const DEFAULT_LOAD_JOB_MIN_CHUNKS = 700;
+
+export function loadJobMinChunks(): number {
+  const n = Number(process.env.CX_LOAD_JOB_MIN_CHUNKS);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_LOAD_JOB_MIN_CHUNKS;
+}
 
 /** Chunks embedded per model call. */
 export const EMBED_BATCH = 32;

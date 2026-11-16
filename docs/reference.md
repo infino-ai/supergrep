@@ -99,7 +99,10 @@ network.
 | `CX_SYNC_INTERVAL_SECS` | 30 | auto-sync debounce between staleness checks |
 | `CX_NO_EMBED` | off | keyword-only mode (with `--db`, the platform copy is keyword-only too) |
 | `CX_NO_RECEIPT` | off | `1` turns off usage accounting - the per-call receipt on results and the `cx usage` ledger |
+| `CX_LOAD_JOB_MIN_CHUNKS` | `700` | the fewest chunks a write to a platform-embedded table sends by one load job instead of appends: a load job takes about 30 s to start and then embeds several times faster |
 | `CX_TABLE` | `chunks` | the hosted table the server reads, for a table loaded from object storage rather than built by `cx index` |
+| `CX_DATABASE` | the directory's name | on the stored account, the database this repository's platform tools use: a checkout reading a shared index (one repository's default branch) names it |
+| `CX_PLATFORM_READ_ONLY` | off | builds and syncs keep the local index alone and leave the platform's chunks table as it is, which the MCP `search` tool still reads (`cx search` reads the local index), and the server registers no database; set with `CX_DATABASE` on a checkout reading a shared index. It covers the chunks table only: the memory hooks still write to the database, and the account's data tools (`hydrate`, `hydrate_cancel`) still load into the database they name |
 | `CX_LOCAL_DB` | unset | a folder holding an Infino database that another process writes (an agent's memory plugin, for example): the MCP server's `find`, `search`, `sql` and `read` run over its tables on this machine, with no account and no code index. `CX_TABLE` names the table a call reads when it names none; unset, `memory` when the database holds it, else its first table. A stored login is set aside; `--db` beside it is refused |
 | `CX_ACCOUNT_DATA` | `account` | how much of the account the server reaches: `account`, `database` or `table` (see [Building on SuperGrep](plugins.md)) |
 
@@ -122,6 +125,9 @@ cx search <query>         exact terms + meaning, one ranked pass           (-k h
 cx sql <statement>        read-only SQL; --embed q="text" fills {{q}}
 cx status                 what the index holds, how fresh, vector readiness
 cx usage                  ledger of queries run and what each returned  (-n, --all, --clear, --json)
+cx chunk                  cut text into the chunks an index would hold: JSON lines {id, path, text} in,
+                          one JSON line per chunk out {id, chunk, start_line, end_line, content, symbol?, kind?, scope?};
+                          path picks how (definitions, headings, records, lines)
 cx mcp                    serve the MCP tools over stdio
 cx index --db <url>       also keep the index on an Infino platform database  (--api-key-file, --embed-provider, --analyzer)
 cx mcp --db <url>         also serve search over that copy                 (--api-key-file)
@@ -170,7 +176,13 @@ stack.
 - **Index:** [infino](https://github.com/infino-ai/infino) tables - BM25 and
   IVF vector indexes over a single copy of the data - queried in-process
   through the Node binding locally, and the same table on an Infino platform
-  database for `search`, written by the same builds and syncs.
+  database for `search`, written by the same builds and syncs. Where the
+  platform embeds (the default), a write of many chunks (a build, or a large
+  sync) goes in one load job from this machine's disk (the `hydrate` tool's
+  upload path), which embeds them across the platform's hosts at once; a
+  write of fewer than `CX_LOAD_JOB_MIN_CHUNKS` (700) is appended, which
+  answers at once. A sync deletes the changed files' rows first. A load may
+  cut a long chunk into passages; `search` returns one hit per chunk.
 - **Embeddings:** computed on the platform, with its own model, so the
   compute-heavy stage never runs on your laptop; `--embed-provider local`
   embeds on this machine and ships the vectors instead.

@@ -16,7 +16,17 @@ import { watch } from "node:fs";
 import { openForIndexing, platformLabel } from "../core/context.js";
 import { indexRepoStaged, syncRepo, type IndexOptions, type IndexStats, type SyncResult } from "../core/indexer.js";
 import { createEmbedder, createIndexingEmbedder, embedderInfo, platformEmbedderInfo } from "../core/embedder.js";
-import { DEFAULT_CAPS, INDEX_DIR_NAME, embedProvider, hostedAnalyzer, type EmbedProvider } from "../core/config.js";
+import {
+  DEFAULT_CAPS,
+  INDEX_DIR_NAME,
+  embedProvider,
+  hostedAccount,
+  hostedAnalyzer,
+  hostedLabel,
+  hostedTarget,
+  platformReadOnly,
+  type EmbedProvider,
+} from "../core/config.js";
 import { HOSTED_DEFAULT_ANALYZER, analyzerOf } from "../core/analyzer.js";
 import { readPlatformManifest } from "../core/manifest.js";
 import { lockIndex, tryLockIndex } from "../core/index-lock.js";
@@ -247,6 +257,9 @@ export async function indexCmd(path: string | undefined, opts: IndexCmdOptions):
     root,
     db,
     hosted,
+    // A database the stored account names is registered on a first build; one
+    // --db named is not.
+    registerDatabase: hostedAccount() !== null,
     indexDirPath: dir,
     embedder,
     embedProvider: provider,
@@ -274,6 +287,11 @@ export async function indexCmd(path: string | undefined, opts: IndexCmdOptions):
       const recorded = readPlatformManifest(dir);
       const shown = analyzer ?? (recorded ? analyzerOf(recorded) : HOSTED_DEFAULT_ANALYZER);
       console.log(dim(`platform table: ${platformLabel(hosted)} · analyzer: ${shown} · embedder: ${platformEmbedding}`));
+    } else {
+      const readOnly = hostedTarget();
+      if (readOnly && platformReadOnly()) {
+        console.log(dim(`platform table: ${hostedLabel(readOnly)} left as it is (CX_PLATFORM_READ_ONLY) · this builds the local index only`));
+      }
     }
   }
 

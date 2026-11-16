@@ -23,6 +23,7 @@ import { HOOK_MEMORY, HOOK_MEMORY_SEND, hookCmd, type HookCmdOptions } from "./c
 import { loginCmd, type LoginCmdOptions } from "./commands/login-cmd.js";
 import { findCmd, searchCmd, sqlCmd, statusCmd, usageCmd } from "./commands/query-cmds.js";
 import { savingsCmd } from "./commands/savings-cmd.js";
+import { chunkCmd } from "./commands/chunk-cmd.js";
 import {
   DEFAULT_SEARCH_K,
   DEFAULT_FIND_LIMIT,
@@ -175,6 +176,14 @@ program
   .option("--hook", "one-line output for a SessionStart hook (silent when unindexed)")
   .option("-C, --path <dir>", "repo root (default: current directory)")
   .action(statusCmd);
+
+program
+  .command("chunk")
+  .description(
+    "cut text into the chunks an index of it would hold: JSON lines {id, path, text} on stdin, " +
+      "one JSON line per chunk {id, chunk, start_line, end_line, content, symbol?, kind?, scope?} on stdout; path picks how it is cut",
+  )
+  .action(() => chunkCmd());
 
 program
   .command("usage")

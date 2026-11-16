@@ -554,6 +554,19 @@ export class HostedDb {
     this.checkedReadTimeoutMs = opts.checkedReadTimeoutMs ?? CHECKED_READ_TIMEOUT_MS;
   }
 
+  /** The fetch this client's calls go through (a test's scripted one), for a
+   * call of the account plane about this client's database. */
+  fetchFn(): typeof fetch {
+    return this.fetchImpl;
+  }
+
+  /** `PUT` one file's bytes to the upload session `url` that
+   * [`openUploads`] opened for it ([`uploadBytes`]), through this client's
+   * fetch. */
+  async upload(url: string, body: ReadableStream<Uint8Array>, size: number): Promise<void> {
+    await uploadBytes(url, body, size, this.fetchImpl);
+  }
+
   /** Telemetry of the most recent logical call, or null before the first. */
   lastCall(): HostedCallInfo | null {
     return this.last;

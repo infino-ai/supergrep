@@ -121,14 +121,23 @@ interface Call {
 
 type Row = Record<string, unknown>;
 
+const STORAGE = "https://storage.example.test";
 /** A platform database with one table registry and a row mirror of the chunks
  * table (path and lang only - enough to answer the sync's recount), driven by
  * op. Every write response carries a write-tokens header. `failOn` makes one
- * op answer 500, to see what a platform failure leaves behind. */
-export function fakePlatform(tables: string[] = [], failOn?: string) {
+ * op answer 500, to see what a platform failure leaves behind. Loads from
+ * this machine's disk are answered too: an upload opens one session per file on STORAGE, whose
+ * `PUT` keeps the bytes; a submitted load takes the rows of the last upload
+ * into the mirror (all of them for `replace`, added for `append`); and a
+ * load's record reports `loadState`. The schema names the platform's
+ * embedding `emb`. */
+export function fakePlatform(tables: string[] = [], failOn?: string, loadState = "succeeded", databaseExists = true, passages = 1) {
   const calls: Call[] = [];
+  let registered = databaseExists;
   const live = new Set(tables);
   let rows: Row[] = [];
+  let uploaded = "";
+  const loads: Row[] = [];
 
   const respond = (value: unknown, write = false): Response =>
     new Response(JSON.stringify(value), {
@@ -141,6 +150,11 @@ export function fakePlatform(tables: string[] = [], failOn?: string) {
 
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input);
+    if (url.startsWith(STORAGE)) {
+      uploaded = await new Response(init?.body as BodyInit).text();
+      calls.push({ op: "storage", url, method: init?.method ?? "PUT", headers: {} });
+      return new Response(null, { status: 200 });
+    }
     const op = url.split("/v1/")[1].split(/[/?]/)[0];
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries((init?.headers ?? {}) as Record<string, string>)) headers[k.toLowerCase()] = v;
@@ -150,6 +164,9 @@ export function fakePlatform(tables: string[] = [], failOn?: string) {
     else if (body instanceof Uint8Array) call.ipc = arrow.tableFromIPC(body);
     calls.push(call);
     if (op === failOn) return new Response("the platform declined", { status: 500 });
+    if (!registered && op !== "databases") {
+      return new Response(JSON.stringify({ error: `database '${TARGET.database}' does not exist` }), { status: 404 });
+    }
 
     switch (op) {
       case "list_tables":
@@ -164,7 +181,7 @@ export function fakePlatform(tables: string[] = [], failOn?: string) {
         return respond({}, true);
       case "append": {
         const appended: Row[] = call.ipc
-          ? call.ipc.toArray().map((r) => ({ path: String(r.path), lang: String(r.lang) }))
+          ? call.ipc.toArray().map((r) => ({ path: String(r.path), lang: String(r.lang), start_line: Number(r.start_line) }))
           : (call.json as { data: Row[] }).data;
         rows.push(...appended);
         return respond({}, true);
@@ -177,14 +194,52 @@ export function fakePlatform(tables: string[] = [], failOn?: string) {
         const n = before - rows.length;
         return respond({ matched: n, n_tombstoned: n, n_not_found: 0 }, true);
       }
+      case "databases":
+        registered = true;
+        return respond({ name: TARGET.database }, true);
+      case "hydrate": {
+        if (new URL(url).pathname.endsWith("/uploads")) {
+          const files = (call.json as { files: Array<{ name: string }> }).files;
+          return respond({ upload: "u1", prefix: "_source/u1/", files: files.map((f, i) => ({ name: f.name, url: `${STORAGE}/u1/${i}` })) }, true);
+        }
+        if (call.method === "GET") {
+          // The record names its request's source, as the platform's does.
+          const source = (loads.at(-1) as { source?: unknown } | undefined)?.source;
+          return respond({ job: `hydrate/${TARGET.database}/${TABLE}`, state: loadState, ...(source ? { request: { source } } : {}), ...(loadState === "failed" ? { error: "the load failed" } : {}) });
+        }
+        if (call.method === "DELETE") {
+          // An ended load's record is cleared; with none, there is nothing to clear.
+          return loads.length > 0 ? new Response(null, { status: 200 }) : new Response(JSON.stringify({ error: "no job" }), { status: 404 });
+        }
+        const load = call.json as { table: string; if_exists?: string };
+        loads.push(load as unknown as Row);
+        live.add(load.table);
+        for (const line of uploaded.split("\n")) {
+          if (line === "") continue;
+          const r = JSON.parse(line) as Row;
+          // The platform may cut a chunk into passages: a row each, all with
+          // the chunk's path and first line.
+          for (let i = 0; i < passages; i++) rows.push({ path: r.path, lang: r.lang, start_line: r.start_line });
+        }
+        return respond({ job: `hydrate/${load.table}`, state: "pending" }, true);
+      }
+      case "schema":
+        return respond([...TEXT_COLUMNS, { name: "emb", type: "embedding", source: ["content"] }]);
+      case "table_card":
+        return new Response("no card yet", { status: 404 });
+      case "vector_search":
+        return respond([]);
       case "query_sql": {
         const sql = (call.json as { query: string }).query;
+        // COUNT(DISTINCT path || ':' || start_line) counts chunks, COUNT(*) rows.
+        const byChunk = sql.includes("COUNT(DISTINCT path ||");
+        const counted = byChunk ? [...new Map(rows.map((r) => [`${r.path}:${r.start_line}`, r])).values()] : rows;
         if (sql.includes("GROUP BY lang")) {
           const byLang = new Map<string, number>();
-          for (const r of rows) byLang.set(String(r.lang), (byLang.get(String(r.lang)) ?? 0) + 1);
+          for (const r of counted) byLang.set(String(r.lang), (byLang.get(String(r.lang)) ?? 0) + 1);
           return respond([...byLang].map(([lang, n]) => ({ lang, n })));
         }
-        return respond([{ n: rows.length, f: new Set(rows.map((r) => r.path)).size }]);
+        return respond([{ n: counted.length, f: new Set(rows.map((r) => r.path)).size }]);
       }
       default:
         return new Response(`unexpected op ${op}`, { status: 400 });
@@ -196,6 +251,10 @@ export function fakePlatform(tables: string[] = [], failOn?: string) {
     calls,
     ops: () => calls.map((c) => c.op),
     rows: () => rows,
+    /** The loads submitted, in order. */
+    loads,
+    /** The bytes of the last upload. */
+    uploaded: () => uploaded,
     db: () => new HostedDb(TARGET, { fetch: fetchImpl }),
   };
 }
@@ -227,6 +286,7 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
+  delete process.env.CX_LOAD_JOB_MIN_CHUNKS;
 });
 
 // --- the build -------------------------------------------------------------------------------
@@ -336,6 +396,22 @@ describe("a build with a platform database (client vectors)", () => {
     expect(platform.ops()).toEqual(["list_tables", "create_table", "append"]);
   });
 
+  it("a first build into a database the account does not have yet registers it, then builds", async () => {
+    writeSmallFixture(root);
+    const platform = fakePlatform([], undefined, "succeeded", false);
+    const stats = await indexRepo({ root, db, hosted: platform.db(), registerDatabase: true, indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
+    expect(stats.hostedError).toBeUndefined();
+    expect(platform.ops()).toEqual(["list_tables", "databases", "list_tables", "create_table", "append"]);
+  });
+
+  it("a build into a database --db named that the platform does not have fails its load and registers nothing", async () => {
+    writeSmallFixture(root);
+    const platform = fakePlatform([], undefined, "succeeded", false);
+    const stats = await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "local" });
+    expect(stats.hostedError).toBeDefined();
+    expect(platform.ops()).toEqual(["list_tables"]);
+  });
+
   it("names the analyzer it was given to the platform and records it in the platform manifest only", async () => {
     writeSmallFixture(root);
     const platform = fakePlatform();
@@ -409,7 +485,8 @@ describe("a build with a platform database (client vectors)", () => {
 });
 
 describe("a build with a platform database (the platform embeds)", () => {
-  it("declares an embedding column the platform fills, appending JSON rows without it; the local index stays keyword-only regardless of an embedder passed in", async () => {
+  it("declares an embedding column the platform fills and loads the chunks into it by one load job; the local index stays keyword-only regardless of an embedder passed in", async () => {
+    process.env.CX_LOAD_JOB_MIN_CHUNKS = "1"; // a build this small loads by one job only with the threshold below it
     writeSmallFixture(root);
     const platform = fakePlatform([TABLE]);
     const phases: string[] = [];
@@ -433,17 +510,20 @@ describe("a build with a platform database (the platform embeds)", () => {
     // it would be a 400.
     expect(created.indexes).toEqual({ fts: [{ column: "content", analyzer: "ascii_lower" }] });
 
-    const appends = platform.calls.filter((c) => c.op === "append");
-    expect(appends).toHaveLength(1);
-    expect(appends[0].headers["content-type"]).toBe("application/json");
-    expect(appends[0].ipc).toBeUndefined();
-    const { data } = appends[0].json as { data: Row[] };
+    // A build's chunks go in one load job from this machine's disk, appended to
+    // the table just created (which keeps its columns and indexes); no append.
+    expect(platform.calls.filter((c) => c.op === "append")).toHaveLength(0);
+    const ops = platform.ops();
+    expect(ops.indexOf("create_table")).toBeLessThan(ops.indexOf("storage"));
+    expect(platform.loads).toHaveLength(1);
+    expect(platform.loads[0]).toMatchObject({ table: TABLE, format: "ndjson", if_exists: "append" });
+    const data = platform.uploaded().trim().split("\n").map((l) => JSON.parse(l) as Row);
     expect(data).toHaveLength(stats.chunks);
     for (const row of data) {
       expect(Object.keys(row).sort()).toEqual([...TEXT_FIELDS].sort());
       expect(row).not.toHaveProperty("embedding");
     }
-    expect(stats.hosted!.appendCalls).toBe(1);
+    expect(stats.hosted!.appendCalls).toBe(0);
 
     // The local manifest never records an embedder any more - only the
     // platform's, since only the platform's copy ever gets vectors.
@@ -451,6 +531,28 @@ describe("a build with a platform database (the platform embeds)", () => {
     const remote = readPlatformManifest(dir)!;
     expect(remote.vectors).toBe("ready");
     expect(remote.embedder).toEqual({ provider: "platform", model: "server-side" });
+  });
+
+  it("appends a build of fewer chunks than the load-job threshold, and loads one of at least that many", async () => {
+    writeSmallFixture(root);
+    const small = fakePlatform();
+    const stats = await indexRepo({ root, db, hosted: small.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" });
+    expect(small.ops()).toContain("append");
+    expect(small.loads).toHaveLength(0);
+
+    process.env.CX_LOAD_JOB_MIN_CHUNKS = String(stats.chunks);
+    const root2 = mkdtempSync(join(tmpdir(), "cx-both-index-"));
+    const dir2 = join(root2, ".infino");
+    writeSmallFixture(root2);
+    const big = fakePlatform();
+    try {
+      await indexRepo({ root: root2, db: connect(dir2), hosted: big.db(), indexDirPath: dir2, embedder: fakeEmbedder, embedProvider: "platform" });
+    } finally {
+      rmSync(root2, { recursive: true, force: true });
+    }
+    expect(big.ops()).not.toContain("append");
+    expect(big.loads).toHaveLength(1);
+    expect(big.rows()).toHaveLength(stats.chunks);
   });
 
   it("is the default provider", async () => {
@@ -797,6 +899,28 @@ describe("a sync with a platform database", () => {
     expect(outcome).toEqual({ action: "rebuild-required", reason: SYNC_REASON_PLATFORM_LOADING });
     expect(syncInProgress(outcome)).toBe(true);
     expect(platform.calls).toHaveLength(beforeCalls);
+  });
+
+  it("loads a sync of at least the load-job threshold's chunks after its deletes, and appends a smaller one", async () => {
+    const platform = fakePlatform();
+    await build(platform, { embedProvider: "platform" });
+    writeFileSync(join(root, "src", "small1.txt"), textFile(1, SMALL_LINES, "changedmarker"));
+    process.env.CX_LOAD_JOB_MIN_CHUNKS = "1";
+    const before = platform.calls.length;
+    const outcome = (await syncRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" })) as SyncResult;
+    expect(outcome.action).toBe("synced");
+    const ops = platform.calls.slice(before).map((c) => c.op);
+    expect(ops).not.toContain("append");
+    expect(ops.indexOf("delete")).toBeLessThan(ops.indexOf("storage"));
+    expect(platform.loads.at(-1)).toMatchObject({ table: TABLE, if_exists: "append" });
+
+    delete process.env.CX_LOAD_JOB_MIN_CHUNKS;
+    writeFileSync(join(root, "src", "small1.txt"), textFile(1, SMALL_LINES, "changedagain"));
+    const loadsBefore = platform.loads.length;
+    const mark = platform.calls.length;
+    await syncRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" });
+    expect(platform.calls.slice(mark).map((c) => c.op)).toContain("append");
+    expect(platform.loads).toHaveLength(loadsBefore);
   });
 });
 

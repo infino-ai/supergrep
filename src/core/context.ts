@@ -12,7 +12,7 @@
 
 import { existsSync } from "node:fs";
 import { connect, type Connection } from "@infino-ai/infino";
-import { indexDir, resolveRoot, TABLE, hostedTarget, hostedLabel, hostedClientOptions } from "./config.js";
+import { indexDir, resolveRoot, TABLE, hostedTarget, hostedLabel, hostedClientOptions, platformReadOnly } from "./config.js";
 import { readManifest, type Manifest } from "./manifest.js";
 import { HostedDb, type HostedOptions, type HostedTarget } from "./hosted.js";
 import { analyzerOf, builtByEarlierVersion, PLATFORM_DEFAULT_ANALYZER } from "./analyzer.js";
@@ -130,7 +130,8 @@ export function openForIndexing(path?: string, hostedOpts?: HostedOptions): Inde
     dir,
     target: dir,
     db: connect(dir),
-    ...(target ? { hosted: hostedDbFor(target, hostedOpts) } : {}),
+    // A checkout reading a shared index writes only its local one.
+    ...(target && !platformReadOnly() ? { hosted: hostedDbFor(target, hostedOpts) } : {}),
   };
 }
 

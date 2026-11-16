@@ -328,7 +328,21 @@ export async function searchHosted(
   const asked = question ? ([{ question, k }] as const) : ([] as const);
   const rows = await hosted.hybridSearch(TABLE, CONTENT_COLUMN, EMBEDDING_COLUMN, query, k, PROJECTION, ...asked);
   const focus = lineFocus(opts, query, opts.analyzer ?? PLATFORM_DEFAULT_ANALYZER);
-  return { query, ranking: "hybrid", hits: rows.map((r) => toHit(r, focus)) };
+  return { query, ranking: "hybrid", hits: onePerChunk(rows).map((r) => toHit(r, focus)) };
+}
+
+/** The rows of a search with one row per chunk: a build's load may cut a long
+ * chunk into passages, each a row of its own with the chunk's path and lines,
+ * and a search can return several of them. The first (best-ranked) stands
+ * for the chunk. */
+function onePerChunk(rows: RowRecord[]): RowRecord[] {
+  const seen = new Set<string>();
+  return rows.filter((r) => {
+    const key = `${String(r.path)}\n${String(r.start_line)}\n${String(r.end_line)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /** The vector leg of a search, or null for a keyword-only pass: the locally
