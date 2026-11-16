@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 //
-// The MCP server on the stored account with CX_PLATFORM_READ_ONLY: a
-// checkout reading a shared index builds its local index and writes nothing
-// to the platform - no database registered, no table created, dropped,
-// appended to or deleted from. The same server without the flag registers
-// the database and loads the table, so the test sees the gate and not a
-// platform that was never asked. A file of its own because the server reads
-// its environment when its module loads.
+// The MCP server on the stored account, its database named by CX_DATABASE:
+// a checkout reading a shared index builds its local index and writes
+// nothing to the platform - no database registered, no table created,
+// dropped, appended to or deleted from - whether CX_PLATFORM_READ_ONLY says
+// so or is unset (CX_DATABASE implies it). With CX_PLATFORM_READ_ONLY=0, as
+// on whatever keeps the shared index current, the same server registers the
+// database and loads the table, so the test sees the gate and not a platform
+// that was never asked. A file of its own because the server reads its
+// environment when its module loads.
 
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -56,6 +58,7 @@ async function buildOnAccount(): Promise<string[]> {
   const root = mkdtempSync(join(tmpdir(), "cx-read-only-"));
   try {
     writeFileSync(join(root, "a.ts"), "export function shared() { return 1; }\n");
+    process.env.CX_DATABASE = "shared";
     configureHosted(
       hostedSettingsFromFlags({}, { [API_KEY_ENV]: KEY, CX_DATABASE: "shared" }, () => KEY, {
         accountRoot: root,
@@ -85,20 +88,26 @@ async function buildOnAccount(): Promise<string[]> {
 
 afterEach(() => {
   delete process.env.CX_PLATFORM_READ_ONLY;
+  delete process.env.CX_DATABASE;
 });
 
 afterAll(() => {
   configureHosted(null);
 });
 
-describe("a checkout reading a shared index (CX_PLATFORM_READ_ONLY)", () => {
-  it("without the flag, a first build registers the database and loads the table", async () => {
+describe("a checkout reading a shared index (CX_DATABASE)", () => {
+  it("with CX_PLATFORM_READ_ONLY=0, a first build registers the database and loads the table", async () => {
+    process.env.CX_PLATFORM_READ_ONLY = "0";
     const ops = await buildOnAccount();
     expect(ops).toContain("databases");
     expect(ops).toContain("create_table");
   });
 
-  it("with it, builds the local index and writes nothing to the platform, registering no database", async () => {
+  it("with CX_PLATFORM_READ_ONLY unset, builds the local index and writes nothing to the platform, registering no database", async () => {
+    expect(await buildOnAccount()).toEqual([]);
+  });
+
+  it("with CX_PLATFORM_READ_ONLY=1, the same", async () => {
     process.env.CX_PLATFORM_READ_ONLY = "1";
     expect(await buildOnAccount()).toEqual([]);
   });
