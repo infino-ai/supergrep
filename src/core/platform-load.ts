@@ -87,14 +87,20 @@ export interface LoadResult {
   record: RowRecord;
 }
 
+/** Register the client's database on its account, as the `hydrate` tool
+ * registers one first; an existing one is left as it is. Files are uploaded
+ * into a database the account has, and its tables are listed and cleared
+ * only once it is there. */
+export async function ensureDatabase(hosted: Pick<HostedDb, "target" | "fetchFn">): Promise<void> {
+  const { baseUrl, apiKey, database } = hosted.target;
+  await createDatabase({ baseUrl, apiKey }, database, { fetch: hosted.fetchFn() });
+}
+
 /** Upload `rowsPath` and load it into `table` by a platform load job, and wait for
  * the job to end. Throws when the upload, the submission or the load fails,
  * or the load does not end within the wait. */
 export async function loadRows(hosted: HostedDb, opts: LoadOptions): Promise<LoadResult> {
-  // Files are uploaded into a database the account has: registered here, as
-  // the `hydrate` tool registers it first (an existing one is left as it is).
-  const { baseUrl, apiKey, database } = hosted.target;
-  await createDatabase({ baseUrl, apiKey }, database, { fetch: hosted.fetchFn() });
+  await ensureDatabase(hosted);
   const size = statSync(opts.rowsPath).size;
   const name = basename(opts.rowsPath);
   // A client of the platform's API opens its uploads for the API's own origin,

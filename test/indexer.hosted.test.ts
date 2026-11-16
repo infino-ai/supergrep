@@ -133,8 +133,9 @@ const STORAGE = "https://storage.example.test";
  * into the mirror (all of them for `replace`, added for `append`); and a
  * load's record reports `loadState`. The schema names the platform's
  * embedding `emb`. */
-export function fakePlatform(tables: string[] = [], failOn?: string, loadState = "succeeded") {
+export function fakePlatform(tables: string[] = [], failOn?: string, loadState = "succeeded", databaseExists = true, passages = 1) {
   const calls: Call[] = [];
+  let registered = databaseExists;
   const live = new Set(tables);
   let rows: Row[] = [];
   let uploaded = "";
@@ -165,6 +166,9 @@ export function fakePlatform(tables: string[] = [], failOn?: string, loadState =
     else if (body instanceof Uint8Array) call.ipc = arrow.tableFromIPC(body);
     calls.push(call);
     if (op === failOn) return new Response("the platform declined", { status: 500 });
+    if (!registered && op !== "databases") {
+      return new Response(JSON.stringify({ error: `database '${TARGET.database}' does not exist` }), { status: 404 });
+    }
 
     switch (op) {
       case "list_tables":
@@ -179,7 +183,7 @@ export function fakePlatform(tables: string[] = [], failOn?: string, loadState =
         return respond({}, true);
       case "append": {
         const appended: Row[] = call.ipc
-          ? call.ipc.toArray().map((r) => ({ path: String(r.path), lang: String(r.lang) }))
+          ? call.ipc.toArray().map((r) => ({ path: String(r.path), lang: String(r.lang), start_line: Number(r.start_line) }))
           : (call.json as { data: Row[] }).data;
         rows.push(...appended);
         return respond({}, true);
@@ -193,6 +197,7 @@ export function fakePlatform(tables: string[] = [], failOn?: string, loadState =
         return respond({ matched: n, n_tombstoned: n, n_not_found: 0 }, true);
       }
       case "databases":
+        registered = true;
         return respond({ name: TARGET.database }, true);
       case "hydrate": {
         if (new URL(url).pathname.endsWith("/uploads")) {
@@ -210,7 +215,9 @@ export function fakePlatform(tables: string[] = [], failOn?: string, loadState =
         for (const line of uploaded.split("\n")) {
           if (line === "") continue;
           const r = JSON.parse(line) as Row;
-          rows.push({ path: r.path, lang: r.lang });
+          // The platform may cut a chunk into passages: a row each, all with
+          // the chunk's path and first line.
+          for (let i = 0; i < passages; i++) rows.push({ path: r.path, lang: r.lang, start_line: r.start_line });
         }
         return respond({ job: `hydrate/${load.table}`, state: "pending" }, true);
       }
@@ -222,12 +229,15 @@ export function fakePlatform(tables: string[] = [], failOn?: string, loadState =
         return respond([]);
       case "query_sql": {
         const sql = (call.json as { query: string }).query;
+        // COUNT(DISTINCT path || ':' || start_line) counts chunks, COUNT(*) rows.
+        const byChunk = sql.includes("COUNT(DISTINCT path ||");
+        const counted = byChunk ? [...new Map(rows.map((r) => [`${r.path}:${r.start_line}`, r])).values()] : rows;
         if (sql.includes("GROUP BY lang")) {
           const byLang = new Map<string, number>();
-          for (const r of rows) byLang.set(String(r.lang), (byLang.get(String(r.lang)) ?? 0) + 1);
+          for (const r of counted) byLang.set(String(r.lang), (byLang.get(String(r.lang)) ?? 0) + 1);
           return respond([...byLang].map(([lang, n]) => ({ lang, n })));
         }
-        return respond([{ n: rows.length, f: new Set(rows.map((r) => r.path)).size }]);
+        return respond([{ n: counted.length, f: new Set(rows.map((r) => r.path)).size }]);
       }
       default:
         return new Response(`unexpected op ${op}`, { status: 400 });
@@ -511,6 +521,15 @@ describe("a build with a platform database (the platform embeds)", () => {
     expect(remote.columns).toEqual({ text: "content", vector: "emb" });
   });
 
+  it("a first build into a database the account does not have yet registers it before anything else", async () => {
+    writeSmallFixture(root);
+    const platform = fakePlatform([], undefined, "succeeded", false);
+    const stats = await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" });
+    expect(stats.hostedError).toBeUndefined();
+    expect(platform.ops()[0]).toBe("databases");
+    expect(platform.rows()).toHaveLength(3);
+  });
+
   it("a rebuild clears the earlier load's record and drops the table before it loads again", async () => {
     writeSmallFixture(root);
     const platform = fakePlatform();
@@ -752,6 +771,19 @@ describe("a sync with a platform database", () => {
     expect(platform.rows()).toHaveLength(3);
     // The columns recorded at the build stay with the table.
     expect(readPlatformManifest(dir)!.columns).toEqual({ text: "content", vector: "emb" });
+  });
+
+  it("counts a platform-embedded table's chunks, not the passages the platform cut them into", async () => {
+    const platform = fakePlatform([], undefined, "succeeded", true, 3);
+    const stats = await build(platform, { embedProvider: "platform" });
+    writeFileSync(join(root, "src", "small1.txt"), textFile(1, SMALL_LINES, "changedmarker"));
+    const outcome = (await syncRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" })) as SyncResult;
+    expect(outcome.action).toBe("synced");
+    expect(platform.rows()).toHaveLength(stats.chunks * 3);
+    const remote = readPlatformManifest(dir)!;
+    expect(remote.chunks).toBe(stats.chunks);
+    expect(remote.chunks).toBe(readManifest(dir)!.chunks);
+    expect(remote.languages).toEqual({ txt: stats.chunks });
   });
 
   it("a load that fails during a sync throws and marks the touched paths unapplied", async () => {

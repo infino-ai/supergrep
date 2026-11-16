@@ -87,7 +87,7 @@ import {
 } from "./analyzer.js";
 import { EMBEDDING_COLUMN, PLATFORM_EMBEDDER_MODEL, PLATFORM_EMBEDDER_PROVIDER } from "./context.js";
 import { rowsToIpc, type HostedDb, type HostedIndexes, type JsonColumn } from "./hosted.js";
-import { clearTable, loadRows, writeRows, type TextRow } from "./platform-load.js";
+import { clearTable, ensureDatabase, loadRows, writeRows, type TextRow } from "./platform-load.js";
 import { codeColumnsOf, DEFAULT_CODE_COLUMNS } from "./searcher.js";
 import { resolveTableShape } from "./table-shape.js";
 import {
@@ -694,7 +694,9 @@ async function loadPlatformCopy(
   const { spill, chunkCount } = scanned;
   onPhase?.("load");
   const tLoad = performance.now();
-  // A build is a full rebuild of both copies: the old table goes first.
+  // A build is a full rebuild of both copies: the old table goes first, from
+  // a database the account has.
+  await ensureDatabase(hosted);
   await clearTable(hosted, TABLE);
   if (chunkCount > 0) await loadSpill(hosted, spill, "new");
   const loadStats: HostedLoadStats = { appendCalls: 0, loadWallMs: Math.round(performance.now() - tLoad) };
@@ -1351,7 +1353,7 @@ export async function syncRepo(opts: IndexOptions): Promise<SyncOutcome> {
       // fails leaves the sync unrecorded and re-applied, never a table that is
       // current with a manifest that is not.
       if (hosted && platformManifest) {
-        platformCounts = await Promise.all([hosted.querySql(TABLE_COUNTS_SQL), hosted.querySql(TABLE_LANGUAGES_SQL)]);
+        platformCounts = await Promise.all([hosted.querySql(PLATFORM_COUNTS_SQL), hosted.querySql(PLATFORM_LANGUAGES_SQL)]);
       }
     } catch (err) {
       // One or both tables may hold part of this diff. Mark every touched
@@ -1438,6 +1440,12 @@ async function applyPlatformDiff(
 /** The recount a sync writes back to a manifest. */
 const TABLE_COUNTS_SQL = `SELECT COUNT(*) AS n, COUNT(DISTINCT path) AS f FROM ${TABLE}`;
 const TABLE_LANGUAGES_SQL = `SELECT lang, COUNT(*) AS n FROM ${TABLE} GROUP BY lang`;
+/** The platform table's recount: the platform may cut a chunk into passages,
+ * each a row with the chunk's path and first line, so chunks are counted by
+ * those, not by rows. */
+const CHUNK_KEY = `path || ':' || CAST(start_line AS VARCHAR)`;
+const PLATFORM_COUNTS_SQL = `SELECT COUNT(DISTINCT ${CHUNK_KEY}) AS n, COUNT(DISTINCT path) AS f FROM ${TABLE}`;
+const PLATFORM_LANGUAGES_SQL = `SELECT lang, COUNT(DISTINCT ${CHUNK_KEY}) AS n FROM ${TABLE} GROUP BY lang`;
 
 /** The manifest fields a recount refreshes, from the two queries' rows. An
  * empty counts result (a table with no rows can answer with none) is zero. */
