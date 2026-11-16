@@ -99,6 +99,7 @@ network.
 | `CX_SYNC_INTERVAL_SECS` | 30 | auto-sync debounce between staleness checks |
 | `CX_NO_EMBED` | off | keyword-only mode (with `--db`, the platform copy is keyword-only too) |
 | `CX_NO_RECEIPT` | off | `1` turns off usage accounting - the per-call receipt on results and the `cx usage` ledger |
+| `CX_LOAD_JOB_MIN_CHUNKS` | `700` | the fewest chunks a write to a platform-embedded table sends by one load job instead of appends: a load job takes about 30 s to start and then embeds several times faster |
 | `CX_TABLE` | `chunks` | the hosted table the server reads, for a table loaded from object storage rather than built by `cx index` |
 | `CX_DATABASE` | the directory's name | on the stored account, the database this repository's platform tools use: a checkout reading a shared index (one repository's default branch) names it |
 | `CX_PLATFORM_READ_ONLY` | off | builds and syncs keep the local index alone and leave the platform copy as it is, which `search` still reads; set with `CX_DATABASE` on a checkout reading a shared index |
@@ -174,12 +175,12 @@ stack.
   IVF vector indexes over a single copy of the data - queried in-process
   through the Node binding locally, and the same table on an Infino platform
   database for `search`, written by the same builds and syncs. Where the
-  platform embeds (the default), a build creates the table and loads all its
-  chunks in one load job from this machine's disk (the `hydrate` tool's
+  platform embeds (the default), a write of many chunks (a build, or a large
+  sync) goes in one load job from this machine's disk (the `hydrate` tool's
   upload path), which embeds them across the platform's hosts at once; a
-  sync deletes the changed files' rows and appends their new chunks, which
-  answers in under a second. A load may cut a long chunk into passages;
-  `search` returns one hit per chunk.
+  write of fewer than `CX_LOAD_JOB_MIN_CHUNKS` (700) is appended, which
+  answers at once. A sync deletes the changed files' rows first. A load may
+  cut a long chunk into passages; `search` returns one hit per chunk.
 - **Embeddings:** computed on the platform, with its own model, so the
   compute-heavy stage never runs on your laptop; `--embed-provider local`
   embeds on this machine and ships the vectors instead.

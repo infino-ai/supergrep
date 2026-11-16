@@ -491,6 +491,21 @@ export const DEFAULT_CAPS: IndexCaps = {
  * becomes searchable as soon as the first batch lands. */
 export const APPEND_BATCH = 512;
 
+/** The fewest chunks a write to a platform-embedded table sends by one load
+ * job rather than by appends (CX_LOAD_JOB_MIN_CHUNKS). An append answers at
+ * once and embeds about 18 rows a second (APPEND_BATCH rows took about 27 s
+ * each); a load job takes about 30 s before it starts, then embeds about 75
+ * rows a second across the platform's hosts. They cross at about 700 chunks:
+ * below that a write is appended, from that up it is loaded (measured on the
+ * platform, 2026-11-16: 9,281 chunks appended in 8 min 34 s, loaded in
+ * 124 s; 5 rows appended in 0.6 s, loaded in 35 s). */
+export const DEFAULT_LOAD_JOB_MIN_CHUNKS = 700;
+
+export function loadJobMinChunks(): number {
+  const n = Number(process.env.CX_LOAD_JOB_MIN_CHUNKS);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_LOAD_JOB_MIN_CHUNKS;
+}
+
 /** Chunks embedded per model call. */
 export const EMBED_BATCH = 32;
 

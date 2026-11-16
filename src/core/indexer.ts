@@ -65,7 +65,7 @@ import { createInterface } from "node:readline";
 import { join, relative, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { IndexSpec, type Connection, type OptimizeOptions, type RowRecord } from "@infino-ai/infino";
-import { APPEND_BATCH, EMBED_BATCH, TABLE, DEFAULT_CAPS, DEFAULT_HOSTED_EMBED_PROVIDER, type IndexCaps, type EmbedProvider } from "./config.js";
+import { APPEND_BATCH, EMBED_BATCH, TABLE, DEFAULT_CAPS, DEFAULT_HOSTED_EMBED_PROVIDER, loadJobMinChunks, type IndexCaps, type EmbedProvider } from "./config.js";
 import { walkRepo } from "./walker.js";
 import { shouldIndexFile, chunkFile, looksBinary, embedText, takeParseFailures, type Chunk } from "./chunker.js";
 import {
@@ -661,9 +661,10 @@ async function loadPlatform(
   }
   await hosted.createTable(TABLE, columns, indexes);
   meterHostedCall(meter, hosted);
-  // Where the platform embeds, a build's chunks go in one load job (loadSpill);
-  // with client vectors, in append waves that carry them.
-  if (chunkCount > 0 && platform) await loadSpill(hosted, spill);
+  // Where the platform embeds, a build of many chunks goes in one load job
+  // (loadSpill) and a small one in appends (loadJobMinChunks); with client
+  // vectors, always in append waves that carry them.
+  if (chunkCount > 0 && platform && chunkCount >= loadJobMinChunks()) await loadSpill(hosted, spill);
   else if (chunkCount > 0) await appendSpillHosted(hosted, spill, chunkCount, columns, dim, platform, meter, onProgress);
 
   const loadStats: HostedLoadStats = { ...meter, loadWallMs: Math.round(performance.now() - tLoad) };
@@ -679,9 +680,9 @@ async function loadPlatform(
   return loadStats;
 }
 
-/** Load a build's spilled chunks into the table just created, by one load
- * job from this machine's disk (platform-load.ts), and wait for it; the rows
- * file is removed either way. */
+/** Load spilled chunks into the existing table (a build's, just created, or
+ * a large sync's) by one load job from this machine's disk
+ * (platform-load.ts), and wait for it; the rows file is removed either way. */
 async function loadSpill(hosted: HostedDb, spill: Spill): Promise<void> {
   const rowsPath = spill.chunksPath.replace(/\.chunks\.ndjson$/, ".rows.ndjson");
   try {
@@ -1405,7 +1406,10 @@ async function applyPlatformDiff(
   if (chunksAdded > 0) {
     const platform = "platform" in vectors;
     const dim = platform ? undefined : vectors.dim;
-    await appendSpillHosted(hosted, spill, chunksAdded, hostedColumns(vectors), dim, platform, meter, onProgress);
+    // A sync as large as a build's worth of chunks loads them as a build does,
+    // after its deletes; a usual sync's few are appended.
+    if (platform && chunksAdded >= loadJobMinChunks()) await loadSpill(hosted, spill);
+    else await appendSpillHosted(hosted, spill, chunksAdded, hostedColumns(vectors), dim, platform, meter, onProgress);
   }
   return { ...meter, loadWallMs: Math.round(performance.now() - tLoad) };
 }

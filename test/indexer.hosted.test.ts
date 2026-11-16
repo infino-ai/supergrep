@@ -282,6 +282,7 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
+  delete process.env.CX_LOAD_JOB_MIN_CHUNKS;
 });
 
 // --- the build -------------------------------------------------------------------------------
@@ -473,6 +474,7 @@ describe("a build with a platform database (client vectors)", () => {
 
 describe("a build with a platform database (the platform embeds)", () => {
   it("declares an embedding column the platform fills and loads the chunks into it by one load job; the local index stays keyword-only regardless of an embedder passed in", async () => {
+    process.env.CX_LOAD_JOB_MIN_CHUNKS = "1"; // a build this small loads by one job only with the threshold below it
     writeSmallFixture(root);
     const platform = fakePlatform([TABLE]);
     const phases: string[] = [];
@@ -517,6 +519,28 @@ describe("a build with a platform database (the platform embeds)", () => {
     const remote = readPlatformManifest(dir)!;
     expect(remote.vectors).toBe("ready");
     expect(remote.embedder).toEqual({ provider: "platform", model: "server-side" });
+  });
+
+  it("appends a build of fewer chunks than the load-job threshold, and loads one of at least that many", async () => {
+    writeSmallFixture(root);
+    const small = fakePlatform();
+    const stats = await indexRepo({ root, db, hosted: small.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" });
+    expect(small.ops()).toContain("append");
+    expect(small.loads).toHaveLength(0);
+
+    process.env.CX_LOAD_JOB_MIN_CHUNKS = String(stats.chunks);
+    const root2 = mkdtempSync(join(tmpdir(), "cx-both-index-"));
+    const dir2 = join(root2, ".infino");
+    writeSmallFixture(root2);
+    const big = fakePlatform();
+    try {
+      await indexRepo({ root: root2, db: connect(dir2), hosted: big.db(), indexDirPath: dir2, embedder: fakeEmbedder, embedProvider: "platform" });
+    } finally {
+      rmSync(root2, { recursive: true, force: true });
+    }
+    expect(big.ops()).not.toContain("append");
+    expect(big.loads).toHaveLength(1);
+    expect(big.rows()).toHaveLength(stats.chunks);
   });
 
   it("is the default provider", async () => {
@@ -587,11 +611,11 @@ describe("failures during a build", () => {
     expect(readPlatformManifest(dir)!.vectors).toBe("ready");
     writeFileSync(join(root, "src", "small0.txt"), textFile(0, SMALL_LINES, "changedmarker"));
 
-    // The rebuild's load fails: the table on the platform is empty (created,
+    // The rebuild's append fails: the table on the platform is empty (created,
     // never filled) while the file state describes the new tree.
-    const failing = fakePlatform([TABLE], "hydrate");
+    const failing = fakePlatform([TABLE], "append");
     const stats = await indexRepo({ root, db, hosted: failing.db(), indexDirPath: dir, embedder: fakeEmbedder });
-    expect(stats.hostedError).toMatch(/server returned 500/);
+    expect(stats.hostedError).toMatch(/append: server returned 500/);
     expect(readPlatformManifest(dir)).toBeUndefined();
 
     // Not "up to date": the table has no record here, a build reloads it.
@@ -863,6 +887,28 @@ describe("a sync with a platform database", () => {
     expect(outcome).toEqual({ action: "rebuild-required", reason: SYNC_REASON_PLATFORM_LOADING });
     expect(syncInProgress(outcome)).toBe(true);
     expect(platform.calls).toHaveLength(beforeCalls);
+  });
+
+  it("loads a sync of at least the load-job threshold's chunks after its deletes, and appends a smaller one", async () => {
+    const platform = fakePlatform();
+    await build(platform, { embedProvider: "platform" });
+    writeFileSync(join(root, "src", "small1.txt"), textFile(1, SMALL_LINES, "changedmarker"));
+    process.env.CX_LOAD_JOB_MIN_CHUNKS = "1";
+    const before = platform.calls.length;
+    const outcome = (await syncRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" })) as SyncResult;
+    expect(outcome.action).toBe("synced");
+    const ops = platform.calls.slice(before).map((c) => c.op);
+    expect(ops).not.toContain("append");
+    expect(ops.indexOf("delete")).toBeLessThan(ops.indexOf("storage"));
+    expect(platform.loads.at(-1)).toMatchObject({ table: TABLE, if_exists: "append" });
+
+    delete process.env.CX_LOAD_JOB_MIN_CHUNKS;
+    writeFileSync(join(root, "src", "small1.txt"), textFile(1, SMALL_LINES, "changedagain"));
+    const loadsBefore = platform.loads.length;
+    const mark = platform.calls.length;
+    await syncRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" });
+    expect(platform.calls.slice(mark).map((c) => c.op)).toContain("append");
+    expect(platform.loads).toHaveLength(loadsBefore);
   });
 });
 
