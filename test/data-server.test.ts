@@ -392,6 +392,47 @@ describe("the account's data through the server started for a repository", () =>
   });
 });
 
+describe("the account's other databases switched off (CX_ACCOUNT_DATA=database)", () => {
+  let s: Started;
+  beforeAll(async () => {
+    s = await start(account(), "cx-data-off-", { accountData: "database" });
+  });
+  afterAll(async () => {
+    await stop(s);
+  });
+
+  it("offers neither tables nor hydrate, and the instructions name neither", async () => {
+    const { tools } = await s.client.listTools();
+    const names = tools.map((t) => t.name);
+    for (const name of ["tables", "hydrate", "hydrate_status", "hydrate_cancel"]) expect(names, name).not.toContain(name);
+    for (const name of ["sql", "search", "find"]) expect(names, name).toContain(name);
+    const instructions = s.client.getInstructions() ?? "";
+    expect(instructions).not.toContain("- tables - ");
+    expect(instructions).not.toContain("- hydrate - ");
+    for (const tool of tools.filter((t) => ["sql", "search", "find"].includes(t.name))) {
+      expect(tool.description, tool.name).not.toContain("With database (and table)");
+    }
+  });
+
+  it("refuses a database argument without asking the platform, and says to leave it out", async () => {
+    for (const [tool, args] of [
+      ["sql", { query: `SELECT * FROM ${ACCOUNTS}`, database: DATA_DB }],
+      ["search", { query: "rent", database: DATA_DB, table: NOTES }],
+      ["find", { query: "rent", database: DATA_DB, table: NOTES }],
+      ["join_keys", { tables: [ACCOUNTS, TRANS], database: DATA_DB }],
+    ] as const) {
+      const result = await call(s, tool, args);
+      expect(result.ok, tool).toBe(false);
+      expect(String(result.value), tool).toContain("not the account's other databases; leave database out");
+      expect(result.ops.filter((op) => op !== "account"), tool).toEqual([]);
+    }
+  });
+
+  it("never wrote a table, dropped one, appended to one, or built a local index", () => {
+    expectNothingBuilt(s);
+  });
+});
+
 describe("the tables a load makes, as the server keeps them", () => {
   /** The table a load is making, and one made by a load this server never
    * followed. */
