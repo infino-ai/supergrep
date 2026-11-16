@@ -87,6 +87,9 @@ import {
 } from "./analyzer.js";
 import { EMBEDDING_COLUMN, PLATFORM_EMBEDDER_MODEL, PLATFORM_EMBEDDER_PROVIDER } from "./context.js";
 import { rowsToIpc, type HostedDb, type HostedIndexes, type JsonColumn } from "./hosted.js";
+import { loadRows, writeRows, type TextRow } from "./platform-load.js";
+import { codeColumnsOf, DEFAULT_CODE_COLUMNS } from "./searcher.js";
+import { resolveTableShape } from "./table-shape.js";
 import {
   diffFiles,
   emptyFileState,
@@ -642,6 +645,7 @@ async function loadPlatform(
   const { spill, chunkCount } = scanned;
 
   const platform = provider === "platform";
+  if (platform) return loadPlatformCopy(opts, hosted, scanned, stats);
   const dim = platform ? undefined : vectors?.dim;
   // Zero chunks ⇒ no vector spill was ever written and nothing is appended.
   if (dim !== undefined && chunkCount > 0) verifyVectorSpill(spill, chunkCount, dim);
@@ -672,6 +676,60 @@ async function loadPlatform(
     toManifest({ ...stats, vectors: platform || dim !== undefined ? "ready" : "none", hosted: loadStats }, analyzer, embedderInfo, "hosted"),
   );
   return loadStats;
+}
+
+/** A build's platform copy where the platform embeds: the spill's chunks,
+ * the rows the local index holds, written out and loaded from this
+ * machine's disk (platform-load.ts), replacing the table. The platform
+ * chooses what the table indexes and embeds, so no schema or index is
+ * declared here. A tree with no chunks loads nothing and leaves no table:
+ * the first sync that brings rows loads it. */
+async function loadPlatformCopy(
+  opts: IndexOptions,
+  hosted: HostedDb,
+  scanned: Scanned,
+  stats: IndexStats,
+): Promise<HostedLoadStats> {
+  const { indexDirPath, onPhase } = opts;
+  const { spill, chunkCount } = scanned;
+  onPhase?.("load");
+  const tLoad = performance.now();
+  if (chunkCount > 0) {
+    await loadSpill(hosted, spill, "replace");
+  } else if ((await hosted.listTables()).includes(TABLE)) {
+    await hosted.dropTable(TABLE, true);
+  }
+  const loadStats: HostedLoadStats = { appendCalls: 0, loadWallMs: Math.round(performance.now() - tLoad) };
+  // The columns the platform chose, for search to read (searcher.ts, codeColumnsOf);
+  // a shape that cannot be read leaves the defaults, as for a table with none.
+  const columns = chunkCount > 0 ? codeColumnsOf(await resolveTableShape(hosted, TABLE).catch(() => null)) : DEFAULT_CODE_COLUMNS;
+  writePlatformManifest(indexDirPath, {
+    ...toManifest(
+      { ...stats, vectors: "ready", hosted: loadStats },
+      PLATFORM_LOAD_ANALYZER,
+      { provider: PLATFORM_EMBEDDER_PROVIDER, model: PLATFORM_EMBEDDER_MODEL },
+      "hosted",
+    ),
+    columns,
+  });
+  return loadStats;
+}
+
+/** The analyzer a loaded table's text indexes are built with when none is
+ * declared: the platform's default. */
+const PLATFORM_LOAD_ANALYZER: Analyzer = "standard";
+
+/** Write the spill's chunks out as table rows beside it and load them
+ * (`replace` for a build, `append` for a sync), waiting for the load to
+ * end; the rows file is removed either way. */
+async function loadSpill(hosted: HostedDb, spill: Spill, ifExists: "append" | "replace"): Promise<void> {
+  const rowsPath = spill.chunksPath.replace(/\.chunks\.ndjson$/, ".rows.ndjson");
+  try {
+    await writeRows(spill.chunksPath, rowsPath, toTextRow as (chunk: never) => TextRow);
+    await loadRows(hosted, { table: TABLE, rowsPath, ifExists });
+  } finally {
+    rmSync(rowsPath, { force: true });
+  }
 }
 
 /** Running totals of a hosted load's platform calls; `loadWallMs` is added
@@ -1349,9 +1407,12 @@ export async function syncRepo(opts: IndexOptions): Promise<SyncOutcome> {
 }
 
 /** Apply a sync's diff to the platform table: the stale paths deleted, then
- * the fresh rows appended in waves. `vectors` says what rides with the rows -
- * nothing for a platform-embedded column, the local vectors of width `dim`
- * for a client-vector column, none when the table is keyword-only. */
+ * the fresh rows added. Where the platform embeds, the rows are loaded as an
+ * append, which keeps what the table indexes and embeds, and waited for: the
+ * deletes run first, between loads, never while a load is writing the
+ * table. Otherwise they are appended in waves, with what
+ * `vectors` says rides along - the local vectors of width `dim` for a
+ * client-vector column, none when the table is keyword-only. */
 async function applyPlatformDiff(
   hosted: HostedDb,
   predicates: string[],
@@ -1367,9 +1428,11 @@ async function applyPlatformDiff(
     meterHostedCall(meter, hosted);
   }
   if (chunksAdded > 0) {
-    const platform = "platform" in vectors;
-    const dim = platform ? undefined : vectors.dim;
-    await appendSpillHosted(hosted, spill, chunksAdded, hostedColumns(vectors), dim, platform, meter, onProgress);
+    if ("platform" in vectors) {
+      await loadSpill(hosted, spill, "append");
+    } else {
+      await appendSpillHosted(hosted, spill, chunksAdded, hostedColumns(vectors), vectors.dim, false, meter, onProgress);
+    }
   }
   return { ...meter, loadWallMs: Math.round(performance.now() - tLoad) };
 }

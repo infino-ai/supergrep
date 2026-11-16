@@ -100,6 +100,8 @@ network.
 | `CX_NO_EMBED` | off | keyword-only mode (with `--db`, the platform copy is keyword-only too) |
 | `CX_NO_RECEIPT` | off | `1` turns off usage accounting - the per-call receipt on results and the `cx usage` ledger |
 | `CX_TABLE` | `chunks` | the hosted table the server reads, for a table loaded from object storage rather than built by `cx index` |
+| `CX_DATABASE` | the directory's name | on the stored account, the database this repository's platform tools use: a checkout reading a shared index (one repository's default branch) names it |
+| `CX_PLATFORM_READ_ONLY` | off | builds and syncs keep the local index alone and leave the platform copy as it is, which `search` still reads; set with `CX_DATABASE` on a checkout reading a shared index |
 | `CX_TEXT_COLUMN` | chosen from the table's shape | with `CX_TABLE`, the column the doors search on a table that has several indexed text columns |
 
 Every result carries a **usage receipt**: the tokens it returned, the files
@@ -168,8 +170,15 @@ stack.
   part of and that definition's span.
 - **Index:** [infino](https://github.com/infino-ai/infino) tables - BM25 and
   IVF vector indexes over a single copy of the data - queried in-process
-  through the Node binding locally, and the same table on an Infino platform
-  database for `search`, written by the same builds and syncs.
+  through the Node binding locally, and the same rows on an Infino platform
+  database for `search`, written by the same builds and syncs. Where the
+  platform embeds (the default), the platform copy is loaded from this
+  machine's disk: the chunks this machine cut are written as rows,
+  uploaded into the database's storage, and loaded by a platform load job
+  (a build replaces the table, a sync appends the changed files' rows after
+  deleting their old ones), and the platform chooses what the table
+  indexes and embeds. The platform manifest records the columns it chose,
+  which `search` reads.
 - **Embeddings:** computed on the platform, with its own model, so the
   compute-heavy stage never runs on your laptop; `--embed-provider local`
   embeds on this machine and ships the vectors instead.

@@ -183,7 +183,7 @@ export function hostedSettingsFromFlags(
       return null;
     }
     baseUrl = stored.baseUrl.replace(/\/+$/, "");
-    database = databaseNameFor(fallback.accountRoot!);
+    database = databaseOverride(env) ?? databaseNameFor(fallback.accountRoot!);
     apiKey = key;
     account = { baseUrl, apiKey };
   } else {
@@ -296,6 +296,27 @@ export function hostedAnalyzer(): Analyzer | undefined {
  * places and are never allowed to differ. */
 export function autoIndexEnabled(): boolean {
   return !OFF_VALUES.includes((process.env.CX_AUTO_INDEX ?? "").toLowerCase());
+}
+
+/** The database the stored account's platform tools use for this
+ * repository (CX_DATABASE), instead of the one named from its directory:
+ * a checkout that reads a shared index - one repository's default branch,
+ * kept current by its own pushes - names that index's database. Unset or
+ * empty, the database is named from the directory, as before. */
+export const DATABASE_ENV = "CX_DATABASE";
+export function databaseOverride(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const name = (env[DATABASE_ENV] ?? "").trim();
+  return name === "" ? undefined : name;
+}
+
+/** Whether builds and syncs leave the platform table alone
+ * (CX_PLATFORM_READ_ONLY, default off): the local index is built and synced
+ * as always, and nothing is loaded into, or deleted from, the platform's
+ * copy, which `search` still reads. A checkout reading a shared index
+ * (CX_DATABASE) sets it, so its own changes never reach the index every
+ * other checkout reads. */
+export function platformReadOnly(): boolean {
+  return ON_VALUES.includes((process.env.CX_PLATFORM_READ_ONLY ?? "").toLowerCase());
 }
 
 /** Whether queries re-sync the index against the working tree (CX_AUTO_SYNC,

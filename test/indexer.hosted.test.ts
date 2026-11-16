@@ -121,14 +121,24 @@ interface Call {
 
 type Row = Record<string, unknown>;
 
+/** Where the fake's upload sessions point: the storage, not the platform. */
+const STORAGE = "https://storage.example.test";
+
 /** A platform database with one table registry and a row mirror of the chunks
  * table (path and lang only - enough to answer the sync's recount), driven by
  * op. Every write response carries a write-tokens header. `failOn` makes one
- * op answer 500, to see what a platform failure leaves behind. */
-export function fakePlatform(tables: string[] = [], failOn?: string) {
+ * op answer 500, to see what a platform failure leaves behind. Loads from
+ * this machine's disk are answered too: an upload opens one session per file on STORAGE, whose
+ * `PUT` keeps the bytes; a submitted load takes the rows of the last upload
+ * into the mirror (all of them for `replace`, added for `append`); and a
+ * load's record reports `loadState`. The schema names the platform's
+ * embedding `emb`. */
+export function fakePlatform(tables: string[] = [], failOn?: string, loadState = "succeeded") {
   const calls: Call[] = [];
   const live = new Set(tables);
   let rows: Row[] = [];
+  let uploaded = "";
+  const loads: Row[] = [];
 
   const respond = (value: unknown, write = false): Response =>
     new Response(JSON.stringify(value), {
@@ -141,6 +151,11 @@ export function fakePlatform(tables: string[] = [], failOn?: string) {
 
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input);
+    if (url.startsWith(STORAGE)) {
+      uploaded = await new Response(init?.body as BodyInit).text();
+      calls.push({ op: "storage", url, method: init?.method ?? "PUT", headers: {} });
+      return new Response(null, { status: 200 });
+    }
     const op = url.split("/v1/")[1].split(/[/?]/)[0];
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries((init?.headers ?? {}) as Record<string, string>)) headers[k.toLowerCase()] = v;
@@ -177,6 +192,29 @@ export function fakePlatform(tables: string[] = [], failOn?: string) {
         const n = before - rows.length;
         return respond({ matched: n, n_tombstoned: n, n_not_found: 0 }, true);
       }
+      case "hydrate": {
+        if (new URL(url).pathname.endsWith("/uploads")) {
+          const files = (call.json as { files: Array<{ name: string }> }).files;
+          return respond({ upload: "u1", prefix: "_source/u1/", files: files.map((f, i) => ({ name: f.name, url: `${STORAGE}/u1/${i}` })) }, true);
+        }
+        if (call.method === "GET") return respond({ state: loadState, ...(loadState === "failed" ? { error: "the load failed" } : {}) });
+        const load = call.json as { table: string; if_exists?: string };
+        loads.push(load as unknown as Row);
+        if (load.if_exists === "replace") rows = [];
+        live.add(load.table);
+        for (const line of uploaded.split("\n")) {
+          if (line === "") continue;
+          const r = JSON.parse(line) as Row;
+          rows.push({ path: r.path, lang: r.lang });
+        }
+        return respond({ job: `hydrate/${load.table}`, state: "pending" }, true);
+      }
+      case "schema":
+        return respond([...TEXT_COLUMNS, { name: "emb", type: "embedding", source: ["content"] }]);
+      case "table_card":
+        return new Response("no card yet", { status: 404 });
+      case "vector_search":
+        return respond([]);
       case "query_sql": {
         const sql = (call.json as { query: string }).query;
         if (sql.includes("GROUP BY lang")) {
@@ -196,6 +234,10 @@ export function fakePlatform(tables: string[] = [], failOn?: string) {
     calls,
     ops: () => calls.map((c) => c.op),
     rows: () => rows,
+    /** The loads submitted, in order. */
+    loads,
+    /** The bytes of the last upload. */
+    uploaded: () => uploaded,
     db: () => new HostedDb(TARGET, { fetch: fetchImpl }),
   };
 }
@@ -409,7 +451,7 @@ describe("a build with a platform database (client vectors)", () => {
 });
 
 describe("a build with a platform database (the platform embeds)", () => {
-  it("declares an embedding column the platform fills, appending JSON rows without it; the local index stays keyword-only regardless of an embedder passed in", async () => {
+  it("loads the chunks from this machine's disk, replacing the table, with no schema declared; the local index stays keyword-only regardless of an embedder passed in", async () => {
     writeSmallFixture(root);
     const platform = fakePlatform([TABLE]);
     const phases: string[] = [];
@@ -425,40 +467,54 @@ describe("a build with a platform database (the platform embeds)", () => {
     // No "commit-vectors" phase: the local table never gains a vector column.
     expect(phases).toEqual(["scan", "chunk", "commit-text", "embed", "load"]);
     expect(stats.vectors).toBe("none");
-    expect(stats.embedMs).toBeGreaterThanOrEqual(0);
+    expect(stats.hostedError).toBeUndefined();
 
-    const created = createBody(platform.calls.find((c) => c.op === "create_table")!);
-    expect(created.schema).toEqual([...TEXT_COLUMNS, { name: "embedding", type: "embedding", source: ["content"] }]);
-    // The platform indexes an embedding column by itself; a vector entry for
-    // it would be a 400.
-    expect(created.indexes).toEqual({ fts: [{ column: "content", analyzer: "ascii_lower" }] });
+    // The load makes the table and the platform chooses what it indexes and embeds: no
+    // create_table, no append, no drop (a replace starts it over).
+    expect(platform.ops()).not.toContain("create_table");
+    expect(platform.ops()).not.toContain("append");
+    expect(platform.ops()).not.toContain("drop_table");
+    const upload = platform.calls.find((c) => c.op === "hydrate" && c.url.endsWith("/uploads"))!;
+    expect(upload.json).toMatchObject({ origin: "https://api.example.test", files: [{ size: expect.any(Number) }] });
+    expect(platform.calls.filter((c) => c.op === "storage")).toHaveLength(1);
+    expect(platform.loads).toHaveLength(1);
+    expect(platform.loads[0]).toEqual({ table: TABLE, source: { kind: "prefix", prefix: "_source/u1/" }, format: "ndjson", if_exists: "replace" });
 
-    const appends = platform.calls.filter((c) => c.op === "append");
-    expect(appends).toHaveLength(1);
-    expect(appends[0].headers["content-type"]).toBe("application/json");
-    expect(appends[0].ipc).toBeUndefined();
-    const { data } = appends[0].json as { data: Row[] };
-    expect(data).toHaveLength(stats.chunks);
-    for (const row of data) {
-      expect(Object.keys(row).sort()).toEqual([...TEXT_FIELDS].sort());
-      expect(row).not.toHaveProperty("embedding");
-    }
-    expect(stats.hosted!.appendCalls).toBe(1);
+    // What went up is the local index's rows, one per chunk, the table's columns only.
+    const sent = platform.uploaded().trim().split("\n").map((l) => JSON.parse(l) as Row);
+    expect(sent).toHaveLength(stats.chunks);
+    for (const row of sent) expect(Object.keys(row).sort()).toEqual([...TEXT_FIELDS].sort());
+    expect(platform.rows()).toHaveLength(stats.chunks);
+    expect(stats.hosted!.appendCalls).toBe(0);
+    // The rows file is the load's alone.
+    expect(readdirSync(dir).filter((f) => f.endsWith(".rows.ndjson"))).toEqual([]);
 
-    // The local manifest never records an embedder any more - only the
-    // platform's, since only the platform's copy ever gets vectors.
+    // The local manifest never records an embedder - only the platform's.
     expect(readManifest(dir)!.embedder).toBeUndefined();
     const remote = readPlatformManifest(dir)!;
     expect(remote.vectors).toBe("ready");
     expect(remote.embedder).toEqual({ provider: "platform", model: "server-side" });
+    expect(remote.analyzer).toBe("standard");
+    // The columns the platform chose, which search reads.
+    expect(remote.columns).toEqual({ text: "content", vector: "emb" });
   });
 
   it("is the default provider", async () => {
     writeSmallFixture(root);
     const platform = fakePlatform();
     await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder });
-    const created = createBody(platform.calls.find((c) => c.op === "create_table")!);
-    expect(created.schema.at(-1)).toEqual({ name: "embedding", type: "embedding", source: ["content"] });
+    expect(platform.ops()).not.toContain("create_table");
+    expect(platform.loads).toHaveLength(1);
+  });
+
+  it("a load that fails is recorded, never thrown: the local index is complete and the platform manifest is not written", async () => {
+    writeSmallFixture(root);
+    const platform = fakePlatform([], undefined, "failed");
+    const stats = await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" });
+    expect(stats.hostedError).toMatch(/platform load of chunks ended failed: the load failed/);
+    expect(localRowCount(db)).toBe(stats.chunks);
+    expect(readPlatformManifest(dir)).toBeUndefined();
+    expect(readdirSync(dir).filter((f) => f.endsWith(".rows.ndjson"))).toEqual([]);
   });
 });
 
@@ -633,7 +689,7 @@ describe("a sync with a platform database", () => {
     expect((outcome as { reason: string }).reason).toBe("no prior index state");
   });
 
-  it("syncs a platform-embedded table with JSON rows while embedding the local rows", async () => {
+  it("syncs a platform-embedded table by a load from disk: the stale rows deleted first, then the changed file's rows appended, keeping what the table indexes and embeds", async () => {
     const platform = fakePlatform();
     await build(platform, { embedProvider: "platform" });
     writeFileSync(join(root, "src", "small1.txt"), textFile(1, SMALL_LINES, "changedmarker"));
@@ -649,17 +705,36 @@ describe("a sync with a platform database", () => {
       onPhase: (p) => phases.push(p),
     })) as SyncResult;
     expect(outcome.action).toBe("synced");
-    // The platform embeds server-side under this provider, so nothing here
-    // ever needs a client-side embed: not for the local table (never has
-    // vectors), and not for the platform's (its own model fills the column).
+    // The platform embeds server-side under this provider: no client-side embed.
     expect(phases).not.toContain("embed");
-    const append = platform.calls.slice(beforeCalls).find((c) => c.op === "append")!;
-    expect(append.headers["content-type"]).toBe("application/json");
-    const { data } = append.json as { data: Row[] };
-    expect(data).toHaveLength(1);
-    expect(data[0]).not.toHaveProperty("embedding");
+    const after = platform.calls.slice(beforeCalls);
+    expect(after.map((c) => c.op)).not.toContain("append");
+    // The delete runs before the load, never while a load writes the table.
+    const deleteAt = after.findIndex((c) => c.op === "delete");
+    const submitAt = after.findIndex((c) => c.op === "hydrate" && c.method === "POST" && !c.url.endsWith("/uploads"));
+    expect(deleteAt).toBeGreaterThanOrEqual(0);
+    expect(submitAt).toBeGreaterThan(deleteAt);
+    expect(platform.loads.at(-1)).toMatchObject({ table: TABLE, if_exists: "append" });
+    const sent = platform.uploaded().trim().split("\n").map((l) => JSON.parse(l) as Row);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].path).toBe("src/small1.txt");
     expect(outcome.vectors).toBe("none");
     expect(localRowCount(db)).toBe(3);
+    expect(platform.rows()).toHaveLength(3);
+    // The columns recorded at the build stay with the table.
+    expect(readPlatformManifest(dir)!.columns).toEqual({ text: "content", vector: "emb" });
+  });
+
+  it("a load that fails during a sync throws and marks the touched paths unapplied", async () => {
+    const platform = fakePlatform();
+    await build(platform, { embedProvider: "platform" });
+    writeFileSync(join(root, "src", "small1.txt"), textFile(1, SMALL_LINES, "changedmarker"));
+    const failing = fakePlatform([TABLE], undefined, "failed");
+    writePlatformManifest(dir, readPlatformManifest(dir)!);
+    await expect(
+      syncRepo({ root, db, hosted: failing.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" }),
+    ).rejects.toThrow(/platform load of chunks ended failed/);
+    expect(readFileState(dir)!.files["src/small1.txt"]).toEqual(UNAPPLIED);
   });
 
   it("asks for a build when the platform table's vector provider changed since it was loaded", async () => {

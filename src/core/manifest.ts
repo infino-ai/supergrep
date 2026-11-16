@@ -66,6 +66,12 @@ export interface Manifest {
   indexMs: number;
   /** Wall-clock of the vector backfill, ms (present once vectors are ready). */
   embedMs?: number;
+  /** On a platform table loaded from this machine's disk: the text column
+   * its search reads and the column the platform embeds, as the table
+   * records them (the platform chooses them, and may name its embedding
+   * otherwise than `embedding`). Absent on a table this client created,
+   * whose columns are `content` and `embedding`. */
+  columns?: { text: string; vector: string };
 }
 
 export function manifestPath(indexDirPath: string): string {

@@ -858,6 +858,13 @@ export class HostedDb {
     return this.parseJson(exchange, "uploads") as RowRecord;
   }
 
+  /** `PUT` one file's bytes to the upload session `url` that
+   * [`openUploads`] opened for it ([`uploadBytes`]), through this client's
+   * fetch. */
+  async upload(url: string, body: ReadableStream<Uint8Array>, size: number): Promise<void> {
+    await uploadBytes(url, body, size, this.fetchImpl);
+  }
+
   // --- writes ---
 
   /** `POST /v1/append/{db}?table=T` with an Arrow IPC stream body - the only

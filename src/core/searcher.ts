@@ -315,20 +315,47 @@ function lineFocus(opts: SearchOptions, query: string, analyzer: Analyzer): Line
  * `analyzer` is the hosted table's, for cutting hits to their matching lines
  * (`lines`): this side has no manifest of that table in hand, so the caller
  * names it, and a caller that cannot gets the platform's default for a bare
- * column. */
+ * column.
+ *
+ * `columns` are the table's own: the text column its keyword leg searches
+ * and the column the platform embeds, as the table records them - a loaded
+ * table may name its embedding `emb` (`codeColumnsOf`). Absent, the
+ * columns a table this client created itself has. */
 export async function searchHosted(
   hosted: Pick<HostedDb, "hybridSearch">,
   query: string,
   k = DEFAULT_SEARCH_K,
-  opts: SearchOptions & { analyzer?: Analyzer; question?: string } = {},
+  opts: SearchOptions & { analyzer?: Analyzer; question?: string; columns?: CodeColumns } = {},
 ): Promise<SearchResult> {
   // With the question, the platform's grader orders a wider pool and the
   // top k come back (ReadChecks), as for a search over a table's rows.
   const question = opts.question?.trim();
   const asked = question ? ([{ question, k }] as const) : ([] as const);
-  const rows = await hosted.hybridSearch(TABLE, CONTENT_COLUMN, EMBEDDING_COLUMN, query, k, PROJECTION, ...asked);
+  const columns = opts.columns ?? DEFAULT_CODE_COLUMNS;
+  const rows = await hosted.hybridSearch(TABLE, columns.text, columns.vector, query, k, PROJECTION, ...asked);
   const focus = lineFocus(opts, query, opts.analyzer ?? PLATFORM_DEFAULT_ANALYZER);
   return { query, ranking: "hybrid", hits: rows.map((r) => toHit(r, focus)) };
+}
+
+/** The columns a search of the code table reads: the text column its
+ * keyword leg searches, and the column the platform embeds. */
+export interface CodeColumns {
+  text: string;
+  vector: string;
+}
+
+/** The code table's columns as this client creates the table itself. */
+export const DEFAULT_CODE_COLUMNS: CodeColumns = { text: CONTENT_COLUMN, vector: EMBEDDING_COLUMN };
+
+/** The code table's columns as the platform records them (its shape:
+ * `table-shape.ts`): the text column when it is the chunks' `content` or the
+ * table's prose, and the column the platform embeds. A loaded table has
+ * had them chosen by the platform; one with no embedded column, or a shape that
+ * cannot be read, keeps the defaults. */
+export function codeColumnsOf(shape: Pick<TableShape, "vectorColumn" | "textColumns" | "primaryText"> | null): CodeColumns {
+  if (!shape) return DEFAULT_CODE_COLUMNS;
+  const text = shape.textColumns.includes(CONTENT_COLUMN) ? CONTENT_COLUMN : shape.primaryText || CONTENT_COLUMN;
+  return { text, vector: shape.vectorColumn ?? EMBEDDING_COLUMN };
 }
 
 /** The vector leg of a search, or null for a keyword-only pass: the locally

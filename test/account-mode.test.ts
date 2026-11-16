@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Connection } from "@infino-ai/infino";
-import { API_KEY_ENV, accountTargetFor, hostedSettingsFromFlags } from "../src/core/config.js";
+import { API_KEY_ENV, DATABASE_ENV, accountTargetFor, hostedSettingsFromFlags, platformReadOnly } from "../src/core/config.js";
 import { writeStoredAccount, writeStoredKey } from "../src/core/keystore.js";
 import { RepoRegistry } from "../src/mcp/repos.js";
 import { noAccountSteps } from "../src/mcp/server.js";
@@ -38,6 +38,20 @@ function signedIn(agreed: boolean): void {
   writeStoredAccount({ baseUrl: PLATFORM, storedAt: "2026-09-27T00:00:00Z", ...(agreed ? { uploadConsentAt: "2026-09-27T00:00:00Z" } : {}) });
 }
 
+describe("CX_PLATFORM_READ_ONLY", () => {
+  afterEach(() => {
+    delete process.env.CX_PLATFORM_READ_ONLY;
+  });
+
+  it("is off unless set on", () => {
+    expect(platformReadOnly()).toBe(false);
+    process.env.CX_PLATFORM_READ_ONLY = "0";
+    expect(platformReadOnly()).toBe(false);
+    process.env.CX_PLATFORM_READ_ONLY = "1";
+    expect(platformReadOnly()).toBe(true);
+  });
+});
+
 describe("the platform settings without --db", () => {
   it("are null with no account, as they always were", () => {
     expect(hostedSettingsFromFlags({}, {}, undefined, { accountRoot: ROOT })).toBeNull();
@@ -59,6 +73,14 @@ describe("the platform settings without --db", () => {
     expect(settings?.target).toEqual({ baseUrl: PLATFORM, database: "my-project", apiKey: KEY });
     expect(settings?.account).toEqual({ baseUrl: PLATFORM, apiKey: KEY });
     expect(settings?.embedProvider).toBe("platform");
+  });
+
+  it("serve the database CX_DATABASE names instead of the directory's: a checkout reading a shared index", () => {
+    signedIn(true);
+    const settings = hostedSettingsFromFlags({}, { [DATABASE_ENV]: " infino " }, undefined, { accountRoot: ROOT });
+    expect(settings?.target.database).toBe("infino");
+    const unset = hostedSettingsFromFlags({}, { [DATABASE_ENV]: "  " }, undefined, { accountRoot: ROOT });
+    expect(unset?.target.database).toBe("my-project");
   });
 
   it("let the environment's key stand in for the stored one, as --db does", () => {

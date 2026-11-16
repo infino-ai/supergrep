@@ -31,7 +31,7 @@ import {
   wholeAllowances,
   type SchemaField,
 } from "../src/core/table-shape.js";
-import { embedsAQuery, findRows, findRowsSql, foldEmbeds, normalizeQueryPlaceholders, RERANK_POOL_ROWS, searchHosted, searchRows } from "../src/core/searcher.js";
+import { codeColumnsOf, DEFAULT_CODE_COLUMNS, embedsAQuery, findRows, findRowsSql, foldEmbeds, normalizeQueryPlaceholders, RERANK_POOL_ROWS, searchHosted, searchRows } from "../src/core/searcher.js";
 import { topKAggregateRefusal } from "../src/core/topk-aggregate.js";
 import { rowFindEntry, rowSearchEntry, formatReceipt } from "../src/core/usage.js";
 import {
@@ -360,6 +360,27 @@ describe("the doors over rows", () => {
     await searchHosted(hosted, "parse config", 4);
     expect(calls[0].at(-1)).toEqual({ question: "where is the config parsed?", k: 4 });
     expect(calls[1]).toHaveLength(6);
+  });
+
+  it("code search reads the table's own columns: the platform's embedding `emb` when the manifest records it, `content` and `embedding` otherwise", async () => {
+    const calls: unknown[][] = [];
+    const hosted = {
+      hybridSearch: async (...args: unknown[]) => {
+        calls.push(args);
+        return [];
+      },
+    };
+    await searchHosted(hosted, "parse config", 4, { columns: { text: "content", vector: "emb" } });
+    await searchHosted(hosted, "parse config", 4);
+    expect(calls[0].slice(0, 3)).toEqual(["chunks", "content", "emb"]);
+    expect(calls[1].slice(0, 3)).toEqual(["chunks", "content", "embedding"]);
+  });
+
+  it("takes the code table's columns from its shape: content when it is text-indexed, else the prose; the embedded column; defaults without a shape", () => {
+    expect(codeColumnsOf({ vectorColumn: "emb", textColumns: ["path", "content"], primaryText: "path" })).toEqual({ text: "content", vector: "emb" });
+    expect(codeColumnsOf({ vectorColumn: "emb", textColumns: ["body"], primaryText: "body" })).toEqual({ text: "body", vector: "emb" });
+    expect(codeColumnsOf({ vectorColumn: null, textColumns: ["content"], primaryText: "content" })).toEqual({ text: "content", vector: "embedding" });
+    expect(codeColumnsOf(null)).toEqual(DEFAULT_CODE_COLUMNS);
   });
 
   it("find with the question fetches the rerank pool for the grader and asks for its limit; without one it fetches the limit", async () => {
