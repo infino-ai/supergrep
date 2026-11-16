@@ -181,9 +181,9 @@ program
   .command("chunk")
   .description(
     "cut text into the chunks an index of it would hold: JSON lines {id, path, text} on stdin, " +
-      "one JSON line per chunk {id, chunk, start_line, end_line, content, symbol?} on stdout; path picks how it is cut",
+      "one JSON line per chunk {id, chunk, start_line, end_line, content, symbol?, kind?, scope?} on stdout; path picks how it is cut",
   )
-  .action(chunkCmd);
+  .action(() => chunkCmd());
 
 program
   .command("usage")

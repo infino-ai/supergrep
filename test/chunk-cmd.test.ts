@@ -1,5 +1,29 @@
+import { Readable, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { chunkText } from "../src/commands/chunk-cmd.js";
+import { chunkCmd, chunkText } from "../src/commands/chunk-cmd.js";
+
+/** Run `cx chunk` on `input` as stdin; what it wrote to stdout, one parsed
+ * line per chunk, and what it threw. */
+async function run(input: string): Promise<{ out: Array<Record<string, unknown>>; error?: Error }> {
+  let written = "";
+  const output = new Writable({
+    write(chunk, _encoding, done) {
+      written += String(chunk);
+      done();
+    },
+  });
+  let error: Error | undefined;
+  try {
+    await chunkCmd(Readable.from([input]), output);
+  } catch (err) {
+    error = err as Error;
+  }
+  const out = written
+    .split("\n")
+    .filter((l) => l !== "")
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+  return { out, ...(error ? { error } : {}) };
+}
 
 /** Lines of plain text, numbered so a chunk's range can be read off its text. */
 function textLines(n: number): string {
@@ -37,5 +61,29 @@ describe("cx chunk", () => {
 
   it("gives no chunks for whitespace", async () => {
     expect(await chunkText({ id: "x", path: "a.txt", text: "  \n\n " })).toEqual([]);
+  });
+
+  it("reads JSON lines on stdin and writes each text's chunks in order, skipping blank lines", async () => {
+    const lines = [JSON.stringify({ id: "a", path: "a.txt", text: "one" }), "", JSON.stringify({ id: 2, path: "b.txt", text: "two\nthree" })];
+    const { out, error } = await run(lines.join("\n") + "\n");
+    expect(error).toBeUndefined();
+    expect(out).toEqual([
+      { id: "a", chunk: 0, start_line: 1, end_line: 1, content: "one" },
+      { id: 2, chunk: 0, start_line: 1, end_line: 2, content: "two\nthree" },
+    ]);
+  });
+
+  it("stops at a line that is not JSON, naming it, after the chunks of the lines before it", async () => {
+    const { out, error } = await run(`${JSON.stringify({ id: "a", path: "a.txt", text: "one" })}\n{not json\n`);
+    expect(out.map((o) => o.id)).toEqual(["a"]);
+    expect(error?.message).toBe("line 2 of stdin is not JSON");
+  });
+
+  it("stops at a line without a string path or text, naming it", async () => {
+    for (const bad of [{ id: 1, text: "no path" }, { id: 1, path: "a.txt" }, { id: 1, path: "a.txt", text: 3 }, null, ["a.txt", "x"]]) {
+      const { out, error } = await run(`${JSON.stringify(bad)}\n`);
+      expect(out).toEqual([]);
+      expect(error?.message).toBe('line 1 of stdin needs a string "path" and a string "text"');
+    }
   });
 });

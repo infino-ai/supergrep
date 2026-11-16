@@ -16,6 +16,7 @@
 // but whitespace gives no chunks.
 
 import { createInterface } from "node:readline";
+import type { Readable, Writable } from "node:stream";
 import { chunkFile } from "../core/chunker.js";
 
 /** One text to cut. */
@@ -58,8 +59,12 @@ function isRequest(value: unknown): value is ChunkRequest {
   return r !== null && typeof r === "object" && typeof r.path === "string" && typeof r.text === "string";
 }
 
-export async function chunkCmd(): Promise<void> {
-  const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+/** Read requests from `input` (stdin) and write their chunks to `output`
+ * (stdout). A blank line is skipped; a line that is not JSON, or lacks a
+ * string `path` and a string `text`, stops the command with its line number,
+ * after the chunks of the lines before it. */
+export async function chunkCmd(input: Readable = process.stdin, output: Writable = process.stdout): Promise<void> {
+  const lines = createInterface({ input, crlfDelay: Infinity });
   let n = 0;
   for await (const line of lines) {
     n += 1;
@@ -71,6 +76,6 @@ export async function chunkCmd(): Promise<void> {
       throw new Error(`line ${n} of stdin is not JSON`);
     }
     if (!isRequest(parsed)) throw new Error(`line ${n} of stdin needs a string "path" and a string "text"`);
-    for (const out of await chunkText(parsed)) process.stdout.write(`${JSON.stringify(out)}\n`);
+    for (const out of await chunkText(parsed)) output.write(`${JSON.stringify(out)}\n`);
   }
 }
