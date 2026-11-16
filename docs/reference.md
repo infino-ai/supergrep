@@ -102,7 +102,7 @@ network.
 | `CX_LOAD_JOB_MIN_CHUNKS` | `700` | the fewest chunks a write to a platform-embedded table sends by one load job instead of appends: a load job takes about 30 s to start and then embeds several times faster |
 | `CX_TABLE` | `chunks` | the hosted table the server reads, for a table loaded from object storage rather than built by `cx index` |
 | `CX_DATABASE` | the directory's name | on the stored account, the database this repository's platform tools use: a checkout reading a shared index (one repository's default branch) names it |
-| `CX_PLATFORM_READ_ONLY` | off | builds and syncs keep the local index alone and leave the platform copy as it is, which `search` still reads; set with `CX_DATABASE` on a checkout reading a shared index |
+| `CX_PLATFORM_READ_ONLY` | off | builds and syncs keep the local index alone and leave the platform's chunks table as it is, which the MCP `search` tool still reads (`cx search` reads the local index), and the server registers no database; set with `CX_DATABASE` on a checkout reading a shared index. It covers the chunks table only: the memory hooks still write to the database, and the account's data tools (`hydrate`, `hydrate_cancel`) still load into the database they name |
 | `CX_TEXT_COLUMN` | chosen from the table's shape | with `CX_TABLE`, the column the doors search on a table that has several indexed text columns |
 
 Every result carries a **usage receipt**: the tokens it returned, the files
@@ -125,7 +125,8 @@ cx sql <statement>        read-only SQL; --embed q="text" fills {{q}}
 cx status                 what the index holds, how fresh, vector readiness
 cx usage                  ledger of queries run and what each returned  (-n, --all, --clear, --json)
 cx chunk                  cut text into the chunks an index would hold: JSON lines {id, path, text} in,
-                          one JSON line per chunk out; path picks how (definitions, headings, records, lines)
+                          one JSON line per chunk out {id, chunk, start_line, end_line, content, symbol?, kind?, scope?};
+                          path picks how (definitions, headings, records, lines)
 cx mcp                    serve the MCP tools over stdio
 cx index --db <url>       also keep the index on an Infino platform database  (--api-key-file, --embed-provider, --analyzer)
 cx mcp --db <url>         also serve search over that copy                 (--api-key-file)

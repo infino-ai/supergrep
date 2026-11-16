@@ -2048,10 +2048,14 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * the outcome wanted, not a failure. Nothing to do when `--db` named the
    * database: it was registered by whoever named it. A refusal (a key the
    * platform will not take, an account that cannot spend) fails the build
-   * with the platform's words and the fix, and the next query tries again. */
+   * with the platform's words and the fix, and the next query tries again.
+   * Nothing either under CX_PLATFORM_READ_ONLY: its builds write no platform
+   * table, and a name the account does not have (a mistyped CX_DATABASE) is
+   * left unregistered: search fails against it rather than an empty
+   * database being made under that name. */
   const registered = new Set<string>();
   const ensureDatabase = async (ctx: RepoCtx): Promise<void> => {
-    if (!account || !ctx.hosted || registered.has(ctx.root)) return;
+    if (!account || !ctx.hosted || platformReadOnly() || registered.has(ctx.root)) return;
     const database = ctx.hosted.target.database;
     try {
       await createDatabase(account, database, { fetch: hostedOptions?.fetch });
@@ -2380,7 +2384,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     return fail(
       ctx.mutation || ctx.completion
         ? `the ${TABLE} table at ${label} is being loaded by the index build in progress - retry when it finishes`
-        : `no ${TABLE} table at ${label} yet - run \`cx index --db ${label}\` to load it`,
+        : platformReadOnly()
+          ? `no ${TABLE} table at ${label} yet - this checkout leaves it to whatever keeps that database current (CX_PLATFORM_READ_ONLY); check that CX_DATABASE names the right database`
+          : `no ${TABLE} table at ${label} yet - run \`cx index --db ${label}\` to load it`,
     );
   };
 

@@ -188,6 +188,12 @@ export interface IndexOptions {
    * `IndexSpec.fts(column)`. A sync whose value differs from the recorded one
    * reports rebuild-required: a table's analyzer is fixed at create time. */
   analyzer?: Analyzer;
+  /** Platform table only: the database is the stored account's (not one
+   * `--db` named), and a build registers it on the account when the platform
+   * answers that it does not have it yet. A database `--db` named is
+   * registered by whoever named it: a name it does not know fails the build
+   * rather than creating a database. */
+  registerDatabase?: boolean;
   /** `load` is the platform pass (drop, create, append waves) after the local
    * stages; the other phases are the local build's. */
   onPhase?: (phase: "scan" | "chunk" | "commit-text" | "embed" | "commit-vectors" | "load") => void;
@@ -655,7 +661,8 @@ async function loadPlatform(
   const meter = newHostedMeter();
   // A build replaces the platform table the way it replaces the local one:
   // the two are the same index, and a build is a full rebuild of both.
-  if ((await listTablesRegistering(hosted)).includes(TABLE)) {
+  const tables = opts.registerDatabase ? await listTablesRegistering(hosted) : await hosted.listTables();
+  if (tables.includes(TABLE)) {
     await hosted.dropTable(TABLE, true);
     meterHostedCall(meter, hosted);
   }
@@ -693,10 +700,11 @@ async function loadSpill(hosted: HostedDb, spill: Spill): Promise<void> {
   }
 }
 
-/** The platform database's tables. A first build may name a database the
- * account does not have yet (`CX_DATABASE` naming a repository's shared
- * index before anything was loaded into it), whose tables cannot be listed
- * (404): it is registered on the account, and listed again. */
+/** The platform database's tables, on the stored account
+ * (`registerDatabase`). A first build may name a database the account does
+ * not have yet (`CX_DATABASE` naming a repository's shared index before
+ * anything was loaded into it), whose tables cannot be listed (404): it is
+ * registered on the account, and listed again. */
 async function listTablesRegistering(hosted: HostedDb): Promise<string[]> {
   try {
     return await hosted.listTables();
