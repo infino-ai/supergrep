@@ -8,9 +8,10 @@
 // sits beside the local one in the index dir.
 
 import { openIndex, NoIndexError, type IndexHandle } from "../core/context.js";
-import { embedProvider, indexDir, resolveRoot } from "../core/config.js";
+import { autoIndexEnabled, embedProvider, indexDir, resolveRoot } from "../core/config.js";
 import { createEmbedder, embedderInfo } from "../core/embedder.js";
 import { readPlatformManifest, type Manifest } from "../core/manifest.js";
+import { analyzerOf, builtByEarlierVersion } from "../core/analyzer.js";
 import { find, search, runSql, jsonify } from "../core/searcher.js";
 import {
   receiptEnabled,
@@ -189,7 +190,29 @@ export async function statusCmd(opts: StatusCmdOptions): Promise<void> {
   }
   const m = handle.manifest;
   const platform = readPlatformManifest(handle.dir);
+  // An index an earlier version built (`ascii_lower`), which this engine
+  // does not open: every query tool refuses it until a build replaces it -
+  // the MCP server's first query, or `cx index`. Said here first, so status
+  // does not describe as ready an index the next query refuses.
+  const rebuild = builtByEarlierVersion(m)
+    ? `built by an earlier version of code-context (analyzer ${analyzerOf(m)}), which this version cannot read`
+    : null;
+  // The MCP server rebuilds such an index on its first query only when it
+  // builds a missing one (CX_AUTO_INDEX, on unless 0); off, it says to run
+  // `cx index` as for a repository never indexed. The server and this
+  // command may run with different environments, so this is the common case
+  // read from this one.
+  const serverRebuilds = autoIndexEnabled();
   if (opts.hook) {
+    if (rebuild) {
+      console.log(
+        `code-context index: ${rebuild}; ` +
+          (serverRebuilds
+            ? "the MCP server rebuilds it on its first query (keyword search is live in seconds), or run `cx index` there."
+            : "run `cx index` there to rebuild it."),
+      );
+      return;
+    }
     console.log(
       `code-context index: ${fmtCount(m.chunks)} chunks from ${fmtCount(m.files)} files, ` +
         `vectors ${m.vectors}, indexed ${fmtAge(m.indexedAt)}. ` +
@@ -200,10 +223,18 @@ export async function statusCmd(opts: StatusCmdOptions): Promise<void> {
     return;
   }
   if (opts.json) {
-    console.log(JSON.stringify(platform ? { ...m, platform } : m, null, 2));
+    console.log(JSON.stringify({ ...m, ...(platform ? { platform } : {}), ...(rebuild ? { rebuild } : {}) }, null, 2));
     return;
   }
   console.log(`${bold("code-context")} - ${handle.root}`);
+  if (rebuild) {
+    console.log(
+      yellow(
+        `  rebuild    ${rebuild}: run \`cx index\` here to rebuild it` +
+          (serverRebuilds ? " (the MCP server rebuilds it on its first query)" : ""),
+      ),
+    );
+  }
   console.log(`  chunks     ${fmtCount(m.chunks)} from ${fmtCount(m.files)} files`);
   if (m.truncatedFiles) {
     console.log(

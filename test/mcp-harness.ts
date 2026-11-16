@@ -145,7 +145,7 @@ export interface Started {
 export async function start(
   platform: Platform,
   prefix: string,
-  options: { startupBudgetMs?: number; localEmbedder?: Embedder } = {},
+  options: { startupBudgetMs?: number; accountData?: "account" | "database" | "table"; localEmbedder?: Embedder } = {},
 ): Promise<Started> {
   const { serveMcp } = await import("../src/mcp/server.js");
   const root = mkdtempSync(join(tmpdir(), prefix));
