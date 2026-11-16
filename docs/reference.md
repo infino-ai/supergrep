@@ -123,6 +123,8 @@ cx search <query>         exact terms + meaning, one ranked pass           (-k h
 cx sql <statement>        read-only SQL; --embed q="text" fills {{q}}
 cx status                 what the index holds, how fresh, vector readiness
 cx usage                  ledger of queries run and what each returned  (-n, --all, --clear, --json)
+cx chunk                  cut text into the chunks an index would hold: JSON lines {id, path, text} in,
+                          one JSON line per chunk out; path picks how (definitions, headings, records, lines)
 cx mcp                    serve the MCP tools over stdio
 cx index --db <url>       also keep the index on an Infino platform database  (--api-key-file, --embed-provider, --analyzer)
 cx mcp --db <url>         also serve search over that copy                 (--api-key-file)
@@ -170,15 +172,8 @@ stack.
   part of and that definition's span.
 - **Index:** [infino](https://github.com/infino-ai/infino) tables - BM25 and
   IVF vector indexes over a single copy of the data - queried in-process
-  through the Node binding locally, and the same rows on an Infino platform
-  database for `search`, written by the same builds and syncs. Where the
-  platform embeds (the default), the platform copy is loaded from this
-  machine's disk: the chunks this machine cut are written as rows,
-  uploaded into the database's storage, and loaded by a platform load job
-  (a build replaces the table, a sync appends the changed files' rows after
-  deleting their old ones), and the platform chooses what the table
-  indexes and embeds. The platform manifest records the columns it chose,
-  which `search` reads.
+  through the Node binding locally, and the same table on an Infino platform
+  database for `search`, written by the same builds and syncs.
 - **Embeddings:** computed on the platform, with its own model, so the
   compute-heavy stage never runs on your laptop; `--embed-provider local`
   embeds on this machine and ships the vectors instead.

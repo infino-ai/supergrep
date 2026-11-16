@@ -86,10 +86,8 @@ import {
   type Analyzer,
 } from "./analyzer.js";
 import { EMBEDDING_COLUMN, PLATFORM_EMBEDDER_MODEL, PLATFORM_EMBEDDER_PROVIDER } from "./context.js";
-import { rowsToIpc, type HostedDb, type HostedIndexes, type JsonColumn } from "./hosted.js";
-import { clearTable, ensureDatabase, loadRows, writeRows, type TextRow } from "./platform-load.js";
-import { codeColumnsOf, DEFAULT_CODE_COLUMNS } from "./searcher.js";
-import { resolveTableShape } from "./table-shape.js";
+import { HostedError, rowsToIpc, type HostedDb, type HostedIndexes, type JsonColumn } from "./hosted.js";
+import { createDatabase } from "./account-api.js";
 import {
   diffFiles,
   emptyFileState,
@@ -645,7 +643,6 @@ async function loadPlatform(
   const { spill, chunkCount } = scanned;
 
   const platform = provider === "platform";
-  if (platform) return loadPlatformCopy(opts, hosted, scanned, stats);
   const dim = platform ? undefined : vectors?.dim;
   // Zero chunks ⇒ no vector spill was ever written and nothing is appended.
   if (dim !== undefined && chunkCount > 0) verifyVectorSpill(spill, chunkCount, dim);
@@ -657,7 +654,7 @@ async function loadPlatform(
   const meter = newHostedMeter();
   // A build replaces the platform table the way it replaces the local one:
   // the two are the same index, and a build is a full rebuild of both.
-  if ((await hosted.listTables()).includes(TABLE)) {
+  if ((await listTablesRegistering(hosted)).includes(TABLE)) {
     await hosted.dropTable(TABLE, true);
     meterHostedCall(meter, hosted);
   }
@@ -678,59 +675,23 @@ async function loadPlatform(
   return loadStats;
 }
 
-/** A build's platform copy where the platform embeds: the spill's chunks,
- * the rows the local index holds, written out and loaded from this
- * machine's disk (platform-load.ts), replacing the table. The platform
- * chooses what the table indexes and embeds, so no schema or index is
- * declared here. A tree with no chunks loads nothing and leaves no table:
- * the first sync that brings rows loads it. */
-async function loadPlatformCopy(
-  opts: IndexOptions,
-  hosted: HostedDb,
-  scanned: Scanned,
-  stats: IndexStats,
-): Promise<HostedLoadStats> {
-  const { indexDirPath, onPhase } = opts;
-  const { spill, chunkCount } = scanned;
-  onPhase?.("load");
-  const tLoad = performance.now();
-  // A build is a full rebuild of both copies: the old table goes first, from
-  // a database the account has.
-  await ensureDatabase(hosted);
-  await clearTable(hosted, TABLE);
-  if (chunkCount > 0) await loadSpill(hosted, spill, "new");
-  const loadStats: HostedLoadStats = { appendCalls: 0, loadWallMs: Math.round(performance.now() - tLoad) };
-  // The columns the platform chose, for search to read (searcher.ts, codeColumnsOf);
-  // a shape that cannot be read leaves the defaults, as for a table with none.
-  const columns = chunkCount > 0 ? codeColumnsOf(await resolveTableShape(hosted, TABLE).catch(() => null)) : DEFAULT_CODE_COLUMNS;
-  writePlatformManifest(indexDirPath, {
-    ...toManifest(
-      { ...stats, vectors: "ready", hosted: loadStats },
-      PLATFORM_LOAD_ANALYZER,
-      { provider: PLATFORM_EMBEDDER_PROVIDER, model: PLATFORM_EMBEDDER_MODEL },
-      "hosted",
-    ),
-    columns,
-  });
-  return loadStats;
-}
-
-/** The analyzer a loaded table's text indexes are built with when none is
- * declared: the platform's default. */
-const PLATFORM_LOAD_ANALYZER: Analyzer = "standard";
-
-/** Write the spill's chunks out as table rows beside it and load them
- * (`new` for a build, `append` for a sync), waiting for the load to end;
- * the rows file is removed either way. */
-async function loadSpill(hosted: HostedDb, spill: Spill, ifExists: "append" | "new"): Promise<void> {
-  const rowsPath = spill.chunksPath.replace(/\.chunks\.ndjson$/, ".rows.ndjson");
+/** The platform database's tables. A first build may name a database the
+ * account does not have yet (`CX_DATABASE` naming a repository's shared
+ * index before anything was loaded into it), whose tables cannot be listed
+ * (404): it is registered on the account, and listed again. */
+async function listTablesRegistering(hosted: HostedDb): Promise<string[]> {
   try {
-    await writeRows(spill.chunksPath, rowsPath, toTextRow as (chunk: never) => TextRow);
-    await loadRows(hosted, { table: TABLE, rowsPath, ifExists });
-  } finally {
-    rmSync(rowsPath, { force: true });
+    return await hosted.listTables();
+  } catch (err) {
+    if (!(err instanceof HostedError && err.status === HTTP_NOT_FOUND)) throw err;
+    const { baseUrl, apiKey, database } = hosted.target;
+    await createDatabase({ baseUrl, apiKey }, database, { fetch: hosted.fetchFn() });
+    return hosted.listTables();
   }
 }
+
+/** The status the platform answers a database the account does not have. */
+const HTTP_NOT_FOUND = 404;
 
 /** Running totals of a hosted load's platform calls; `loadWallMs` is added
  * when the load ends. */
@@ -1353,7 +1314,7 @@ export async function syncRepo(opts: IndexOptions): Promise<SyncOutcome> {
       // fails leaves the sync unrecorded and re-applied, never a table that is
       // current with a manifest that is not.
       if (hosted && platformManifest) {
-        platformCounts = await Promise.all([hosted.querySql(PLATFORM_COUNTS_SQL), hosted.querySql(PLATFORM_LANGUAGES_SQL)]);
+        platformCounts = await Promise.all([hosted.querySql(TABLE_COUNTS_SQL), hosted.querySql(TABLE_LANGUAGES_SQL)]);
       }
     } catch (err) {
       // One or both tables may hold part of this diff. Mark every touched
@@ -1407,12 +1368,9 @@ export async function syncRepo(opts: IndexOptions): Promise<SyncOutcome> {
 }
 
 /** Apply a sync's diff to the platform table: the stale paths deleted, then
- * the fresh rows added. Where the platform embeds, the rows are loaded as an
- * append, which keeps what the table indexes and embeds, and waited for: the
- * deletes run first, between loads, never while a load is writing the
- * table. Otherwise they are appended in waves, with what
- * `vectors` says rides along - the local vectors of width `dim` for a
- * client-vector column, none when the table is keyword-only. */
+ * the fresh rows appended in waves. `vectors` says what rides with the rows -
+ * nothing for a platform-embedded column, the local vectors of width `dim`
+ * for a client-vector column, none when the table is keyword-only. */
 async function applyPlatformDiff(
   hosted: HostedDb,
   predicates: string[],
@@ -1428,11 +1386,9 @@ async function applyPlatformDiff(
     meterHostedCall(meter, hosted);
   }
   if (chunksAdded > 0) {
-    if ("platform" in vectors) {
-      await loadSpill(hosted, spill, "append");
-    } else {
-      await appendSpillHosted(hosted, spill, chunksAdded, hostedColumns(vectors), vectors.dim, false, meter, onProgress);
-    }
+    const platform = "platform" in vectors;
+    const dim = platform ? undefined : vectors.dim;
+    await appendSpillHosted(hosted, spill, chunksAdded, hostedColumns(vectors), dim, platform, meter, onProgress);
   }
   return { ...meter, loadWallMs: Math.round(performance.now() - tLoad) };
 }
@@ -1440,12 +1396,6 @@ async function applyPlatformDiff(
 /** The recount a sync writes back to a manifest. */
 const TABLE_COUNTS_SQL = `SELECT COUNT(*) AS n, COUNT(DISTINCT path) AS f FROM ${TABLE}`;
 const TABLE_LANGUAGES_SQL = `SELECT lang, COUNT(*) AS n FROM ${TABLE} GROUP BY lang`;
-/** The platform table's recount: the platform may cut a chunk into passages,
- * each a row with the chunk's path and first line, so chunks are counted by
- * those, not by rows. */
-const CHUNK_KEY = `path || ':' || CAST(start_line AS VARCHAR)`;
-const PLATFORM_COUNTS_SQL = `SELECT COUNT(DISTINCT ${CHUNK_KEY}) AS n, COUNT(DISTINCT path) AS f FROM ${TABLE}`;
-const PLATFORM_LANGUAGES_SQL = `SELECT lang, COUNT(DISTINCT ${CHUNK_KEY}) AS n FROM ${TABLE} GROUP BY lang`;
 
 /** The manifest fields a recount refreshes, from the two queries' rows. An
  * empty counts result (a table with no rows can answer with none) is zero. */

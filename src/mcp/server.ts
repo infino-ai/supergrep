@@ -3304,14 +3304,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             // (`lines`): the platform manifest this machine wrote when it loaded
             // the table records it; a table loaded some other way is read with
             // the platform's default for a bare column, as analyzerOf says.
-            const platformManifest = readPlatformManifest(ctx.dir);
-            const hostedAnalyzer = analyzerOf(platformManifest ?? { origin: "hosted" });
-            // The table's own columns, which the platform chose when it loaded it
-            // (the manifest records them); a table this client created has
-            // the defaults.
-            const columns = platformManifest?.columns;
+            const hostedAnalyzer = analyzerOf(readPlatformManifest(ctx.dir) ?? { origin: "hosted" });
             const [{ value: result, own }, recalled] = await Promise.all([
-              answeredBy(searchHosted(ctx.hosted, query, k, { lines, analyzer: hostedAnalyzer, question, columns }), ctx),
+              answeredBy(searchHosted(ctx.hosted, query, k, { lines, analyzer: hostedAnalyzer, question }), ctx),
               recallFor(query),
             ]);
             // The hits seed the graph by their place: a chunk's path and
