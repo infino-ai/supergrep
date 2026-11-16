@@ -587,11 +587,11 @@ describe("failures during a build", () => {
     expect(readPlatformManifest(dir)!.vectors).toBe("ready");
     writeFileSync(join(root, "src", "small0.txt"), textFile(0, SMALL_LINES, "changedmarker"));
 
-    // The rebuild's append fails: the table on the platform is empty (created,
+    // The rebuild's load fails: the table on the platform is empty (created,
     // never filled) while the file state describes the new tree.
-    const failing = fakePlatform([TABLE], "append");
+    const failing = fakePlatform([TABLE], "hydrate");
     const stats = await indexRepo({ root, db, hosted: failing.db(), indexDirPath: dir, embedder: fakeEmbedder });
-    expect(stats.hostedError).toMatch(/append: server returned 500/);
+    expect(stats.hostedError).toMatch(/server returned 500/);
     expect(readPlatformManifest(dir)).toBeUndefined();
 
     // Not "up to date": the table has no record here, a build reloads it.
