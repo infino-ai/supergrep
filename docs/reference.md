@@ -103,7 +103,8 @@ network.
 | `CX_TABLE` | `chunks` | the hosted table the server reads, for a table loaded from object storage rather than built by `cx index` |
 | `CX_DATABASE` | the directory's name | on the stored account, the database this repository's platform tools use: a checkout reading a shared index (one repository's default branch) names it |
 | `CX_PLATFORM_READ_ONLY` | off | builds and syncs keep the local index alone and leave the platform's chunks table as it is, which the MCP `search` tool still reads (`cx search` reads the local index), and the server registers no database; set with `CX_DATABASE` on a checkout reading a shared index. It covers the chunks table only: the memory hooks still write to the database, and the account's data tools (`hydrate`, `hydrate_cancel`) still load into the database they name |
-| `CX_TEXT_COLUMN` | chosen from the table's shape | with `CX_TABLE`, the column the doors search on a table that has several indexed text columns |
+| `CX_LOCAL_DB` | unset | a folder holding an Infino database that another process writes (an agent's memory plugin, for example): the MCP server's `find`, `search`, `sql` and `read` run over its tables on this machine, with no account and no code index. `CX_TABLE` names the table a call reads when it names none; unset, `memory` when the database holds it, else its first table. A stored login is set aside; `--db` beside it is refused |
+| `CX_ACCOUNT_DATA` | `account` | how much of the account the server reaches: `account`, `database` or `table` (see [Building on SuperGrep](plugins.md)) |
 
 Every result carries a **usage receipt**: the tokens it returned, the files
 it spanned, and a running session total. For the platform tools the receipt
