@@ -192,15 +192,20 @@ export function fakePlatform(tables: string[] = [], failOn?: string, loadState =
         const n = before - rows.length;
         return respond({ matched: n, n_tombstoned: n, n_not_found: 0 }, true);
       }
+      case "databases":
+        return respond({ name: TARGET.database }, true);
       case "hydrate": {
         if (new URL(url).pathname.endsWith("/uploads")) {
           const files = (call.json as { files: Array<{ name: string }> }).files;
           return respond({ upload: "u1", prefix: "_source/u1/", files: files.map((f, i) => ({ name: f.name, url: `${STORAGE}/u1/${i}` })) }, true);
         }
         if (call.method === "GET") return respond({ state: loadState, ...(loadState === "failed" ? { error: "the load failed" } : {}) });
+        if (call.method === "DELETE") {
+          // An ended load's record is cleared; with none, there is nothing to clear.
+          return loads.length > 0 ? new Response(null, { status: 200 }) : new Response(JSON.stringify({ error: "no job" }), { status: 404 });
+        }
         const load = call.json as { table: string; if_exists?: string };
         loads.push(load as unknown as Row);
-        if (load.if_exists === "replace") rows = [];
         live.add(load.table);
         for (const line of uploaded.split("\n")) {
           if (line === "") continue;
@@ -469,16 +474,23 @@ describe("a build with a platform database (the platform embeds)", () => {
     expect(stats.vectors).toBe("none");
     expect(stats.hostedError).toBeUndefined();
 
-    // The load makes the table and the platform chooses what it indexes and embeds: no
-    // create_table, no append, no drop (a replace starts it over).
+    // The load makes the table and the platform chooses what it indexes and
+    // embeds: no create_table, no append. The table that was there is dropped
+    // first (a build starts both copies over).
     expect(platform.ops()).not.toContain("create_table");
     expect(platform.ops()).not.toContain("append");
-    expect(platform.ops()).not.toContain("drop_table");
-    const upload = platform.calls.find((c) => c.op === "hydrate" && c.url.endsWith("/uploads"))!;
+    expect(platform.ops()).toContain("drop_table");
+    // The database is registered before anything is uploaded into it.
+    const registered = platform.calls.findIndex((c) => c.op === "databases" && c.method === "POST");
+    const uploadAt = platform.calls.findIndex((c) => c.op === "hydrate" && c.url.endsWith("/uploads"));
+    expect(registered).toBeGreaterThanOrEqual(0);
+    expect(uploadAt).toBeGreaterThan(registered);
+    expect(platform.calls[registered].json).toEqual({ name: TARGET.database });
+    const upload = platform.calls[uploadAt];
     expect(upload.json).toMatchObject({ origin: "https://api.example.test", files: [{ size: expect.any(Number) }] });
     expect(platform.calls.filter((c) => c.op === "storage")).toHaveLength(1);
     expect(platform.loads).toHaveLength(1);
-    expect(platform.loads[0]).toEqual({ table: TABLE, source: { kind: "prefix", prefix: "_source/u1/" }, format: "ndjson", if_exists: "replace" });
+    expect(platform.loads[0]).toEqual({ table: TABLE, source: { kind: "prefix", prefix: "_source/u1/" }, format: "ndjson" });
 
     // What went up is the local index's rows, one per chunk, the table's columns only.
     const sent = platform.uploaded().trim().split("\n").map((l) => JSON.parse(l) as Row);
@@ -497,6 +509,22 @@ describe("a build with a platform database (the platform embeds)", () => {
     expect(remote.analyzer).toBe("standard");
     // The columns the platform chose, which search reads.
     expect(remote.columns).toEqual({ text: "content", vector: "emb" });
+  });
+
+  it("a rebuild clears the earlier load's record and drops the table before it loads again", async () => {
+    writeSmallFixture(root);
+    const platform = fakePlatform();
+    await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" });
+    const before = platform.calls.length;
+    await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder, embedProvider: "platform" });
+    const again = platform.calls.slice(before);
+    const cleared = again.findIndex((c) => c.op === "hydrate" && c.method === "DELETE");
+    const dropped = again.findIndex((c) => c.op === "drop_table");
+    const loaded = again.findIndex((c) => c.op === "hydrate" && c.method === "POST" && !c.url.endsWith("/uploads"));
+    expect(cleared).toBeGreaterThanOrEqual(0);
+    expect(dropped).toBeGreaterThan(cleared);
+    expect(loaded).toBeGreaterThan(dropped);
+    expect(platform.rows()).toHaveLength(3);
   });
 
   it("is the default provider", async () => {

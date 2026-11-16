@@ -554,6 +554,12 @@ export class HostedDb {
     this.checkedReadTimeoutMs = opts.checkedReadTimeoutMs ?? CHECKED_READ_TIMEOUT_MS;
   }
 
+  /** The fetch this client's calls go through (a test's scripted one), for a
+   * call of the account plane about this client's database. */
+  fetchFn(): typeof fetch {
+    return this.fetchImpl;
+  }
+
   /** Telemetry of the most recent logical call, or null before the first. */
   lastCall(): HostedCallInfo | null {
     return this.last;

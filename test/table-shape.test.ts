@@ -376,6 +376,15 @@ describe("the doors over rows", () => {
     expect(calls[1].slice(0, 3)).toEqual(["chunks", "content", "embedding"]);
   });
 
+  it("code search returns one hit per chunk when the platform cut a chunk into passages", async () => {
+    const passage = (score: number) => ({ path: "a.ts", start_line: 10, end_line: 60, lang: "ts", symbol: "f", content: "x", score });
+    const hosted = {
+      hybridSearch: async () => [passage(0.9), passage(0.8), { ...passage(0.5), path: "b.ts" }],
+    };
+    const result = await searchHosted(hosted, "f", 3);
+    expect(result.hits.map((h) => h.path)).toEqual(["a.ts", "b.ts"]);
+  });
+
   it("takes the code table's columns from its shape: content when it is text-indexed, else the prose; the embedded column; defaults without a shape", () => {
     expect(codeColumnsOf({ vectorColumn: "emb", textColumns: ["path", "content"], primaryText: "path" })).toEqual({ text: "content", vector: "emb" });
     expect(codeColumnsOf({ vectorColumn: "emb", textColumns: ["body"], primaryText: "body" })).toEqual({ text: "body", vector: "emb" });

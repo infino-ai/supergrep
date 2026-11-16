@@ -16,7 +16,8 @@ import { createInterface } from "node:readline";
 import { basename } from "node:path";
 import { Readable } from "node:stream";
 import { once } from "node:events";
-import type { HostedDb, RowRecord } from "./hosted.js";
+import { createDatabase } from "./account-api.js";
+import { HostedError, type HostedDb, type RowRecord } from "./hosted.js";
 
 /** The source format of the rows file. */
 const ROWS_FORMAT = "ndjson";
@@ -67,10 +68,10 @@ export interface LoadOptions {
   table: string;
   /** The NDJSON rows file to upload. */
   rowsPath: string;
-  /** What the load does with a table of that name: `append` adds the rows
-   * (the table keeps the roles it was built with); `replace` starts the
-   * table over from them, its roles chosen again (a build). */
-  ifExists: "append" | "replace";
+  /** `append` adds the rows to the table, which keeps what it indexes and
+   * embeds; `new` loads a table that is not there (a build, which clears the
+   * old one first: `clearTable`). */
+  ifExists: "append" | "new";
   pollMs?: number;
   waitMs?: number;
   /** Sleeps between polls; a test's own clock. */
@@ -90,6 +91,10 @@ export interface LoadResult {
  * the job to end. Throws when the upload, the submission or the load fails,
  * or the load does not end within the wait. */
 export async function loadRows(hosted: HostedDb, opts: LoadOptions): Promise<LoadResult> {
+  // Files are uploaded into a database the account has: registered here, as
+  // the `hydrate` tool registers it first (an existing one is left as it is).
+  const { baseUrl, apiKey, database } = hosted.target;
+  await createDatabase({ baseUrl, apiKey }, database, { fetch: hosted.fetchFn() });
   const size = statSync(opts.rowsPath).size;
   const name = basename(opts.rowsPath);
   // A client of the platform's API opens its uploads for the API's own origin,
@@ -105,12 +110,28 @@ export async function loadRows(hosted: HostedDb, opts: LoadOptions): Promise<Loa
     table: opts.table,
     source: { kind: PREFIX_SOURCE, prefix },
     format: ROWS_FORMAT,
-    if_exists: opts.ifExists,
+    ...(opts.ifExists === "append" ? { if_exists: "append" } : {}),
   });
   const job = String(answer.job ?? opts.table);
   const record = await waitForLoad(hosted, opts.table, opts);
   return { job, prefix, record };
 }
+
+/** Make room for a new load of `table`: its ended load's record cleared, so
+ * the name can be loaded again, and the table dropped when it is there. Not
+ * every deployment can replace a table in one load, so a build does it in
+ * these steps. A table with no load record is left to the drop alone. */
+export async function clearTable(hosted: Pick<HostedDb, "hydrateCancel" | "listTables" | "dropTable">, table: string): Promise<void> {
+  try {
+    await hosted.hydrateCancel(table);
+  } catch (err) {
+    if (!(err instanceof HostedError && err.status === HTTP_NOT_FOUND)) throw err;
+  }
+  if ((await hosted.listTables()).includes(table)) await hosted.dropTable(table, true);
+}
+
+/** The status of a table with no load record to clear. */
+const HTTP_NOT_FOUND = 404;
 
 /** Wait until `table`'s load job has ended: its record when its rows
  * landed, a throw when it failed, stopped, or outlasted the wait. */

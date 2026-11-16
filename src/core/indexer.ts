@@ -87,7 +87,7 @@ import {
 } from "./analyzer.js";
 import { EMBEDDING_COLUMN, PLATFORM_EMBEDDER_MODEL, PLATFORM_EMBEDDER_PROVIDER } from "./context.js";
 import { rowsToIpc, type HostedDb, type HostedIndexes, type JsonColumn } from "./hosted.js";
-import { loadRows, writeRows, type TextRow } from "./platform-load.js";
+import { clearTable, loadRows, writeRows, type TextRow } from "./platform-load.js";
 import { codeColumnsOf, DEFAULT_CODE_COLUMNS } from "./searcher.js";
 import { resolveTableShape } from "./table-shape.js";
 import {
@@ -694,11 +694,9 @@ async function loadPlatformCopy(
   const { spill, chunkCount } = scanned;
   onPhase?.("load");
   const tLoad = performance.now();
-  if (chunkCount > 0) {
-    await loadSpill(hosted, spill, "replace");
-  } else if ((await hosted.listTables()).includes(TABLE)) {
-    await hosted.dropTable(TABLE, true);
-  }
+  // A build is a full rebuild of both copies: the old table goes first.
+  await clearTable(hosted, TABLE);
+  if (chunkCount > 0) await loadSpill(hosted, spill, "new");
   const loadStats: HostedLoadStats = { appendCalls: 0, loadWallMs: Math.round(performance.now() - tLoad) };
   // The columns the platform chose, for search to read (searcher.ts, codeColumnsOf);
   // a shape that cannot be read leaves the defaults, as for a table with none.
@@ -720,9 +718,9 @@ async function loadPlatformCopy(
 const PLATFORM_LOAD_ANALYZER: Analyzer = "standard";
 
 /** Write the spill's chunks out as table rows beside it and load them
- * (`replace` for a build, `append` for a sync), waiting for the load to
- * end; the rows file is removed either way. */
-async function loadSpill(hosted: HostedDb, spill: Spill, ifExists: "append" | "replace"): Promise<void> {
+ * (`new` for a build, `append` for a sync), waiting for the load to end;
+ * the rows file is removed either way. */
+async function loadSpill(hosted: HostedDb, spill: Spill, ifExists: "append" | "new"): Promise<void> {
   const rowsPath = spill.chunksPath.replace(/\.chunks\.ndjson$/, ".rows.ndjson");
   try {
     await writeRows(spill.chunksPath, rowsPath, toTextRow as (chunk: never) => TextRow);
