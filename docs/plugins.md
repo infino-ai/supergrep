@@ -32,9 +32,9 @@ says:
 
 | `CX_ACCOUNT_DATA` | the server reaches |
 |---|---|
-| `account`, the default (also `1`, `true`, `yes`) | every database the key may see: the `tables` and `hydrate` tools, and the `database` argument of the query tools |
-| `database` (also `0`, `false`, `no`) | its own database only. Every table in it is described in the `sql` text, and `sql` and `join_keys` may join them |
-| `table` | the one table it was started for. The other tables of its database are not described, `join_keys` is not offered, and a `sql` statement that names one is refused before it runs |
+| `account`, the default (also `1`, `true`, `yes`, `on`) | every database the key may see: the `tables` and `hydrate` tools, and the `database` argument of the query tools |
+| `database` (also `0`, `false`, `no`, `off`) | its own database only. Every table in it is described in the `sql` text, and `sql` and `join_keys` may join them |
+| `table` | the one table it was started for. The other tables of its database are not described, `join_keys` is not offered, and a `sql` statement that names one, bare or qualified (`hr.payroll`), is refused before it runs. The database's tables are listed for every statement, so a table made a moment ago is refused too |
 
 Any other value stops the server at startup. Whatever the key could see beyond
 the scope, the server does not reach.
