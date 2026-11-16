@@ -65,6 +65,22 @@ export function tablesNamed(query: string, tables: readonly string[]): string[] 
   return named;
 }
 
+/** The tables of `tables` a statement reaches in any written form: bare,
+ * quoted, or after a qualifier (`hr.payroll`, `public.payroll`,
+ * `"public"."payroll"`). Unlike `tablesNamed`, a name after a `.` counts, so
+ * a column that shares a table's name (`p.payroll`) counts too: this is the
+ * check that keeps a statement off tables it may not read, and it errs
+ * toward refusing. */
+export function tablesReached(query: string, tables: readonly string[]): string[] {
+  const reached: string[] = [];
+  for (const table of tables) {
+    if (!table) continue;
+    const re = new RegExp(`(?<![\\w])"?${escapeRegex(table)}"?(?![\\w])`, "i");
+    if (re.test(query) && !reached.includes(table)) reached.push(table);
+  }
+  return reached;
+}
+
 /** Every alias a statement gives one of `tables`: `FROM issues i`,
  * `JOIN logs AS l`, `hybrid_search('chunks', ...) AS c`. Alias to table. */
 export function aliasesOf(query: string, tables: readonly string[]): Map<string, string> {

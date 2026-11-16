@@ -45,8 +45,9 @@ export interface Manifest {
    * tokenized by the engine with this analyzer, and the client mirrors it to
    * decide what the index can look up. Absent on manifests written before it
    * was recorded: those tables were built locally through the binding's bare
-   * `IndexSpec.fts(column)`, which the pinned engine (0.5.2) indexes with
-   * `ascii_lower`, its default - read an absent value as that. */
+   * `IndexSpec.fts(column)`, which the engine pinned then (0.5.2) indexed with
+   * `ascii_lower`, its default - read an absent value as that
+   * (analyzer.ts, UNRECORDED_LOCAL_ANALYZER). */
   analyzer?: Analyzer;
   embedder?: EmbedderInfo;
   files: number;

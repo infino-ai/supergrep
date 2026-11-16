@@ -72,6 +72,8 @@ import {
   autoSyncEnabled as autoSyncSetting,
   apiToolsEnabled,
   readOnlyEnabled,
+  accountDataScope,
+  type AccountDataScope,
   configuredCardTier,
   LEAN_CARD_TIER,
   memoryEnabled,
@@ -162,6 +164,7 @@ export function pastDeadline(err: unknown): boolean {
   return err instanceof HostedError && err.pastDeadline;
 }
 import { hostedDbFor, localDb, newHostedMemo, platformLabel, platformTableReady, type IndexHandle } from "../core/context.js";
+import { builtByEarlierVersion } from "../core/analyzer.js";
 import { budgetSqlRows, foldValidationFacts, rankRows, sqlBudgetHint } from "../core/facts.js";
 import { HostedError, type HostedDb, type HostedOptions, type PromptCards, type ReadChecks, type RowRecord } from "../core/hosted.js";
 import {
@@ -191,8 +194,9 @@ import {
   hostedTelemetry,
   type CallTelemetry,
   CONTENT_COLUMN,
-  FIND_RESULT_CHAR_BUDGET,
   MAX_FIND_CONTEXT,
+  MAX_FIND_PAGES,
+  AUTO_CHUNK_CONTEXT,
 } from "../core/searcher.js";
 import { renderFind } from "../core/find-text.js";
 import {
@@ -227,7 +231,7 @@ import {
   type ResolveOptions,
   type TableShape,
 } from "../core/table-shape.js";
-import { joinGate, joinRefusal, tablesNamed, withoutGraphCalls, type PlatformJoin } from "../core/join-gate.js";
+import { joinGate, joinRefusal, tablesNamed, tablesReached, withoutGraphCalls, type PlatformJoin } from "../core/join-gate.js";
 import { expandAcrossGraph, newExpansionMemory, type GraphExpansion, type Searched } from "../core/graph-expand.js";
 import { DataPlane, type HydrateToolSource } from "./data.js";
 import { topKAggregateRefusal } from "../core/topk-aggregate.js";
@@ -948,17 +952,72 @@ export const PER_PROJECT_COUNT =
   "SELECT split_part(path,'/',1) AS project, count(*) AS lines FROM token_match('chunks','content','<the " +
   "term>','and') GROUP BY 1 ORDER BY 2 DESC (GROUP BY path for the count per file).";
 
+/** The form a find carries its matches in, from what the caller set. Given
+ * neither chunks nor context, each match comes in its block trimmed to
+ * AUTO_CHUNK_CONTEXT lines around it - the comment above it and the lines
+ * below - rather than as the matching line alone: a question about what each
+ * match does or relies on is answered by those lines, and a caller handed
+ * the bare lines reads a window per match to find them. Tool text saying
+ * when to set chunks is not followed by every model; a default applies to
+ * all of them. Either option set is the caller's choice and stands: chunks false is the
+ * matching line alone (with context, grep's -B/-A lines), chunks true the
+ * whole block. `aroundByDefault` is set when the default applied, so the
+ * result can say so and name the other forms. */
+export function findForm(
+  chunks: boolean | undefined,
+  context: number | undefined,
+): { chunks?: boolean; context?: number; aroundByDefault?: number } {
+  if (chunks === undefined && context === undefined) {
+    return { chunks: true, context: AUTO_CHUNK_CONTEXT, aroundByDefault: AUTO_CHUNK_CONTEXT };
+  }
+  return { chunks, context };
+}
+
 /** The hint on an empty find, or null when the result needs none: a query
  * with spaces is a phrase or a signature, which one exact line may never
  * hold; with `defines` on and nothing found, the name itself is in doubt.
  * A bare identifier that is simply absent gets no hint - zero is the answer. */
-export function findHint(query: string, total: number, defines: boolean, withText = total, listed = total): string | null {
+export function findHint(
+  query: string,
+  total: number,
+  defines: boolean,
+  withText = total,
+  listed = total,
+  blocks = false,
+  pages?: number[],
+  skip = 0,
+): string | null {
+  // Pages: the result names where each following page starts, so the rest
+  // is one reply of finds with skip - not one find per file, and never a
+  // read per line.
+  if (pages && pages.length > 0) {
+    const tail = pages.length >= MAX_FIND_PAGES ? " The last of them names where the next pages start." : "";
+    return (
+      `This result carried ${withText} of the ${total} matching lines${blocks ? " with their blocks" : " with their text"}. ` +
+      `For the rest, find again with the same query and options and skip set to each of ${pages.join(", ")} - all ` +
+      `of them in the same reply, one call each; together they carry every remaining match, so no find per file ` +
+      `is needed.${tail} A saved result is not for the shell to read.`
+    );
+  }
   // A flood: the counts are complete, every place within the limit is
   // listed, and the text of the rest is one sql away - never the shell over
   // a saved result (the demo, 2026-09-24: a 58,000-character find went to a
   // file and Bash read it).
-  if (total > withText) {
-    const beyond = total > listed ? ` ${total - listed} more are in the total and the per-file counts but not listed.` : "";
+  // A page from `skip` answers for the matches from there on: the last page
+  // carries all of those, and the ones before it came on earlier pages, so
+  // it needs no hint sending the caller back for them.
+  const from = Math.min(Math.max(0, skip), total);
+  if (total - from > withText) {
+    const beyond =
+      total - from > listed ? ` ${total - from - listed} more are in the total and the per-file counts but not listed.` : "";
+    // A chunks find past its budget: the rest's blocks are one more chunks
+    // find away, not a read per line.
+    if (blocks) {
+      return (
+        `${withText} of ${total} matching lines came with their block; the rest are listed by path and line after ` +
+        `them.${beyond} For their blocks, find again with chunks and skip. A saved result is not for the shell to read.`
+      );
+    }
     return (
       `${withText} of ${total} lines carry their text; the rest are listed by path and line after them.${beyond} ` +
       "For a line's text, sql: SELECT start_line, content FROM the table WHERE path = '...' AND start_line <= " +
@@ -1779,6 +1838,9 @@ export interface ServeOptions {
   hostedOptions?: HostedOptions;
   /** Offer no tool that writes (`readOnlyEnabled` when absent). */
   readOnly?: boolean;
+  /** How much of the account the server reaches (`accountDataScope` when
+   * absent). */
+  accountData?: AccountDataScope;
   /** The key this session's platform calls carry instead of the configured
    * one (the server over HTTP with sign-in). The repository the server was
    * started for is then not served at all (see `signedIn`). */
@@ -1805,6 +1867,7 @@ const PACKAGE_VERSION: string = JSON.parse(readFileSync(new URL("../../package.j
 export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {}): Promise<void> {
   const { hostedOptions } = serveOptions;
   const readOnly = serveOptions.readOnly ?? readOnlyEnabled();
+  const accountScope = serveOptions.accountData ?? accountDataScope();
   const hostFiles = serveOptions.hostFiles ?? true;
   // When the start-up stops waiting on the database's other tables: counted
   // from here, the server's start, as the client counts its own wait.
@@ -1878,11 +1941,15 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const repoFor = (requested?: string): RepoCtx => registry.get(requested);
 
   // The manifest is re-read per call so staged vector readiness is noticed
-  // the moment it lands.
+  // the moment it lands. A local index built under another analyzer than
+  // this engine's (an earlier version's `ascii_lower`, which the engine no
+  // longer opens) reads as no index, so the first query rebuilds it the way
+  // it builds a missing one, rather than refusing until the next sync.
   const getHandle = (ctx: RepoCtx): IndexHandle | null => {
     if (!existsSync(ctx.dir)) return null;
     const manifest = readManifest(ctx.dir);
     if (!manifest) return null;
+    if (builtByEarlierVersion(manifest)) return null;
     return { root: ctx.root, dir: ctx.dir, target: ctx.target, db: ctx.db, manifest };
   };
 
@@ -2023,9 +2090,15 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   const doSync = async (ctx: RepoCtx, lock: IndexLock): Promise<SyncOutcome> => {
     await ensureDatabase(ctx);
     const outcome = await syncRepo({ ...indexTargets(ctx), embedder: getEmbedder() });
-    // A rebuild for every reason but "a build is already in flight" (the
-    // vector stage, or the platform load - a second build would race it).
-    if (outcome.action === "rebuild-required" && !syncInProgress(outcome)) {
+    // A rebuild for every reason, "a build is already in flight" (the vector
+    // stage, or the platform load) among them: this runs under the index's
+    // lock, which every writer holds until its build's completion settles,
+    // and never under this context's own completion (maybeAutoSync), so a
+    // manifest still marked in flight here was left by a build that stopped
+    // before it finished (a server killed mid-backfill). Left alone, it
+    // would refuse every sync until someone rebuilt it by hand.
+    if (outcome.action === "rebuild-required") {
+      if (syncInProgress(outcome)) console.error(`${ctx.root}: rebuilding an index whose last build did not finish (${outcome.reason})`);
       const emb = buildEmbedder();
       const run = await indexRepoStaged({ ...indexTargets(ctx), embedder: emb });
       backfill(ctx, run, emb, lock);
@@ -2258,6 +2331,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
    * rule cannot be missed by one of them. */
   const localIndex = async (ctx: RepoCtx): Promise<{ handle: IndexHandle; autoIndexed?: IndexStats } | { failed: ReturnType<typeof fail> }> => {
     if (signedIn) return { failed: fail(SIGNED_IN_ROOT) };
+    const before = existsSync(ctx.dir) ? readManifest(ctx.dir) : null;
     let ensured: EnsureResult;
     try {
       ensured = await ensureIndexed(ctx, { autoIndexEnabled: autoIndexEnabled && ownsTable(ctx), getHandle, build: buildIndex });
@@ -2265,15 +2339,23 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       return { failed: fail(`indexing failed: ${(err as Error).message}`) };
     }
     if ("needsIndex" in ensured) return { failed: ownsTable(ctx) ? noIndex(ctx) : foreignTable(ctx) };
+    if (ensured.autoIndexed && before && builtByEarlierVersion(before)) replacedBuilds.add(ensured.autoIndexed);
     return ensured;
   };
+
+  /** The builds that replaced an index an earlier version built, so the call
+   * that made one says so rather than that no index existed. */
+  const replacedBuilds = new WeakSet<IndexStats>();
 
   /** Marker attached to a query result when this call built the index. */
   const autoIndexNote = (stats: IndexStats) => ({
     files: stats.files,
     chunks: stats.chunks,
     note:
-      "no index existed - built one on this call; keyword search is live now" +
+      (replacedBuilds.has(stats)
+        ? "rebuilt the index an earlier version of code-context built, which this version cannot read, on this call"
+        : "no index existed - built one on this call") +
+      "; keyword search is live now" +
       (stats.vectors === "building" ? " and vectors are backfilling in the background" : ""),
   });
 
@@ -2336,8 +2418,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // it at startup. Upload sessions are opened for the platform's own origin:
   // a deployment lists the origins it takes uploads from, and a client of
   // its API is of that origin as far as a listing can name one.
+  // Only in the `account` scope (CX_ACCOUNT_DATA, accountDataScope): in the
+  // others the server reaches its own database, or its own table, alone.
   const data =
-    hosted !== null
+    hosted !== null && accountScope === "account"
       ? new DataPlane({
           account: { baseUrl: hosted.baseUrl, apiKey: hosted.apiKey },
           clientOptions: hostedOptions ?? {},
@@ -2347,8 +2431,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           verdictTimeoutMs: VERDICT_TIMEOUT_MS,
         })
       : null;
-  /** The refusal of a `database` argument on a server with no account. */
-  const noDataPlane = (tool: string) => fail(`${tool}: database names a database of an Infino account, and this server has none - ${noAccountSteps()}`);
+  /** The refusal of a `database` argument on a server with no account, or
+   * with the account's data switched off. */
+  const noDataPlane = (tool: string) =>
+    hosted !== null
+      ? fail(`${tool}: this server serves only its own data, not the account's other databases; leave database out`)
+      : fail(`${tool}: database names a database of an Infino account, and this server has none - ${noAccountSteps()}`);
   /** What each query tool's text says of the account's data, where there is
    * an account: one sentence, since the routing line below carries the rest
    * and every sentence here is prompt text on every turn. */
@@ -2429,7 +2517,9 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // alone: asked beside its siblings it would come back carrying the
   // platform's joins, and no key reaches the tool text - the model calls
   // join_keys.
-  const siblingNames = othersDb ? await databaseTables(othersDb, TABLE) : [];
+  // In the `table` scope there are none: the server reaches its own table
+  // alone, so no other is listed, described or offered to a JOIN.
+  const siblingNames = othersDb && accountScope !== "table" ? await databaseTables(othersDb, TABLE) : [];
   // Every hosted table of another shape this server describes - the primary
   // when it is one, and the siblings - has its card asked for within the
   // budget the platform's own loop lays the cards of one prompt out within
@@ -2724,6 +2814,16 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     if (/\bgraph_(?:walk|rank)\s*\(/i.test(code)) return null;
     const named = tablesNamed(withoutGraphCalls(code), [TABLE, ...siblingNames]);
     return named.length === 1 ? named[0] : null;
+  };
+
+  /** In the `table` scope, the other tables of a context's database: the
+   * names a statement may not reach. Listed afresh for every statement, so a
+   * table created a moment ago is among them; a kept listing would let a
+   * statement naming it run until the listing was renewed. A listing that
+   * fails throws, so the statement is refused rather than run unchecked. */
+  const tablesOutside = async (ctx: RepoCtx): Promise<string[]> => {
+    if (!ctx.hosted) return [];
+    return (await ctx.hosted.listTables()).filter((name) => name !== TABLE);
   };
 
   /** A `sql` statement run on the platform, whichever table it is over: the
@@ -3237,7 +3337,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             // the platform's default for a bare column, as analyzerOf says.
             const hostedAnalyzer = analyzerOf(readPlatformManifest(ctx.dir) ?? { origin: "hosted" });
             const [{ value: result, own }, recalled] = await Promise.all([
-              answeredBy(searchHosted(ctx.hosted, query, k, { lines, analyzer: hostedAnalyzer }), ctx),
+              answeredBy(searchHosted(ctx.hosted, query, k, { lines, analyzer: hostedAnalyzer, question }), ctx),
               recallFor(query),
             ]);
             // The hits seed the graph by their place: a chunk's path and
@@ -3298,8 +3398,15 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           FIND_BY_BARE_NAME +
           // A flood keeps every place: the lines past the text budget come as
           // path and line numbers (`more`), and a line's text is a sql read.
-          " The lines around a match - what leads into an error and follows it - come with it when you ask " +
-          "for context (like grep -B/-A); no file need be opened for them. " +
+          // A question about what each match does or relies on is answered
+          // by the lines around it, so they come by default (findForm), and
+          // the pages of a wide result are named so they come in one reply.
+          ` Each match comes in the block of code it sits in, with the ${AUTO_CHUNK_CONTEXT} lines around it - the ` +
+          "comment above it, the lines below - numbered as a file read is and merged where they meet, so what each " +
+          "match does or relies on is in the result and no file need be opened. chunks: true carries whole blocks; " +
+          "chunks: false the matching line alone, as grep -n does, and with context the lines before and after it " +
+          "(grep -B/-A). When a result names further pages, ask for every one of them in the same reply with skip. " +
+          "Never follow a find with a read per match. " +
           "A wide result lists every matching place: the first lines with their text, the rest by path and " +
           "line after them; a line's text is one sql statement away, and the per-file counts count them all. " +
           "A count per project or per file - which projects use X, how many times each - is one sql statement, " +
@@ -3356,7 +3463,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             .positive()
             .max(MAX_FIND_LIMIT)
             .default(DEFAULT_FIND_LIMIT)
-            .describe("Maximum matching lines to return; the result reports the total either way."),
+            .describe(
+              "Matching lines one result carries at most: a page, not a cap on the find. With more than this, the " +
+                "result names the skip of each following page; the result reports the total either way.",
+            ),
           question: z.string().optional().describe(RERANK_QUESTION_PARAM),
           context: z
             .number()
@@ -3365,9 +3475,31 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             .max(MAX_FIND_CONTEXT)
             .optional()
             .describe(
-              "Lines before and after each match to carry, from the match's own window - what grep -B/-A " +
-                "shows - so the lines that lead into an error and follow it come with the match, without " +
-                "opening the file. Up to 20; more than a few matches with context is a wide result.",
+              `Lines around each match to carry. Unset, each match comes in its block with ${AUTO_CHUNK_CONTEXT} lines ` +
+                "around it. With chunks true, each block keeps this many lines around its matches; given alone or " +
+                "with chunks false, the matching line comes with this many lines before and after it, as grep -B/-A " +
+                "shows. Up to 20; more than a few matches with context is a wide result.",
+            ),
+          chunks: z
+            .boolean()
+            .optional()
+            .describe(
+              `Unset, each match comes in the block of code it sits in, trimmed to ${AUTO_CHUNK_CONTEXT} lines around ` +
+                "it, its lines numbered. true: the whole block - the chunk the index holds it in - for the body " +
+                "around a match; past two pages of whole blocks they are trimmed too, and the result says so. " +
+                "false: the matching line alone, as grep -n writes it - for a list of places or a count. A block " +
+                "holding several matches comes once, and overlapping blocks are not repeated. The text budget " +
+                "still applies; the matches of blocks past it are listed by path and line.",
+            ),
+          skip: z
+            .number()
+            .int()
+            .min(0)
+            .optional()
+            .describe(
+              "Matching lines to pass over before this result starts: the next page of a find its budget cut. A " +
+                "result that could not carry every match names the skip of each following page; ask for all of " +
+                "them in one reply, one call each, rather than one find per file.",
             ),
           path: z
             .string()
@@ -3381,7 +3513,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
           table: TABLE_ARG,
         },
       },
-      async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, path, question, share, database, table }) => {
+      async (args) => batched("find", args, async ({ query, ignoreCase, defines, under, limit, context, chunks, skip, path, question, share, database, table }) => {
         let ctx: RepoCtx;
         try {
           ctx = repoFor(database !== undefined ? undefined : path);
@@ -3444,18 +3576,22 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
         if (!autoIndexed) maybeAutoSync(ctx); // a fresh build is already current
         try {
           const t0 = performance.now();
-          // A batch shares the one text budget between its queries.
-          const budget = share && share > 1 ? Math.floor(FIND_RESULT_CHAR_BUDGET / share) : undefined;
-          const result = await find(handle, query, { ignoreCase, defines, under, limit, context, budget });
+          // A batch shares the one text budget between its queries; the
+          // pages a result names are worked out for calls of their own.
+          const form = findForm(chunks, context);
+          const result = await find(handle, query, { ignoreCase, defines, under, limit, context: form.context, chunks: form.chunks, skip, share });
           const listed = result.matches.length + (result.more ?? []).reduce((n, m) => n + m.lines.length, 0);
-          const hint = findHint(query, result.total, Boolean(defines), result.matches.length, listed) ?? undefined;
+          const hint =
+            findHint(query, result.total, Boolean(defines), result.matches.length, listed, Boolean(result.blocks), result.pages, result.skip) ??
+            undefined;
           const noted = autoIndexed ? autoIndexNote(autoIndexed) : undefined;
           const tookMs = Math.round((performance.now() - t0) * 1000) / 1000;
+          const aroundByDefault = form.aroundByDefault;
           // Written as grep writes it (`renderFind`); the receipt prices that
           // text, since it is what was returned, and rides on its last line.
           let usage: string | undefined;
           if (receiptOn) {
-            const entry = findEntry(result, false, renderFind(result, { hint, autoIndexed: noted?.note, tookMs }));
+            const entry = findEntry(result, false, renderFind(result, { hint, autoIndexed: noted?.note, tookMs, aroundByDefault }));
             recordUsage(ctx.dir, entry);
             usage = formatReceipt(entry, session);
           }
@@ -3467,7 +3603,7 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
               took_ms: tookMs,
               ...(usage ? { usage } : {}),
             },
-            renderFind(result, { hint, autoIndexed: noted?.note, tookMs, usage }),
+            renderFind(result, { hint, autoIndexed: noted?.note, tookMs, usage, aroundByDefault }),
           );
         } catch (err) {
           return fail(`find failed: ${(err as Error).message}`);
@@ -3559,6 +3695,24 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       // Over a database named on the call: the statement runs there, on the
       // platform, held to the keys among that database's tables.
       if (database !== undefined) return sqlOnDatabase(ctx, database, table, query, code, embeds, question);
+      // In the `table` scope a statement reaches the server's own table
+      // alone: one naming another table of the database - as an identifier,
+      // bare or qualified by a schema or database (`hr.payroll`), or as a
+      // search or graph function's argument - is refused before it runs. A
+      // name matched inside a string literal, or a column that happens to
+      // share another table's name (`p.payroll`), is refused too; the check
+      // errs toward refusing.
+      if (accountScope === "table" && ctx.hosted) {
+        let outside: string[];
+        try {
+          outside = tablesReached(code, await tablesOutside(ctx));
+        } catch (err) {
+          return fail(`sql failed: the database's tables could not be listed to check the statement: ${(err as Error).message}`);
+        }
+        if (outside.length > 0) {
+          return fail(`sql: this server reads the ${TABLE} table alone, and the statement names ${outside.join(", ")}, another table of its database`);
+        }
+      }
       // A statement across two or more of the hosted tables is held to the
       // keys the platform found on their values: one written without any of
       // them is refused with the keys, and the model rewrites it. The model
@@ -3778,11 +3932,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     );
   }
 
-  if (hosted) {
+  if (hosted && accountScope !== "table") {
     // The call before a JOIN, on every hosted server and not only under
     // CX_API_TOOLS: a model that knows which tables its question spans has
     // no other way to the keys (the owner, 2026-09-24: "the outer model
     // knows the tables it wants to search across. what does it do then?").
+    // Not in the `table` scope, where there is one table and nothing to join.
     const keysDb = hostedDbFor(hosted, { ...hostedOptions, coldStartSecs: 0 });
     server.registerTool(
       "join_keys",

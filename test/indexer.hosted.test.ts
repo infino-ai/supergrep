@@ -311,7 +311,7 @@ describe("a build with a platform database (client vectors)", () => {
     // rows; the file state is shared; no spills are left.
     const local = readManifest(dir)!;
     expect(local.origin).toBeUndefined();
-    expect(local.analyzer).toBe("ascii_lower");
+    expect(local.analyzer).toBe("standard");
     expect(local.vectors).toBe("none");
     expect(local.embedder).toBeUndefined();
     expect(local.chunks).toBe(stats.chunks);
@@ -346,7 +346,9 @@ describe("a build with a platform database (client vectors)", () => {
       vector: [{ column: "embedding", metric: "cosine" }],
     });
     expect(readPlatformManifest(dir)!.analyzer).toBe("standard");
-    expect(readManifest(dir)!.analyzer).toBe("ascii_lower"); // the local index took the engine default
+    // The local index took the engine's analyzer, whatever was given for the
+    // platform: on the pinned engine that is `standard`, the one it has.
+    expect(readManifest(dir)!.analyzer).toBe("standard");
   });
 
   it("indexes an empty tree to an empty, complete table on both sides", async () => {

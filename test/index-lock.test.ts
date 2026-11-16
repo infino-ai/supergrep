@@ -5,7 +5,7 @@
 // refusing to write under another process's lock, and the MCP server leaving
 // a first build alone while another process holds it.
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -71,6 +71,37 @@ describe("the index lock", () => {
     const attempt = tryLockIndex(dir);
     expect("lock" in attempt).toBe(true);
     expect(held().pid).toBe(process.pid);
+  });
+
+  it("is taken over from this process's id when this process does not hold it (a restarted container's own stale lock)", () => {
+    plant(lockPath(dir), { pid: process.pid, since: "2026-01-01T00:00:00.000Z" });
+    const attempt = tryLockIndex(dir);
+    expect("lock" in attempt).toBe(true);
+    expect(held()).toMatchObject({ pid: process.pid });
+    expect(held().since).not.toBe("2026-01-01T00:00:00.000Z");
+    // The acquisition this process does hold is still refused to a second taker.
+    expect("heldBy" in tryLockIndex(dir)).toBe(true);
+    if ("lock" in attempt) attempt.lock.release();
+    expect(existsSync(lockPath(dir))).toBe(false);
+  });
+
+  it("refuses the lock this process holds to a second spelling of the same index dir (a symlink)", () => {
+    const link = join(mkdtempSync(join(tmpdir(), "cx-lock-link-")), "index");
+    symlinkSync(dir, link);
+    try {
+      const lock = lockIndex(dir);
+      const second = tryLockIndex(link);
+      expect("heldBy" in second && second.heldBy?.pid).toBe(process.pid);
+      expect(held().since).toBe(lock.holder.since);
+      lock.release();
+      expect(existsSync(lockPath(dir))).toBe(false);
+      // Released, the other spelling takes it, and the first is then refused it.
+      const viaLink = lockIndex(link);
+      expect("heldBy" in tryLockIndex(dir)).toBe(true);
+      viaLink.release();
+    } finally {
+      rmSync(join(link, ".."), { recursive: true, force: true });
+    }
   });
 
   it("counts a live process, or one on another host, as holding it", () => {
@@ -151,6 +182,46 @@ describe("the MCP server under another process's lock", () => {
         await client.close();
       }
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the MCP server and a build that stopped before it finished", () => {
+  it("rebuilds an index whose manifest is still marked building when no process holds its lock", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cx-lock-abandoned-"));
+    const interval = process.env.CX_SYNC_INTERVAL_SECS;
+    process.env.CX_SYNC_INTERVAL_SECS = "0";
+    try {
+      writeFileSync(join(root, "a.ts"), "export function abandoned() { return 1; }\n");
+      const indexDir = join(root, ".infino");
+      const { serveMcp } = await import("../src/mcp/server.js");
+      const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+      await serveMcp(root, { transport: serverSide });
+      const client = new Client({ name: "abandoned-test", version: "0" });
+      await client.connect(clientSide);
+      const until = async (done: () => boolean) => {
+        for (let i = 0; i < 200 && !done(); i++) await new Promise((r) => setTimeout(r, 25));
+        expect(done()).toBe(true);
+      };
+      try {
+        const find = () => client.callTool({ name: "find", arguments: { query: "abandoned" } });
+        await find(); // builds the index
+        await until(() => readManifest(indexDir) !== undefined && readManifest(indexDir)!.vectors !== "building" && !existsSync(lockPath(indexDir)));
+        // What a server killed mid-backfill leaves: the marker, and no live lock.
+        const path = join(indexDir, "codecontext.json");
+        const before = { ...readManifest(indexDir)!, vectors: "building" as const, indexedAt: "2026-01-01T00:00:00.000Z" };
+        writeFileSync(path, JSON.stringify(before));
+        await find(); // the query's auto-sync finds the marker under the lock
+        await until(() => readManifest(indexDir)?.indexedAt !== before.indexedAt && !existsSync(lockPath(indexDir)));
+        expect(readManifest(indexDir)?.vectors).not.toBe("building");
+        expect(readManifest(indexDir)?.files).toBe(1);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      if (interval === undefined) delete process.env.CX_SYNC_INTERVAL_SECS;
+      else process.env.CX_SYNC_INTERVAL_SECS = interval;
       rmSync(root, { recursive: true, force: true });
     }
   });

@@ -16,9 +16,12 @@ It gives a profile the repositories it reads:
 - when a session starts, every repository that has a finished index is
   synced in the background (`index.py`), so the tools' first call finds it
   current or nearly so. A repository with no index yet, or one whose
-  vectors are still being built, is left to the server, which builds or
-  finishes it: a sync here would find nothing to update in place, and `cx
-  index` would rebuild it, dropping the table under the server. The client
+  vectors are still being built, is left to the server, which builds it,
+  or rebuilds one whose build stopped before it finished on its next query
+  (not when CX_TABLE names a platform table the server does not own; then
+  `hermes supergrep index` does): a sync here would find nothing to update
+  in place, and `cx index` would rebuild it, dropping the table under the
+  server. The client
   lets one process at a time write an index (its lock file), so the hook's
   sync and the server's own never overlap; whichever comes second skips.
   `hermes supergrep index` builds them ahead of a session.
