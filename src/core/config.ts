@@ -351,18 +351,20 @@ export function readOnlyEnabled(): boolean {
  * - `table`: the one table it was started for (CX_TABLE, or the code
  *   index's) and nothing else of its database: the other tables are not
  *   described, `join_keys` is not offered, and a `sql` statement that names
- *   one is refused.
+ *   one, bare or qualified (`hr.payroll`, `"public"."payroll"`), is refused.
+ *   The database's tables are listed for every statement, so a table made a
+ *   moment ago is refused too.
  * Whatever the key could see beyond that, the server does not reach. */
 export type AccountDataScope = "account" | "database" | "table";
 
-/** The scope CX_ACCOUNT_DATA names. `1`/`true`/`yes` read as `account` and
- * `0`/`false`/`no` as `database`, the switch's first two states. Any other
- * value stops the server at startup rather than serving more than was
- * meant. */
+/** The scope CX_ACCOUNT_DATA names. `1`/`true`/`yes`/`on` read as `account`
+ * and `0`/`false`/`no`/`off` as `database`, the switch's first two states.
+ * Any other value stops the server at startup rather than serving more than
+ * was meant. */
 export function accountDataScope(env: NodeJS.ProcessEnv = process.env): AccountDataScope {
   const value = (env.CX_ACCOUNT_DATA ?? "").trim().toLowerCase();
-  if (value === "" || value === "account" || ON_VALUES.includes(value)) return "account";
-  if (value === "database" || OFF_VALUES.includes(value)) return "database";
+  if (value === "" || value === "account" || value === "on" || ON_VALUES.includes(value)) return "account";
+  if (value === "database" || value === "off" || OFF_VALUES.includes(value)) return "database";
   if (value === "table") return "table";
   throw new Error(`CX_ACCOUNT_DATA=${value} is not a scope: account, database or table`);
 }

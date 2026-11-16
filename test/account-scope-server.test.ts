@@ -55,6 +55,11 @@ const OTHERS = [
   `SELECT j.title FROM ${JOBS} j JOIN ${PAYROLL} p ON j.id = p.employee_id`,
   `SELECT * FROM bm25_search('${PAYROLL}', 'employee_id', 'x', 5)`,
   `WITH p AS (SELECT * FROM "${PAYROLL}") SELECT COUNT(*) FROM p`,
+  // Qualified by a schema or by the database's own name, quoted or not.
+  `SELECT * FROM public.${PAYROLL}`,
+  `SELECT * FROM hr.${PAYROLL}`,
+  `SELECT * FROM ${JOBS} j JOIN public.${PAYROLL} p ON j.id = p.employee_id`,
+  `SELECT * FROM "public"."${PAYROLL}"`,
 ];
 
 beforeAll(() => {
@@ -66,10 +71,10 @@ afterAll(() => {
 
 describe("CX_ACCOUNT_DATA's values", () => {
   it("reads account, database and table, and the switch's on and off words", () => {
-    for (const value of [undefined, "", "account", "1", "true", "YES"]) {
+    for (const value of [undefined, "", "account", "1", "true", "YES", "on"]) {
       expect(accountDataScope({ CX_ACCOUNT_DATA: value }), String(value)).toBe("account");
     }
-    for (const value of ["database", "0", "false", "no"]) expect(accountDataScope({ CX_ACCOUNT_DATA: value }), value).toBe("database");
+    for (const value of ["database", "0", "false", "no", "Off"]) expect(accountDataScope({ CX_ACCOUNT_DATA: value }), value).toBe("database");
     expect(accountDataScope({ CX_ACCOUNT_DATA: " Table " })).toBe("table");
   });
 
@@ -133,5 +138,41 @@ describe("the table scope: its own table and nothing else of the database", () =
     const result = await call(s, "sql", { query: OWN });
     expect(result.ok, String(result.value)).toBe(true);
     expect(result.ops).toContain("query_sql");
+  });
+});
+
+describe("the table scope lists the database for every statement", () => {
+  // A table made after the server's last statement is refused on the next
+  // one: no kept listing lets a statement through while it is stale.
+  const BONUS = "bonus";
+  const listed = [JOBS, PAYROLL];
+  let s: Started;
+  beforeAll(async () => {
+    s = await start(
+      scriptPlatform({
+        list_tables: () => [200, [...listed]],
+        schema: (body) => [200, SCHEMAS[String(body?.table_name)]],
+        table_card: () => [404, { error: "no card" }],
+        hydrate: () => [404, { error: "no load record" }],
+        query_sql: () => [200, [{ n: 3 }]],
+        validate: () => [200, { valid: true, check: "unchecked" }],
+      }),
+      "cx-scope-fresh-",
+      { accountData: "table" },
+    );
+  });
+  afterAll(async () => {
+    await stop(s);
+  });
+
+  it("refuses a table created after the previous statement", async () => {
+    const own = await call(s, "sql", { query: OWN });
+    expect(own.ok, String(own.value)).toBe(true);
+    listed.push(BONUS);
+    const result = await call(s, "sql", { query: `SELECT * FROM ${BONUS}` });
+    expect(result.ok).toBe(false);
+    expect(String(result.value)).toContain(`the statement names ${BONUS}`);
+    expect(result.ops).toContain("list_tables");
+    expect(result.ops).not.toContain("query_sql");
   });
 });

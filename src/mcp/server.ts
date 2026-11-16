@@ -229,7 +229,7 @@ import {
   type ResolveOptions,
   type TableShape,
 } from "../core/table-shape.js";
-import { joinGate, joinRefusal, tablesNamed, withoutGraphCalls, type PlatformJoin } from "../core/join-gate.js";
+import { joinGate, joinRefusal, tablesNamed, tablesReached, withoutGraphCalls, type PlatformJoin } from "../core/join-gate.js";
 import { expandAcrossGraph, newExpansionMemory, type GraphExpansion, type Searched } from "../core/graph-expand.js";
 import { DataPlane, type HydrateToolSource } from "./data.js";
 import { topKAggregateRefusal } from "../core/topk-aggregate.js";
@@ -2731,18 +2731,13 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   };
 
   /** In the `table` scope, the other tables of a context's database: the
-   * names a statement may not reach. Listed at most once a minute, since a
-   * statement may name a table created a moment ago. A listing that fails
-   * throws, so the statement is refused rather than run unchecked. */
-  const OUTSIDE_TTL_MS = 60_000;
-  const outsideListed = new Map<string, { at: number; names: string[] }>();
+   * names a statement may not reach. Listed afresh for every statement, so a
+   * table created a moment ago is among them; a kept listing would let a
+   * statement naming it run until the listing was renewed. A listing that
+   * fails throws, so the statement is refused rather than run unchecked. */
   const tablesOutside = async (ctx: RepoCtx): Promise<string[]> => {
     if (!ctx.hosted) return [];
-    const kept = outsideListed.get(ctx.root);
-    if (kept && Date.now() - kept.at < OUTSIDE_TTL_MS) return kept.names;
-    const names = (await ctx.hosted.listTables()).filter((name) => name !== TABLE);
-    outsideListed.set(ctx.root, { at: Date.now(), names });
-    return names;
+    return (await ctx.hosted.listTables()).filter((name) => name !== TABLE);
   };
 
   /** A `sql` statement run on the platform, whichever table it is over: the
@@ -3580,13 +3575,15 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       if (database !== undefined) return sqlOnDatabase(ctx, database, table, query, code, embeds, question);
       // In the `table` scope a statement reaches the server's own table
       // alone: one naming another table of the database - as an identifier,
-      // or as a search or graph function's argument - is refused before it
-      // runs. A name matched inside a string literal is refused too; the
-      // check errs toward refusing.
+      // bare or qualified by a schema or database (`hr.payroll`), or as a
+      // search or graph function's argument - is refused before it runs. A
+      // name matched inside a string literal, or a column that happens to
+      // share another table's name (`p.payroll`), is refused too; the check
+      // errs toward refusing.
       if (accountScope === "table" && ctx.hosted) {
         let outside: string[];
         try {
-          outside = tablesNamed(code, await tablesOutside(ctx));
+          outside = tablesReached(code, await tablesOutside(ctx));
         } catch (err) {
           return fail(`sql failed: the database's tables could not be listed to check the statement: ${(err as Error).message}`);
         }
