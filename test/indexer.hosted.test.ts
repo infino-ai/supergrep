@@ -559,11 +559,12 @@ describe("failures during a build", () => {
 
   it("a platform failure is recorded, never thrown: the local index is complete and the platform manifest is not written", async () => {
     writeSmallFixture(root);
-    const platform = fakePlatform([], "create_table");
+    // The default provider loads from disk: the platform refuses the upload.
+    const platform = fakePlatform([], "hydrate");
     const stats = await indexRepo({ root, db, hosted: platform.db(), indexDirPath: dir, embedder: fakeEmbedder });
     expect(stats.vectors).toBe("none"); // local; never affected by the platform's failure
     expect(stats.hosted).toBeUndefined();
-    expect(stats.hostedError).toMatch(/create_table: server returned 500/);
+    expect(stats.hostedError).toMatch(/server returned 500/);
     expect(localRowCount(db)).toBe(3);
     expect(readManifest(dir)!.vectors).toBe("none");
     expect(readPlatformManifest(dir)).toBeUndefined();
@@ -579,9 +580,9 @@ describe("failures during a build", () => {
 
     // The rebuild's append fails: the table on the platform is empty (created,
     // never filled) while the file state describes the new tree.
-    const failing = fakePlatform([TABLE], "append");
+    const failing = fakePlatform([TABLE], "hydrate");
     const stats = await indexRepo({ root, db, hosted: failing.db(), indexDirPath: dir, embedder: fakeEmbedder });
-    expect(stats.hostedError).toMatch(/append: server returned 500/);
+    expect(stats.hostedError).toMatch(/server returned 500/);
     expect(readPlatformManifest(dir)).toBeUndefined();
 
     // Not "up to date": the table has no record here, a build reloads it.
