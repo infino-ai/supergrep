@@ -35,7 +35,7 @@ import logging
 import threading
 from typing import Optional
 
-from . import cli, config, index
+from . import cli, config, index, instructions
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,9 @@ def register(ctx) -> None:
     the session-start hook. Never raises: a profile with no repositories
     configured still loads the plugin, and says so in its log."""
     cli.register(ctx)
+    # The server's instructions, which Hermes would otherwise drop, in every
+    # session's system prompt (instructions.py).
+    instructions.register(ctx)
     try:
         skill = config.skill_path(config.load())
         ctx.register_skill("code-context", skill, config.SKILL_DESCRIPTION)
