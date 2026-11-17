@@ -157,26 +157,52 @@ function derivedTables(query: string, tables: readonly string[]): Map<string, st
   return derived;
 }
 
-/** Whether every column `query` compares through `names` (`n.col = ...`) is
- * one the subquery or CTE `inner` selects under its own name - `col`,
- * `t.col`, `col AS col` - or `inner` selects `*`. A column renamed inside
- * (`title AS instance_id`) is not the table's column of that name, so a
- * derived name that compares one does not stand for the table: the join
- * written through it is held to a key as a join between unknown sources
- * would be. Columns only selected or sorted on (`c.n`, `ORDER BY c.n`) join
- * nothing and are left alone. */
+/** Whether every column `query` reads through `names` in a condition - an
+ * `ON`, `WHERE` or `HAVING` clause, bare (`n.col = ...`) or inside an
+ * expression (`split_part(n.col, '/', 1) = ...`) - is one the subquery or
+ * CTE `inner` selects under its own name - `col`, `t.col`, `col AS col` - or
+ * `inner` selects `*`. A column renamed inside (`title AS instance_id`) is
+ * not the table's column of that name, so a derived name that reads one in a
+ * condition does not stand for the table: the join written through it is
+ * held to a key as a join between unknown sources would be. Columns only
+ * selected, grouped or sorted on (`c.n`, `ORDER BY c.n`) join nothing and
+ * are left alone. */
 function carriesAsSelected(query: string, names: readonly string[], inner: string): boolean {
   const selected = selectedAsThemselves(inner);
   if (selected === "all") return true;
   for (const name of names) {
     const read = new RegExp(`(?<![\\w.'"])"?${escapeRegex(name)}"?\\s*\\.\\s*"?([A-Za-z_]\\w*)"?`, "gi");
     for (const m of query.matchAll(read)) {
-      const at = m.index ?? 0;
-      const compared = /=\s*$/.test(query.slice(0, at)) || /^\s*=/.test(query.slice(at + m[0].length));
-      if (compared && !selected.has(m[1].toLowerCase())) return false;
+      if (inCondition(query, m.index ?? 0) && !selected.has(m[1].toLowerCase())) return false;
     }
   }
   return true;
+}
+
+/** The clause keywords a position in a statement can lie under. */
+const CLAUSE_END = /\b(select|from|join|on|using|where|having|group\s+by|order\s+by|limit)$/i;
+/** The clauses that hold conditions. */
+const CONDITION_CLAUSES = new Set(["on", "where", "having"]);
+
+/** Whether position `at` of `query` lies in a condition: the nearest clause
+ * keyword before it, at its own nesting or an enclosing one, is `ON`,
+ * `WHERE` or `HAVING`. The parentheses of a function call around it
+ * (`split_part(c.path, ...)`) are stepped out of; a parenthesised group that
+ * closed before it - a subquery beside it - is skipped whole. Text inside
+ * quotes is not read for keywords. */
+function inCondition(query: string, at: number): boolean {
+  const before = query.slice(0, at).replace(/'[^']*'|"[^"]*"/g, (quoted) => " ".repeat(quoted.length));
+  let depth = 0;
+  for (let i = before.length - 1; i >= 0; i--) {
+    const c = before[i];
+    if (c === ")") depth += 1;
+    else if (c === "(") depth = Math.max(0, depth - 1);
+    else if (depth === 0 && /[a-z]/i.test(c) && !/\w/.test(before[i + 1] ?? " ")) {
+      const clause = CLAUSE_END.exec(before.slice(0, i + 1));
+      if (clause) return CONDITION_CLAUSES.has(clause[1].toLowerCase());
+    }
+  }
+  return false;
 }
 
 /** The columns a query's top-level select list carries under their own
