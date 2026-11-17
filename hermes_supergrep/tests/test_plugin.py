@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 import hermes_supergrep
-from hermes_supergrep import cli, config, index, mcp_launch
+from hermes_supergrep import cli, config, index, instructions, mcp_launch
 
 CHECKOUT = Path(__file__).resolve().parent.parent.parent
 
@@ -26,6 +26,7 @@ class FakeCtx:
         self.cli_commands = {}
         self.skills = {}
         self.hooks = {}
+        self.sections = {}
 
     def register_cli_command(self, name, help, setup_fn, handler_fn=None, description=""):
         self.cli_commands[name] = (help, setup_fn, handler_fn)
@@ -37,6 +38,14 @@ class FakeCtx:
 
     def register_hook(self, hook_name, callback, *, hold_stream=False):
         self.hooks.setdefault(hook_name, []).append(callback)
+
+    def register_system_prompt_section(self, id, content, *, position="after_memory", max_chars=4000):
+        self.sections[id] = content
+
+
+class OlderHermesCtx(FakeCtx):
+    """A Hermes from before system prompt sections."""
+    register_system_prompt_section = None
 
 
 @pytest.fixture
@@ -316,3 +325,97 @@ def test_a_repository_another_process_is_indexing_is_skipped_not_failed(tmp_path
     busy = [r for r in caplog.records if index.OTHER_PROCESS in r.getMessage()]
     assert [r.levelno for r in busy] == [logging.INFO]
     assert cli.main(["index"]) == 0
+
+
+# --- the server's instructions in the system prompt --------------------------
+
+INSTRUCTIONS = "Look with find, search and sql first.\nRead every path in one call."
+
+
+def fake_server(tmp_path: Path, answer: str) -> config.Settings:
+    """Settings whose `node` is a stand-in MCP server: it reads one request and
+    runs `answer` (a Python statement with the request as `req`)."""
+    server = tmp_path / "node"
+    server.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys, time\n"
+        "req = json.loads(sys.stdin.readline())\n"
+        f"{answer}\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    )
+    server.chmod(server.stat().st_mode | stat.S_IEXEC)
+    client = tmp_path / "cli.js"
+    client.write_text("")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    return config.Settings(repos=(repo,), client_js=client, node=str(server))
+
+
+def test_the_instructions_are_the_servers_answer_to_initialize(tmp_path):
+    reply = {"jsonrpc": "2.0", "id": 1, "result": {"instructions": INSTRUCTIONS}}
+    settings = fake_server(
+        tmp_path,
+        "print('a log line, not JSON')\n"
+        "assert req['method'] == 'initialize'\n"
+        f"print(json.dumps({reply!r}))",
+    )
+    assert instructions.fetch(settings, timeout=10) == INSTRUCTIONS
+
+
+def test_a_server_that_does_not_answer_gives_no_instructions(tmp_path):
+    settings = fake_server(tmp_path, "pass")
+    assert instructions.fetch(settings, timeout=1) == ""
+
+
+def test_a_server_that_cannot_start_gives_no_instructions(tmp_path):
+    settings = config.Settings(repos=(tmp_path,), client_js=tmp_path / "missing.js", node="node")
+    assert instructions.fetch(settings, timeout=1) == ""
+
+
+def test_the_instructions_go_in_parts_cut_at_line_ends():
+    text = "\n".join(f"line {i:03d} " + "x" * 40 for i in range(100))
+    got = instructions.parts(text, size=1000, count=10)
+    assert all(len(part) <= 1000 for part in got)
+    assert "\n".join(got) == text
+    assert all(part.startswith("line ") for part in got)
+
+
+def test_what_does_not_fit_in_the_sections_is_left_out():
+    text = "\n".join("y" * 90 for _ in range(30))
+    got = instructions.parts(text, size=200, count=2)
+    assert len(got) == 2 and all(len(part) <= 200 for part in got)
+
+
+def test_each_section_renders_its_part_and_fails_open():
+    got = ["first part", "second part"]
+    assert instructions.section(0, lambda: got)({}) == "first part"
+    assert instructions.section(1, lambda: got)({}) == "second part"
+    assert instructions.section(1, lambda: ["only part"])({}) == ""
+
+    def broken():
+        raise RuntimeError("no server")
+
+    assert instructions.section(0, broken)({}) == ""
+
+
+def test_register_gives_hermes_the_instructions_as_system_prompt_sections():
+    ctx = FakeCtx()
+    assert instructions.register(ctx, lambda: ["first", "second"])
+    assert sorted(ctx.sections) == ["supergrep.instructions.1", "supergrep.instructions.2"]
+    assert ctx.sections["supergrep.instructions.1"]({}) == "first"
+    assert not instructions.register(OlderHermesCtx(), lambda: ["first"])
+
+
+def test_the_answer_serves_the_sessions_of_the_next_minutes(monkeypatch):
+    calls = []
+
+    def fetch(settings):
+        calls.append(settings)
+        return INSTRUCTIONS
+
+    settings = config.Settings(repos=(Path("/nowhere"),), client_js=Path("/nowhere/cli.js"), node="node")
+    monkeypatch.setattr(instructions, "_cache", {})
+    assert instructions.current(lambda: settings, fetch) == [INSTRUCTIONS]
+    assert instructions.current(lambda: settings, fetch) == [INSTRUCTIONS]
+    assert len(calls) == 1
