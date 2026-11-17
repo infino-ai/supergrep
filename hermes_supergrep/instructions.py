@@ -15,9 +15,11 @@ So the plugin starts the server as Hermes does (`mcp_launch.command`, with the
 profile's `mcp_servers.supergrep.env`), takes the instructions from its answer
 to `initialize`, and gives them to Hermes as system prompt sections: a Hermes
 session starts with what a Claude Code one does. Hermes caps a section at
-4,000 characters, so the text goes in as up to `PARTS` sections cut at line
-ends. A server that does not answer leaves the sections empty, and the
-session starts as it did before.
+4,000 characters and all plugins' sections in a session at 8,000 together,
+skipping whole any section that would pass either, so the text goes in as two
+sections cut at line ends, and what runs past them is left out. A server that
+does not answer leaves the sections empty, and the session starts as it did
+before.
 """
 from __future__ import annotations
 
@@ -34,8 +36,11 @@ from . import config, mcp_launch
 
 logger = logging.getLogger(__name__)
 
-# The sections' ids, `supergrep.instructions.1` and on, and how many there are:
-# enough for the instructions at Hermes's cap of 4,000 characters a section.
+# The sections' ids, `supergrep.instructions.1` and on, and how many there are.
+# Hermes renders at most 8,000 characters of plugin sections a session, headings
+# and markers included, and skips a section whole that would pass that; two
+# full parts with their headings come to about 7,850, so a third would never
+# be shown.
 SECTION_ID = "supergrep.instructions.{}"
 PARTS = 2
 # The most characters a part holds, under Hermes's 4,000 for the section's
@@ -43,8 +48,12 @@ PARTS = 2
 PART_CHARS = 3_800
 # How long the server has to answer `initialize`.
 ANSWER_TIMEOUT_S = 30.0
-# How long one answer serves the sessions that start after it.
+# How long one answer serves the sessions that start after it, and how long an
+# empty one (a server that did not start or answer) does: long enough that the
+# second section does not wait again, short enough that a slow start does not
+# leave the next minutes' sessions without instructions.
 CACHE_S = 300.0
+EMPTY_CACHE_S = 30.0
 # The MCP revision the request names; the server answers in the one it speaks.
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -120,22 +129,23 @@ def parts(text: str, size: int = PART_CHARS, count: int = PARTS) -> list[str]:
         out.append(part)
     out = [p.strip("\n") for p in out if p.strip()]
     if len(out) > count:
-        logger.warning("supergrep: the server's instructions run past %d sections; the rest is left out",
-                       count)
+        kept = sum(len(p) for p in out[:count])
+        logger.warning("supergrep: the server's instructions are %d characters; %d fit in %d sections "
+                       "and the rest is left out", len(text), kept, count)
     return out[:count]
 
 
 def current(load: Callable[[], config.Settings] = config.load,
             fetch_fn: Callable[[config.Settings], str] = fetch) -> list[str]:
     """The instructions' parts for a session starting now: fetched from the
-    server, or the answer of the last `CACHE_S` seconds for the same
-    settings."""
+    server, or the answer of the last `CACHE_S` seconds for the same settings
+    (`EMPTY_CACHE_S` when that answer was empty)."""
     settings = load()
     key = (settings.repos, str(settings.client_js), settings.node, tuple(sorted(settings.block.items())))
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(key)
-        if hit and now - hit[0] < CACHE_S:
+        if hit and now - hit[0] < (CACHE_S if hit[1] else EMPTY_CACHE_S):
             return parts(hit[1])
         text = fetch_fn(settings)
         _cache[key] = (now, text)

@@ -419,3 +419,35 @@ def test_the_answer_serves_the_sessions_of_the_next_minutes(monkeypatch):
     assert instructions.current(lambda: settings, fetch) == [INSTRUCTIONS]
     assert instructions.current(lambda: settings, fetch) == [INSTRUCTIONS]
     assert len(calls) == 1
+
+
+def test_an_empty_answer_is_kept_only_briefly(monkeypatch):
+    answers = ["", INSTRUCTIONS]
+
+    def fetch(settings):
+        return answers.pop(0)
+
+    clock = [1000.0]
+    monkeypatch.setattr(instructions.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(instructions, "_cache", {})
+    settings = config.Settings(repos=(Path("/nowhere"),), client_js=Path("/nowhere/cli.js"), node="node")
+    assert instructions.current(lambda: settings, fetch) == []
+    clock[0] += instructions.EMPTY_CACHE_S - 1
+    assert instructions.current(lambda: settings, fetch) == []
+    clock[0] += 2
+    assert instructions.current(lambda: settings, fetch) == [INSTRUCTIONS]
+    clock[0] += instructions.EMPTY_CACHE_S * 2
+    assert instructions.current(lambda: settings, fetch) == [INSTRUCTIONS]
+
+
+def test_both_full_parts_fit_hermes_s_budget_for_a_session():
+    # Hermes renders a session's plugin sections between two markers, each
+    # under a heading and a length line, and skips a section that would take
+    # the whole past 8,000 characters.
+    start, end = "<!-- hermes-plugin-sections:start -->", "<!-- hermes-plugin-sections:end -->"
+    total = len(start) + len(end) + 2
+    for n in range(instructions.PARTS):
+        heading = (f"## Plugin Context: {instructions.SECTION_ID.format(n + 1)}\n"
+                   f"<!-- hermes-plugin-section-chars:{instructions.PART_CHARS} -->\n\n")
+        total += len(heading) + instructions.PART_CHARS + (2 if n else 0)
+    assert total <= 8_000
