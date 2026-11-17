@@ -1191,7 +1191,7 @@ export function codeSurface(table: string, siblings: readonly string[], options:
     frame:
       "code-context is a local index of this repository: every file's lines are in it" +
       (siblings.length > 0
-        ? `, and beside it in the same database the tables ${siblings.join(", ")}, which one sql statement joins with it`
+        ? `, and beside it in the same database ${otherTables(siblings.length)}, named once in the sql tool's text, which one sql statement joins with it`
         : "") +
       ", and what the repository holds is in the sql tool's text, so begin with these tools, not with ls, " +
       "cat or a look at CLAUDE.md.",
@@ -1361,28 +1361,33 @@ export function carriesSemantics(card: RowRecord | undefined): boolean {
   return schema.some((col: Record<string, unknown>) => typeof col?.description === "string" && col.description !== "");
 }
 
+/** "1 other table", "3 other tables": how the texts that count the other
+ * tables of a database name them, the names being said once, in the sql
+ * text (`siblingsNote`). */
+export function otherTables(count: number): string {
+  return `${count} other ${count === 1 ? "table" : "tables"}`;
+}
+
 export function siblingsNote(table: string, siblings: TableShape[], unresolved: string[], searchable = true, semantics = false): string {
-  const described = siblings.map(
-    (s) =>
-      `${s.table}(${siblingColumnList(s)})` +
-      (s.textColumns.length ? `, full-text indexed on ${s.textColumns.join(", ")}` : "") +
-      (s.vectorColumn ? `, vector column ${s.vectorColumn}` : ""),
-  );
-  // With the semantic layer folded in, each sibling's meanings follow the
-  // list - the primary's ride in its card at the end of the text.
-  const meanings = semantics
-    ? siblings
-        .map((s) => [s.table, cardMeanings(s.card)] as const)
-        .filter(([, said]) => said !== "")
-        .map(([name, said]) => `${name}: ${said}`)
-    : [];
-  const partner = siblings[0]?.table ?? table;
+  // The other tables are named once, here, and nothing more of them is
+  // written: their columns, text columns and meanings are one
+  // describe_columns away. Written out for every table, they made this text
+  // 2.2 million characters on a database of 444 tables (2026-11-16), and on
+  // one of 212 tables the start-up's rendering of the cards missed its
+  // deadline (2026-11-09).
+  const names = siblings.map((s) => s.table);
+  // The worked JOIN names no table of the database but the primary: written
+  // over the first of the others, it named that table again.
+  const partner = "<other table>";
   return (
     // The rule first, in the owner's words (2026-09-24, after Opus was
     // measured twice writing a cross-table statement with no join_keys
     // call: "it's not forceful enough").
     ` ${JOIN_KEYS_RULE}` +
-    ` Also in this database, and joinable with ${table} in one statement: ${described.join("; ")}.` +
+    ` Also in this database, and joinable with ${table} in one statement: ${names.join(", ")}. ` +
+    "This line is the one place the other tables are named. Their columns are not listed: describe_columns with " +
+    "your question returns the cards of the tables the question needs, best first; with a table and a pattern " +
+    "(`*` for every column), that table's columns." +
     LIST_COLUMN_SENTENCE +
     // The same sentence the loop reads over several tables: a question may
     // be about any one of them, and a statement over that table alone is
@@ -1397,7 +1402,7 @@ export function siblingsNote(table: string, siblings: TableShape[], unresolved: 
     // tables still answered one table at a time and read the rest from
     // files (the owner, 2026-09-24: "i don't think opus or the models are
     // using joins. that's the key advantage we have we have to be explicit").
-    `write the JOIN - FROM ${searchable ? `hybrid_search('${partner}', '<text column>', '<terms>', 'embedding', {{q}}, 50) AS ${partner}` : partner} ` +
+    `write the JOIN - FROM ${searchable ? `hybrid_search('${partner}', '<text column>', '<terms>', 'embedding', {{q}}, 50) AS other` : `${partner} AS other`} ` +
     `JOIN ${table} ON <the predicate join_keys returned> WHERE ... - and not one query per table. ` +
     // The semantic layer names the keys in its descriptions (the owner,
     // 2026-10-01: "everything, keys included"), so with it folded in the
@@ -1407,8 +1412,7 @@ export function siblingsNote(table: string, siblings: TableShape[], unresolved: 
       ? "Call join_keys with the tables first and paste its predicate into ON."
       : "The keys are not written here: call join_keys with the tables first and paste its predicate into ON.") +
     GRAPH_WALK_SENTENCE +
-    CONNECTED_SENTENCE +
-    (meanings.length ? ` What the other tables hold, from their cards: ${meanings.join(" ")}` : "")
+    CONNECTED_SENTENCE
   );
 }
 
@@ -1416,7 +1420,10 @@ export function siblingsNote(table: string, siblings: TableShape[], unresolved: 
  * `siblingsSearchable`'s answer: without a full-text column among the
  * tables, the JOIN has no search functions to hold. */
 export function siblingsInstruction(table: string, siblings: string[], searchable = true): string {
-  const names = siblings.join(", ");
+  // The tables are named once, in the sql tool's text (`siblingsNote`): here
+  // they are counted, not listed, so a large database's names are not
+  // repeated on every turn.
+  const names = `the ${otherTables(siblings.length)} the sql tool's text names`;
   // The keys are join_keys's to return, never written here or in the sql
   // text, so a statement across tables never guesses a key from a column
   // name and never reads one we typed.
@@ -1426,9 +1433,8 @@ export function siblingsInstruction(table: string, siblings: string[], searchabl
   // alone, whichever it is: the text describes every one of them, and a
   // reader who asks about the second table is not sent through the first.
   const anyOne =
-    ` A question about one of these tables alone is answered over that table alone, whichever of ${table}, ${names} ` +
-    "it is: every one of them is described in the sql tool's text, and a wide one's mapped columns are one " +
-    "describe_columns away.";
+    ` A question about one of these tables alone is answered over that table alone, whichever of ${table} and ${names} ` +
+    "it is: every one of them is named in the sql tool's text, and its columns are one describe_columns away.";
   return (
     `\n- ${JOIN_KEYS_RULE} sql also joins ${table} with ${names} in one statement - a question that touches two of these tables ` +
         `is one JOIN, ${searchable ? "with the search functions inside it, " : ""}not one query per table and not a walk through ` +
@@ -1557,7 +1563,7 @@ export function rowsSurface(shape: TableShape, siblings: readonly string[], opti
   // is the builder's, after the frame.
   const indexOf =
     siblings.length > 0
-      ? `code-context is an index of the tables ${[table, ...siblings].join(", ")}, one database, ${rowIs} in each.`
+      ? `code-context is an index of the ${table} table and the ${otherTables(siblings.length)} of its database (named once in the sql tool's text), ${rowIs} in each.`
       : `code-context is an index of the ${table} table, ${rowIs}.`;
   return {
     frame: indexOf,
@@ -2998,7 +3004,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     ...(card ? [TABLE] : []),
     ...siblings.flatMap((s) => (s.card ? [s.table] : [])),
   ];
-  if (platformTools && !apiTools && describer && cardTables.length > 0) {
+  // With other tables the start-up asks for no rendering at all: they are
+  // named once in the sql text, and describe_columns with the model's
+  // question returns their cards. Rendered, every table's card went into the
+  // text, and on a database of hundreds of tables the platform could not
+  // answer within the start-up's deadline (212 tables, 2026-11-09).
+  if (platformTools && !apiTools && describer && cardTables.length > 0 && siblingNames.length === 0) {
     try {
       const reader = othersDb ?? describer;
       promptCards = await reader.promptCards(cardTables, CARD_TIER);
@@ -3433,13 +3444,12 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
     // jsonify, not JSON.stringify: a card's statistics over a 64-bit column
     // (a log table's nanosecond timestamps) are bigints, and a refusal here
     // stops the server before it serves a single tool.
-    // Every described table's card, the primary's first: the tables beside
-    // it are described the same way, so a question about one of them is
-    // written over its own columns and not the primary's.
-    const cards = [
-      ...(card ? [{ table: TABLE, card }] : []),
-      ...siblings.flatMap((s) => (s.card ? [{ table: s.table, card: s.card }] : [])),
-    ];
+    // The primary's card. The other tables' cards are not folded in: they
+    // are named once in the sql text, and describe_columns with the model's
+    // question returns the cards it needs. Folded in for every table, they
+    // were most of a 2.2-million-character sql text on a 444-table database
+    // (2026-11-16).
+    const cards = card ? [{ table: TABLE, card }] : [];
     // The platform's own rendering when it serves one (`promptCards`):
     // what its loop's prompt carries, folded in unchanged, so the model
     // here reads the cards the model inside the loop reads. The cards as
@@ -3473,7 +3483,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
   // (`cardsCut`) has all of its entries one describe_columns away.
   const describeColumnsOffered = Boolean(
     describer &&
-      (cardsCut > 0 ||
+      // With other tables, describe_columns is how their columns are read:
+      // the sql text names them and lists none of their columns.
+      (siblingNames.length > 0 ||
+        cardsCut > 0 ||
         (promptCards !== null && promptCardsMap(promptCards)) ||
         [card, ...siblings.map((s) => s.card as RowRecord | undefined)].some((c) => cardMapsColumns(c) || cardNamesKinds(c))),
   );
@@ -3534,7 +3547,10 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
             .string()
             .optional()
             .describe(
-              `The table (one of: ${tablesHere.join(", ")}). Absent with a question: the cards of the tables the question needs; absent without one: ${TABLE}.`,
+              (siblingNames.length > 0
+                ? `The table: ${TABLE}, or one of the other tables the sql tool's text names.`
+                : `The table: ${TABLE}.`) +
+                ` Absent with a question: the cards of the tables the question needs; absent without one: ${TABLE}.`,
             ),
           pattern: z.string().min(1).optional().describe("A column name, matched whole; `*` matches any run of characters, for a prefix (`property_report*`) or a word anywhere in the name (`*monthly*`); or `*` for every column. Case does not matter. Every column when a question is given and this is absent."),
           limit: z.number().int().positive().optional().describe("Entries to list, most rows with a value first (default 40)."),

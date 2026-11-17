@@ -134,8 +134,9 @@ describe("a table with no full-text column, with siblings of the same kind", () 
     // asked at the enriched tier, the default; the primary and the uncarded
     // sibling then at the lean one they fall back to, with the primary's
     // load record between its cards and its siblings'.
-    // Last, the platform's rendering of the carded tables' cards, one call.
-    expect(s.startup).toEqual(["list_tables", "schema", "schema", "schema", "table_card", "table_card", "hydrate", "table_card", "table_card", "table_card", "table_card"]);
+    // No rendering of the cards: with other tables in the database the
+    // start-up asks for none.
+    expect(s.startup).toEqual(["list_tables", "schema", "schema", "schema", "table_card", "table_card", "hydrate", "table_card", "table_card", "table_card"]);
     // The schemas are read at once, and the siblings' cards asked for at
     // once, so which table each of those calls names is fixed in count, not
     // in order: each table's schema once, the primary's cards before its
@@ -145,7 +146,7 @@ describe("a table with no full-text column, with siblings of the same kind", () 
     const cards = asked("table_card")
       .filter((x) => x.body?.tables === undefined)
       .map((x) => `${String(x.body?.table)}:${String(x.body?.tier)}`);
-    expect(asked("table_card").filter((x) => x.body?.tables !== undefined)).toHaveLength(1);
+    expect(asked("table_card").filter((x) => x.body?.tables !== undefined)).toHaveLength(0);
     expect(cards.slice(0, 2)).toEqual([`${TRANS_TABLE}:enriched`, `${TRANS_TABLE}:lean`]);
     expect(cards.slice(2).sort()).toEqual([`${ACCOUNT_TABLE}:enriched`, `${LOAN_TABLE}:enriched`, `${LOAN_TABLE}:lean`]);
     expect(cards.indexOf(`${LOAN_TABLE}:enriched`)).toBeLessThan(cards.indexOf(`${LOAN_TABLE}:lean`));
@@ -176,7 +177,7 @@ describe("a table with no full-text column, with siblings of the same kind", () 
     const sql = byName.get("sql") ?? "";
     expect(sql).toContain("Full-text indexed: none. ");
     expect(sql).toContain("the search functions do not apply to this table");
-    expect(sql).toContain(`FROM ${ACCOUNT_TABLE} JOIN ${TRANS_TABLE} ON <the predicate join_keys returned>`);
+    expect(sql).toContain(`FROM <other table> AS other JOIN ${TRANS_TABLE} ON <the predicate join_keys returned>`);
     expect(sql).toContain("The keys are not written here: call join_keys with the tables first and paste its predicate into ON");
     expect(byName.get("join_keys")).toContain(`FROM ${TRANS_TABLE} JOIN other ON <predicate> reads as written`);
     expect(instructions).toContain("is one JOIN, not one query per table");

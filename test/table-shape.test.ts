@@ -1449,17 +1449,19 @@ describe("a table with no full-text column", () => {
     expect(siblingsSearchable(null, [account], [])).toBe(true);
     const note = siblingsNote("berka_trans", [account], [], false);
     expect(note).toContain(JOIN_KEYS_RULE);
-    expect(note).toContain("berka_account(account_id i64, district_id i64, frequency utf8, date i64)");
+    // The other table is named once, without its columns.
+    expect(note).toContain("joinable with berka_trans in one statement: berka_account. This line is the one place");
+    expect(note).not.toContain("berka_account(account_id");
     expect(note).toContain(
       "none of these tables has a full-text column, so the JOIN is over the tables themselves: write the JOIN - " +
-        "FROM berka_account JOIN berka_trans ON <the predicate join_keys returned> WHERE ... - and not one query per table.",
+        "FROM <other table> AS other JOIN berka_trans ON <the predicate join_keys returned> WHERE ... - and not one query per table.",
     );
     expect(note).not.toContain("hybrid_search");
     expect(note).not.toContain("search functions");
     // Where a table can be searched, the shape is the one it always was.
     expect(siblingsNote("chunks", [JOBS], [])).toContain(
       "and the search functions take any of them as their first argument and their rows join like a table's: write the JOIN - " +
-        "FROM hybrid_search('chunks_jobs', '<text column>', '<terms>', 'embedding', {{q}}, 50) AS chunks_jobs JOIN chunks ON",
+        "FROM hybrid_search('<other table>', '<text column>', '<terms>', 'embedding', {{q}}, 50) AS other JOIN chunks ON",
     );
     // Where the keys come from, said both ways: the lean text says no key
     // is written in it; the text carrying the semantic layer (the server's
@@ -1592,7 +1594,9 @@ describe("a wide table's card, laid out within the loop's budget", () => {
 
   it("tells the model over several tables what the loop is told, in the loop's words", () => {
     const text = instructionsFor(rowsSurface(events, ["events_track"], { describeColumns: true }), ["events_track"]);
-    expect(text).toContain("code-context is an index of the tables events, events_track, one database, one row per record in each.");
+    expect(text).toContain(
+      "code-context is an index of the events table and the 1 other table of its database (named once in the sql tool's text), one row per record in each.",
+    );
     expect(text).toContain(SEVERAL_TABLES_SENTENCE.trim());
     expect(text).toContain("- describe_columns -");
     expect(rowsInstructions(events)).toContain("code-context is an index of the events table, one row per record.");
@@ -1643,7 +1647,7 @@ describe("the one instructions builder over every shape of index", () => {
   it("reaches every shape with what they share: the choosing sentence and describe_columns", () => {
     // The code text with tables beside it says the question may be about any
     // of them, in the loop's words, as the rows text does.
-    expect(code).toContain("and beside it in the same database the tables swe_issues, which one sql statement joins with it");
+    expect(code).toContain("and beside it in the same database 1 other table, named once in the sql tool's text, which one sql statement joins with it");
     expect(code).toContain(SEVERAL_TABLES_SENTENCE.trim());
     expect(codeInstructions("chunks", [])).not.toContain(SEVERAL_TABLES_SENTENCE.trim());
     expect(code).toContain(DESCRIBE_COLUMNS_LINE);

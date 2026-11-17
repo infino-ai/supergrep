@@ -461,7 +461,7 @@ describe("the chunks table with other tables in its database: the tables a state
     await stop(s);
   });
 
-  it("describes the siblings' columns and the join keys in the sql text and names them in the instructions", async () => {
+  it("names the siblings once in the sql text, without their columns, and counts them in the instructions", async () => {
     // Startup listed the database's tables once, then read each sibling's
     // schema (and asked for its card), nothing more.
     expect(s.startup.filter((op) => op === "list_tables").length).toBe(1);
@@ -470,8 +470,12 @@ describe("the chunks table with other tables in its database: the tables a state
     const { tools } = await s.client.listTools();
     const sql = tools.find((t) => t.name === "sql")?.description ?? "";
     expect(sql).toContain("joinable with chunks in one statement");
-    expect(sql).toContain("swe_issues(instance_id utf8, project utf8, problem_statement large_utf8)");
-    expect(sql).toContain("chunks_swelogs(path utf8, start_line i64, content large_utf8, instance_id utf8, resolved utf8)");
+    // Named once, with no column list: their columns are one
+    // describe_columns away.
+    expect(sql).toMatch(/joinable with chunks in one statement: (swe_issues, chunks_swelogs|chunks_swelogs, swe_issues)\./);
+    expect(sql).not.toContain("swe_issues(instance_id");
+    expect(sql).not.toContain("chunks_swelogs(path");
+    expect(tools.map((t) => t.name)).toContain("describe_columns");
     // No key reaches the tool text. Each card is asked for by table, tier
     // and its share of the card budget alone (a card route parameter that
     // handed joins back with the card is gone); no join_keys call is made
@@ -507,12 +511,14 @@ describe("the chunks table with other tables in its database: the tables a state
     const instructions = s.client.getInstructions() ?? "";
     // A question across the tables is one JOIN, written once join_keys has
     // returned the keys.
-    expect(instructions).toContain(`- ${rule} sql also joins chunks with swe_issues, chunks_swelogs in one statement`);
+    expect(instructions).toContain(`- ${rule} sql also joins chunks with the 2 other tables the sql tool's text names in one statement`);
     expect(instructions).toContain("call join_keys with the tables for the keys, then write the JOIN");
     // The siblings come second in the sql text, before the recipes and the
     // card.
     expect(sql.indexOf("joinable with chunks in one statement")).toBeLessThan(sql.indexOf("The search functions are table-valued"));
-    expect(instructions).toContain("beside it in the same database the tables swe_issues, chunks_swelogs");
+    // Counted here, named once in the sql text.
+    expect(instructions).toContain("beside it in the same database 2 other tables, named once in the sql tool's text");
+    expect(instructions).not.toContain("swe_issues");
   });
 
   it("runs a statement across the tables on the platform once the platform's key is in it, asking join_keys itself first", async () => {

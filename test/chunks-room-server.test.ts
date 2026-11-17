@@ -122,8 +122,11 @@ describe("a chunks-shaped hosted table the local index does not hold", () => {
     expect(byName.get("sql")).toContain(`hybrid_search('${ROOM_TABLE}','content','terms','emb', {{q:"..."}}, k)`);
     expect(byName.get("find")).toContain(`Every row of ${ROOM_TABLE}`);
     expect(byName.has("read")).toBe(true);
-    // The room first, the database's other tables the platform listed beside it.
-    expect(s.client.getInstructions()).toContain(`an index of the tables ${ROOM_TABLE}, chunks, chunks_docs, one database`);
+    // The room first, the database's other tables counted beside it: their
+    // names are said once, in the sql text.
+    expect(s.client.getInstructions()).toContain(`an index of the ${ROOM_TABLE} table and the 2 other tables of its database`);
+    expect(byName.get("sql")).toContain("joinable with");
+    expect(byName.get("sql")).toContain("chunks, chunks_docs");
   });
 
   it("search reads the hosted index by the table's own text and vector columns", async () => {
