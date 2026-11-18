@@ -103,17 +103,33 @@ export function aliasesOf(query: string, tables: readonly string[]): Map<string,
   // two joined on their key) was refused before, its `e.id = c.id` naming no
   // table the gate knew (2026-11-10). A subquery or CTE over several tables
   // stands for none: the join inside it is held to a key on its own.
-  for (const [name, table] of derivedTables(query, tables)) {
+  // Which of the table's columns such a name carries is `carriedColumns`.
+  for (const [name, { table }] of derivedTables(query, tables)) {
     if (!aliases.has(name)) aliases.set(name, table);
   }
   return aliases;
 }
 
+/** The columns each subquery alias and CTE name of a statement carries under
+ * their own names (`selectedAsThemselves`), for the names that do not carry
+ * every column: a name absent here stands for its table whatever column is
+ * read through it. A column renamed or computed inside (`title AS
+ * instance_id`, `count(*) AS n`) is not the table's column of that name, so
+ * `name.column` is the table's only for the columns listed. Names and
+ * columns in lowercase. */
+export function carriedColumns(query: string, tables: readonly string[]): Map<string, ReadonlySet<string>> {
+  const carried = new Map<string, ReadonlySet<string>>();
+  for (const [name, { columns }] of derivedTables(query, tables)) {
+    if (columns !== "all") carried.set(name, columns);
+  }
+  return carried;
+}
+
 /** The single known table each subquery alias and CTE name of a statement
- * reads, and each alias given such a CTE (`FROM recent r`). Names in
- * lowercase. */
-function derivedTables(query: string, tables: readonly string[]): Map<string, string> {
-  const derived = new Map<string, string>();
+ * reads, with the columns it carries as themselves, and the same for each
+ * alias given such a CTE (`FROM recent r`). Names in lowercase. */
+function derivedTables(query: string, tables: readonly string[]): Map<string, { table: string; columns: Set<string> | "all" }> {
+  const derived = new Map<string, { table: string; columns: Set<string> | "all" }>();
   const only = (inner: string): string | null => {
     const named = tablesNamed(inner, tables);
     return named.length === 1 ? named[0] : null;
@@ -138,8 +154,8 @@ function derivedTables(query: string, tables: readonly string[]): Map<string, st
     if (!SUBQUERY_START.test(inner)) continue;
     const alias = /^\s*(?:as\s+)?([A-Za-z_]\w*)/i.exec(query.slice(end))?.[1];
     const table = only(inner);
-    if (alias && table && !NOT_AN_ALIAS.has(alias.toLowerCase()) && carriesAsSelected(query, [alias], inner)) {
-      derived.set(alias.toLowerCase(), table);
+    if (alias && table && !NOT_AN_ALIAS.has(alias.toLowerCase())) {
+      derived.set(alias.toLowerCase(), { table, columns: selectedAsThemselves(inner) });
     }
   }
   for (const [cte, { table, inner }] of ctes) {
@@ -149,60 +165,11 @@ function derivedTables(query: string, tables: readonly string[]): Map<string, st
       const alias = m[1].toLowerCase();
       if (!NOT_AN_ALIAS.has(alias) && alias !== cte) names.push(alias);
     }
-    // The CTE stands for its table under every name only when what the
-    // statement reads through those names is the table's own columns.
-    if (!carriesAsSelected(query, names, inner)) continue;
-    for (const name of names) derived.set(name, table);
+    // The CTE carries the same columns under every name it is read by.
+    const columns = selectedAsThemselves(inner);
+    for (const name of names) derived.set(name, { table, columns });
   }
   return derived;
-}
-
-/** Whether every column `query` reads through `names` in a condition - an
- * `ON`, `WHERE` or `HAVING` clause, bare (`n.col = ...`) or inside an
- * expression (`split_part(n.col, '/', 1) = ...`) - is one the subquery or
- * CTE `inner` selects under its own name - `col`, `t.col`, `col AS col` - or
- * `inner` selects `*`. A column renamed inside (`title AS instance_id`) is
- * not the table's column of that name, so a derived name that reads one in a
- * condition does not stand for the table: the join written through it is
- * held to a key as a join between unknown sources would be. Columns only
- * selected, grouped or sorted on (`c.n`, `ORDER BY c.n`) join nothing and
- * are left alone. */
-function carriesAsSelected(query: string, names: readonly string[], inner: string): boolean {
-  const selected = selectedAsThemselves(inner);
-  if (selected === "all") return true;
-  for (const name of names) {
-    const read = new RegExp(`(?<![\\w.'"])"?${escapeRegex(name)}"?\\s*\\.\\s*"?([A-Za-z_]\\w*)"?`, "gi");
-    for (const m of query.matchAll(read)) {
-      if (inCondition(query, m.index ?? 0) && !selected.has(m[1].toLowerCase())) return false;
-    }
-  }
-  return true;
-}
-
-/** The clause keywords a position in a statement can lie under. */
-const CLAUSE_END = /\b(select|from|join|on|using|where|having|group\s+by|order\s+by|limit)$/i;
-/** The clauses that hold conditions. */
-const CONDITION_CLAUSES = new Set(["on", "where", "having"]);
-
-/** Whether position `at` of `query` lies in a condition: the nearest clause
- * keyword before it, at its own nesting or an enclosing one, is `ON`,
- * `WHERE` or `HAVING`. The parentheses of a function call around it
- * (`split_part(c.path, ...)`) are stepped out of; a parenthesised group that
- * closed before it - a subquery beside it - is skipped whole. Text inside
- * quotes is not read for keywords. */
-function inCondition(query: string, at: number): boolean {
-  const before = query.slice(0, at).replace(/'[^']*'|"[^"]*"/g, (quoted) => " ".repeat(quoted.length));
-  let depth = 0;
-  for (let i = before.length - 1; i >= 0; i--) {
-    const c = before[i];
-    if (c === ")") depth += 1;
-    else if (c === "(") depth = Math.max(0, depth - 1);
-    else if (depth === 0 && /[a-z]/i.test(c) && !/\w/.test(before[i + 1] ?? " ")) {
-      const clause = CLAUSE_END.exec(before.slice(0, i + 1));
-      if (clause) return CONDITION_CLAUSES.has(clause[1].toLowerCase());
-    }
-  }
-  return false;
 }
 
 /** The columns a query's top-level select list carries under their own
@@ -252,20 +219,45 @@ function topLevelSelectList(query: string): string[] {
   return items;
 }
 
+/** What stands in for the table of a column a derived name does not carry:
+ * no table's name, so the column matches no key. */
+const NOT_CARRIED = "<derived>";
+const NO_LIMITS: ReadonlyMap<string, ReadonlySet<string>> = new Map();
+
 /** A statement or predicate reduced to what its join condition is made of:
- * lowercase, aliases replaced by their tables, quotes and blanks gone. */
-export function normalizeSql(text: string, aliases: ReadonlyMap<string, string>): string {
+ * lowercase, aliases replaced by their tables, quotes and blanks gone. An
+ * alias in `carried` is replaced only before the columns listed for it: a
+ * column it renames or computes is no table's, and is marked so. */
+export function normalizeSql(
+  text: string,
+  aliases: ReadonlyMap<string, string>,
+  carried: ReadonlyMap<string, ReadonlySet<string>> = NO_LIMITS,
+): string {
   let out = text.toLowerCase();
   for (const [alias, table] of aliases) {
-    out = out.replace(new RegExp(`(?<![\\w.])${escapeRegex(alias)}\\.`, "g"), `${table.toLowerCase()}.`);
+    const columns = carried.get(alias);
+    if (!columns) {
+      out = out.replace(new RegExp(`(?<![\\w.])${escapeRegex(alias)}\\.`, "g"), `${table.toLowerCase()}.`);
+      continue;
+    }
+    out = out.replace(new RegExp(`(?<![\\w.])${escapeRegex(alias)}\\.(["\`]?)([a-z_]\\w*)`, "g"), (_read, quote: string, column: string) =>
+      `${columns.has(column) ? table.toLowerCase() : NOT_CARRIED}.${quote}${column}`,
+    );
   }
   return out.replace(/["`]/g, "").replace(/\s+/g, "");
 }
 
 /** Whether `predicate` (`a.x = b.y`, either side possibly an expression) is
- * written in the statement, either way round. */
-export function predicateHolds(query: string, predicate: string, aliases: ReadonlyMap<string, string>): boolean {
-  const statement = normalizeSql(query, aliases);
+ * written in the statement, either way round, each column read through a
+ * derived name counting as its table's only where the name carries it
+ * (`carried`, see `carriedColumns`). */
+export function predicateHolds(
+  query: string,
+  predicate: string,
+  aliases: ReadonlyMap<string, string>,
+  carried: ReadonlyMap<string, ReadonlySet<string>> = NO_LIMITS,
+): boolean {
+  const statement = normalizeSql(query, aliases, carried);
   const sides = predicate.split(/\s=\s/);
   if (sides.length !== 2) return statement.includes(normalizeSql(predicate, aliases));
   const [l, r] = sides.map((s) => normalizeSql(s, aliases));
@@ -397,7 +389,8 @@ export async function joinGate(
   // statement to; it runs as written.
   if (joins.length === 0) return { kind: "run", tables, keysAsked: true };
   const aliases = aliasesOf(query, tables);
-  if (joins.some((j) => predicateHolds(query, j.predicate, aliases))) return { kind: "run", tables, keysAsked: true };
+  const carried = carriedColumns(query, tables);
+  if (joins.some((j) => predicateHolds(query, j.predicate, aliases, carried))) return { kind: "run", tables, keysAsked: true };
   return { kind: "refuse", tables, keys: joins };
 }
 
