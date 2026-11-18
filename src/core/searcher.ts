@@ -1817,6 +1817,22 @@ export interface RowFindResult {
   total: number;
   /** Set when `total` exceeded the limit and `matches` was cut. */
   truncated?: boolean;
+  /** Set when the platform's rerank cut matches at its pool (`overPoolNote`). */
+  over_pool?: string;
+}
+
+/** How many rows a reranked read found past the platform's rerank pool,
+ * which were neither graded nor returned: its coverage's `over_pool`, absent
+ * when there were none; 0 for a read not reranked. */
+export function overPool(rerank: RowRecord | undefined): number {
+  const n = Number(rerank?.over_pool);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** What a result says of the rows a rerank's pool cut, so the reader knows
+ * rows were left out rather than that there were no more. */
+export function overPoolNote(n: number): string {
+  return `${n} more row${n === 1 ? " was" : "s were"} found past the platform's rerank pool and left out: neither graded nor returned`;
 }
 
 /** The alias the table-wide count travels under beside each row: a name no
@@ -1872,11 +1888,12 @@ export async function findRows(
   const question = hosted.reranksOnRead === false ? undefined : opts.question?.trim();
   const checks = question ? { rerank: { question, k: limit } } : {};
   const fetched = question ? Math.max(limit, RERANK_POOL_ROWS) : limit;
-  const { rows } = await hosted.querySqlChecked(findRowsSql(shape, plainTerms(query), fetched), checks);
+  const { rows, rerank } = await hosted.querySqlChecked(findRowsSql(shape, plainTerms(query), fetched), checks);
   const total = rows.length > 0 ? Number(rows[0][FIND_TOTAL_COLUMN]) : 0;
   // A platform that did not rerank (one without the grader) returns the
   // whole pool: the caller still gets `limit`.
   const matches = rows.slice(0, limit).map(({ [FIND_TOTAL_COLUMN]: _total, ...row }) => rowHit(row, shape));
+  const cut = overPool(rerank);
   return {
     query,
     table: shape.table,
@@ -1885,6 +1902,7 @@ export async function findRows(
     matches,
     total,
     ...(total > matches.length ? { truncated: true } : {}),
+    ...(cut > 0 ? { over_pool: overPoolNote(cut) } : {}),
   };
 }
 

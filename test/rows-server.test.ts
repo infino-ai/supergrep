@@ -576,6 +576,40 @@ describe("graph expansion that fails", () => {
   });
 });
 
+describe("a reranked statement whose matches ran past the platform's pool", () => {
+  let s: Started;
+  beforeAll(async () => {
+    s = await start(
+      describable(SPELLINGS[1], {
+        // The platform's envelope: the rows it graded, and how many it found
+        // past its pool; a statement it did not rerank says it skipped it.
+        query_sql: (body) =>
+          String(body?.query).includes("GROUP BY")
+            ? [200, { rows: [{ n: 42 }], rerank: { skipped: "the statement orders its own rows", over_pool: 300 } }]
+            : [200, { rows: [{ id: "a" }], rerank: { model: "grader", over_pool: 300 } }],
+      }),
+      "cx-rows-",
+    );
+  });
+  afterAll(async () => {
+    await stop(s);
+  });
+
+  it("says how many rows were left out, and how to get every row", async () => {
+    const { ok, value } = await call(s, "sql", { query: `SELECT id FROM ${JOBS_TABLE}`, question: "which jobs want rust?" });
+    expect(ok, String(value)).toBe(true);
+    const note = String((value as { over_pool?: string }).over_pool);
+    expect(note).toContain("300 more rows were found past the platform's rerank pool and left out: neither graded nor returned");
+    expect(note).toContain("is not reranked and returns every row it finds");
+  });
+
+  it("says nothing on a statement the platform did not rerank", async () => {
+    const { ok, value } = await call(s, "sql", { query: `SELECT COUNT(*) AS n FROM ${JOBS_TABLE} GROUP BY 1`, question: "how many?" });
+    expect(ok, String(value)).toBe(true);
+    expect(value).not.toHaveProperty("over_pool");
+  });
+});
+
 describe("graph expansion on the ledger", () => {
   let s: Started;
   beforeAll(async () => {

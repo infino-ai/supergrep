@@ -183,6 +183,8 @@ import {
   analyzerOf,
   find,
   findRows,
+  overPool,
+  overPoolNote,
   search,
   searchHosted,
   searchRows,
@@ -396,6 +398,11 @@ export const lineOrLines = z.preprocess(jsonOrAsIs, z.union([z.number().int().po
  * hand - sat for 116 s waiting on a best-effort check. That is a regression
  * against the tool as it was, and a platform outage must not become one. */
 const VERDICT_TIMEOUT_MS = 3_000;
+/** What a reranked `sql` result that left rows out says beside the count:
+ * how to get every row instead. The platform keeps a statement's own order,
+ * and returns every row, when it groups or orders by anything but a
+ * search's score. */
+const OVER_POOL_SQL_HINT = "A statement with its own GROUP BY, or an ORDER BY on anything but a search's score, is not reranked and returns every row it finds";
 /** The budget one graph expansion has: it adds to a result already in
  * hand, so it never holds that result longer than this. */
 const GRAPH_TIMEOUT_MS = 5_000;
@@ -3271,9 +3278,13 @@ export async function serveMcp(rootPath?: string, serveOptions: ServeOptions = {
       }
       const held = budgetSqlRows(rowsOut, (row) => jsonify(row).length);
       const hint = sqlBudgetHint(rowsOut.length, held.budget);
+      // Rows the rerank's pool left out: said, so the reader does not take
+      // the rows returned for every row there is.
+      const cut = reranked ? overPool(checked.rerank) : 0;
       return ok({
         rows: held.rows,
         ...(hint ? { hint } : {}),
+        ...(cut > 0 ? { over_pool: `${overPoolNote(cut)}. ${OVER_POOL_SQL_HINT}` } : {}),
         ...graph.section,
         ...(verdict ? { validation: verdict } : {}),
         index: "platform",

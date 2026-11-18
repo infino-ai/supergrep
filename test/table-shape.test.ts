@@ -31,7 +31,7 @@ import {
   wholeAllowances,
   type SchemaField,
 } from "../src/core/table-shape.js";
-import { embedsAQuery, findRows, findRowsSql, foldEmbeds, normalizeQueryPlaceholders, RERANK_POOL_ROWS, searchHosted, searchRows } from "../src/core/searcher.js";
+import { embedsAQuery, findRows, findRowsSql, foldEmbeds, normalizeQueryPlaceholders, overPool, overPoolNote, RERANK_POOL_ROWS, searchHosted, searchRows } from "../src/core/searcher.js";
 import { topKAggregateRefusal } from "../src/core/topk-aggregate.js";
 import { rowFindEntry, rowSearchEntry, formatReceipt } from "../src/core/usage.js";
 import {
@@ -393,6 +393,22 @@ describe("the doors over rows", () => {
     const result = await findRows(hosted, JOBS, "rust", { limit: 2, question: "which jobs want rust?" });
     expect(result.matches.map((m) => m.id)).toEqual(["r0", "r1"]);
     expect(result).toMatchObject({ total: 9, truncated: true });
+  });
+
+  it("find says how many rows the platform's rerank pool left out, and nothing when it left none", async () => {
+    const row = { __cx_total: 1, id: "a", title: "A" };
+    const cut = { querySqlChecked: async () => ({ rows: [row], rerank: { model: "grader", over_pool: 250 } }) };
+    const result = await findRows(cut, JOBS, "rust", { limit: 2, question: "which jobs want rust?" });
+    expect(result.over_pool).toBe(overPoolNote(250));
+    expect(result.over_pool).toContain("250 more rows were found past the platform's rerank pool and left out");
+    // None left out, or a read that was not reranked: no note.
+    const whole = { querySqlChecked: async () => ({ rows: [row], rerank: { model: "grader" } }) };
+    expect(await findRows(whole, JOBS, "rust", { limit: 2, question: "q" })).not.toHaveProperty("over_pool");
+    const plain = { querySqlChecked: async () => ({ rows: [row] }) };
+    expect(await findRows(plain, JOBS, "rust", { limit: 2 })).not.toHaveProperty("over_pool");
+    expect(overPool({ over_pool: 1 })).toBe(1);
+    expect(overPoolNote(1)).toContain("1 more row was found");
+    for (const none of [undefined, {}, { over_pool: 0 }, { over_pool: "x" }]) expect(overPool(none), String(none)).toBe(0);
   });
 
   it("find with the question fetches only its limit once the platform has said it runs no grader", async () => {
