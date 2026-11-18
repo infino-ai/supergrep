@@ -139,29 +139,28 @@ describe("the sql text with the semantic layer folded in", () => {
     expect(asked[0]).toBe(`${TRANS_TABLE}:enriched`);
     expect([...asked].sort()).toEqual([`${DISTRICT_TABLE}:enriched`, `${LOAN_TABLE}:enriched`, `${LOAN_TABLE}:lean`, `${TRANS_TABLE}:enriched`]);
     expect(asked.indexOf(`${LOAN_TABLE}:enriched`)).toBeLessThan(asked.indexOf(`${LOAN_TABLE}:lean`));
-    // Then the platform's rendering of every carded table's card, once, at
-    // the same tier (`promptCards`); this platform predates it, so the
-    // cards as read are folded in.
+    // With other tables in the database the start-up asks for no rendering
+    // of the cards (`promptCards`): the others are named once in the sql
+    // text, and describe_columns with a question returns their cards.
     const rendered = s.sent.filter((x) => x.op === "table_card" && x.body?.tables !== undefined);
-    expect(rendered).toHaveLength(1);
-    expect(String(rendered[0].body?.tables).split(",").sort()).toEqual([DISTRICT_TABLE, LOAN_TABLE, TRANS_TABLE].sort());
-    expect(rendered[0].body?.tier).toBe("enriched");
+    expect(rendered).toHaveLength(0);
   });
 
-  it("folds in the primary's enriched card and each sibling's meanings beside the columns", async () => {
+  it("folds in the primary's enriched card, and names the other tables without their meanings", async () => {
     const { tools } = await s.client.listTools();
     const sql = tools.find((t) => t.name === "sql")?.description ?? "";
     // The primary's whole enriched card, its data source and its columns'
     // descriptions with it.
     expect(sql).toContain(TRANS_DESCRIPTION);
     expect(sql).toContain("Account owning the transaction; foreign key to account table");
-    // The siblings' meanings follow their column list.
-    expect(sql).toContain(`What the other tables hold, from their cards: ${DISTRICT_TABLE}: ${DISTRICT_CONTEXT}`);
-    expect(sql).toContain("a4 (population, inhabitants): Number of inhabitants living in the district");
-    // A text column's sections and markers ride beside its description.
-    expect(sql).toContain("notes: Free text about the district, structure: a heading line, then `- ` bullet lines, each one fact");
-    // A sibling with a lean card only still has its codes decoded.
-    expect(sql).toContain(`${LOAN_TABLE}: Columns - status: codes: "A" = Contract finished, no problems; "D" = Running contract, client in debt.`);
+    // The other tables are named once; their meanings and codes are one
+    // describe_columns away, not in this text.
+    expect(sql).toContain(`joinable with ${TRANS_TABLE} in one statement: `);
+    expect(sql).toContain("This line is the one place the other tables are named.");
+    expect(sql).not.toContain("What the other tables hold, from their cards");
+    expect(sql).not.toContain(DISTRICT_CONTEXT);
+    expect(sql).not.toContain("Number of inhabitants living in the district");
+    expect(tools.map((t) => t.name)).toContain("describe_columns");
     // The descriptions name the keys, so the text does not say they are absent.
     expect(sql).not.toContain("The keys are not written here");
     expect(sql).toContain("Call join_keys with the tables first and paste its predicate into ON.");

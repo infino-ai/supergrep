@@ -58,10 +58,11 @@ const FOR_QUESTION = '{"dataset": "db", "tables": [{"table": "events", "schema":
 const VOCABULARY = "Search vocabulary: RENDERED-VOCABULARY";
 
 /** `fits`: whether the scope's cards fit a prompt as they are (the
- * platform answers `ranked: false`), or would be ranked (`ranked: true`). */
-const platform = (fits: boolean) =>
+ * platform answers `ranked: false`), or would be ranked (`ranked: true`).
+ * `listed`: the database's tables. */
+const platform = (fits: boolean, listed: string[] = [EVENTS_TABLE, VISITORS_TABLE]) =>
   scriptPlatform({
-    list_tables: () => [200, [EVENTS_TABLE, VISITORS_TABLE]],
+    list_tables: () => [200, listed],
     schema: (body) => {
       const fields = SCHEMAS[String(body?.table_name)];
       return fields ? [200, fields] : [404, { error: "no such table" }];
@@ -101,19 +102,19 @@ afterAll(() => {
 
 const renderings = (s: Started) => s.sent.filter((x) => x.op === "table_card" && x.body?.tables !== undefined);
 
-describe("cards that fit: the platform's rendering, folded in unchanged", () => {
+describe("a table alone, its card fitting: the platform's rendering, folded in unchanged", () => {
   let s: Started;
   beforeAll(async () => {
-    s = await start(platform(true), "cx-prompt-cards-fit-");
+    s = await start(platform(true, [EVENTS_TABLE]), "cx-prompt-cards-fit-");
   });
   afterAll(async () => {
     await stop(s);
   });
 
-  it("asks the platform once for every carded table's rendering, at the card tier", () => {
+  it("asks the platform once for the table's rendering, at the card tier", () => {
     const asked = renderings(s);
     expect(asked).toHaveLength(1);
-    expect(String(asked[0].body?.tables).split(",").sort()).toEqual([EVENTS_TABLE, VISITORS_TABLE].sort());
+    expect(asked[0].body?.tables).toBe(EVENTS_TABLE);
     expect(asked[0].body?.tier).toBe("enriched");
     expect(asked[0].body?.question).toBeUndefined();
   });
@@ -127,10 +128,10 @@ describe("cards that fit: the platform's rendering, folded in unchanged", () => 
   });
 });
 
-describe("cards that do not fit: a line a table, and the cards a question needs on asking", () => {
+describe("a table alone, its card not fitting: the overview", () => {
   let s: Started;
   beforeAll(async () => {
-    s = await start(platform(false), "cx-prompt-cards-overview-");
+    s = await start(platform(false, [EVENTS_TABLE]), "cx-prompt-cards-overview-");
   });
   afterAll(async () => {
     await stop(s);
@@ -145,6 +146,31 @@ describe("cards that do not fit: a line a table, and the cards a question needs 
     expect(sql).toContain(OVERVIEW);
     expect(sql).not.toContain(RENDERED);
     expect(sql).toContain("describe_columns with your question");
+  });
+});
+
+// With other tables in the database the start-up asks for no rendering: on a
+// database of hundreds of tables the rendering did not answer within the
+// start-up's deadline, and every table's card went into the sql text. The
+// tables are named once, in that text, and describe_columns with the model's
+// question returns the cards it needs.
+describe("a database of several tables: no rendering at start-up, and the cards a question needs on asking", () => {
+  let s: Started;
+  beforeAll(async () => {
+    s = await start(platform(false), "cx-prompt-cards-several-");
+  });
+  afterAll(async () => {
+    await stop(s);
+  });
+
+  it("asks for no rendering, names the other table once and points at describe_columns", async () => {
+    expect(renderings(s)).toHaveLength(0);
+    const { tools } = await s.client.listTools();
+    const sql = tools.find((t) => t.name === "sql")?.description ?? "";
+    expect(sql).toContain(`joinable with ${EVENTS_TABLE} in one statement: ${VISITORS_TABLE}. This line is the one place the other tables are named.`);
+    expect(sql).toContain("describe_columns with your question returns the cards of the tables the question needs");
+    expect(sql).not.toContain(OVERVIEW);
+    expect(sql).not.toContain(RENDERED);
   });
 
   it("describe_columns with a question alone returns the cards that question needs", async () => {

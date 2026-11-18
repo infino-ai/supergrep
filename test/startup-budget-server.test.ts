@@ -129,22 +129,24 @@ describe("another table whose card never answers", () => {
     expect(s.startup).toEqual(["list_tables", "schema", "schema", "schema", "table_card", "hydrate", "table_card", "table_card"]);
   });
 
-  it("describes every table, the mute one from its schema alone, and folds in the cards that came", async () => {
+  it("names every other table once, the mute one too, and folds in its own table's card alone", async () => {
     const { sql } = await texts(s);
     expect(sql).toContain(`Also in this database, and joinable with ${TRANS_TABLE} in one statement: `);
-    expect(sql).toContain(`${ACCOUNT_TABLE}(account_id`);
-    expect(sql).toContain(`${MUTE_CARD_TABLE}(card_id`);
+    expect(sql).toContain(ACCOUNT_TABLE);
+    expect(sql).toContain(MUTE_CARD_TABLE);
+    // No other table's columns or card: they are one describe_columns away.
+    expect(sql).not.toContain(`${ACCOUNT_TABLE}(account_id`);
+    expect(sql).not.toContain(`${MUTE_CARD_TABLE}(card_id`);
     expect(sql).not.toContain("could not be described when this server started");
-    expect(sql).toContain(`${TRANS_TABLE}: ${JSON.stringify(cardOf(TRANS_TABLE, ROWS[TRANS_TABLE]))}`);
-    expect(sql).toContain(`${ACCOUNT_TABLE}: ${JSON.stringify(cardOf(ACCOUNT_TABLE, ROWS[ACCOUNT_TABLE]))}`);
-    expect(sql).not.toContain(`${MUTE_CARD_TABLE}: {`);
+    expect(sql).toContain(JSON.stringify(cardOf(TRANS_TABLE, ROWS[TRANS_TABLE])));
+    expect(sql).not.toContain(JSON.stringify(cardOf(ACCOUNT_TABLE, ROWS[ACCOUNT_TABLE])));
   });
 
-  it("offers describe_columns for the card left out, though every card that came lists its columns whole", async () => {
+  it("offers describe_columns for the other tables, named by the sql text", async () => {
     const { tools } = await s.client.listTools();
     const describe = tools.find((t) => t.name === "describe_columns");
     expect(describe).toBeDefined();
-    expect(JSON.stringify(describe?.inputSchema)).toContain(MUTE_CARD_TABLE);
+    expect(JSON.stringify(describe?.inputSchema)).toContain("one of the other tables the sql tool's text names");
     expect(s.client.getInstructions()).toContain("describe_columns");
   });
 
@@ -182,14 +184,17 @@ describe("another table whose schema never answers, and a primary slower than th
     expect(s.startup).toEqual(["list_tables", "schema", "schema", "schema", "table_card", "hydrate"]);
   });
 
-  it("describes its own table whole, the others as far as they were read, and names the one it could not", async () => {
+  it("describes its own table whole, names the others, and says which one it could not describe", async () => {
     const { sql, instructions } = await texts(s);
     expect(sql).toContain(JSON.stringify(cardOf(TRANS_TABLE, ROWS[TRANS_TABLE])));
-    expect(sql).toContain(`${ACCOUNT_TABLE}(account_id`);
+    expect(sql).toContain(ACCOUNT_TABLE);
+    expect(sql).not.toContain(`${ACCOUNT_TABLE}(account_id`);
     expect(sql).not.toContain(JSON.stringify(cardOf(ACCOUNT_TABLE, ROWS[ACCOUNT_TABLE])));
     expect(sql).toContain(`(${MUTE_SCHEMA_TABLE} could not be described when this server started;`);
-    // The table is still one of the database's: the model is told it is there.
-    expect(instructions).toContain(`${TRANS_TABLE}, ${ACCOUNT_TABLE}, ${MUTE_SCHEMA_TABLE}`);
+    // The table is still one of the database's: the model is told it is
+    // there, counted in the instructions and named in the sql text.
+    expect(instructions).toContain(`${TRANS_TABLE} and the 2 other tables the sql tool's text names`);
+    expect(sql).toContain(MUTE_SCHEMA_TABLE);
   });
 
   it("keeps the tools a table of rows has, and describe_columns for the card the budget left out", async () => {
