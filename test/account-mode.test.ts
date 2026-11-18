@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Connection } from "@infino-ai/infino";
-import { API_KEY_ENV, DATABASE_ENV, accountTargetFor, hostedSettingsFromFlags, platformReadOnly } from "../src/core/config.js";
+import { API_KEY_ENV, DATABASE_ENV, accountTargetFor, configureHosted, hostedSettingsFromFlags, platformReadOnly } from "../src/core/config.js";
 import { writeStoredAccount, writeStoredKey } from "../src/core/keystore.js";
 import { RepoRegistry } from "../src/mcp/repos.js";
 import { noAccountSteps } from "../src/mcp/server.js";
@@ -41,14 +41,32 @@ function signedIn(agreed: boolean): void {
 describe("CX_PLATFORM_READ_ONLY", () => {
   afterEach(() => {
     delete process.env.CX_PLATFORM_READ_ONLY;
+    configureHosted(null);
   });
 
-  it("is off unless set on", () => {
+  it("is off unless set on, with no CX_DATABASE", () => {
     expect(platformReadOnly()).toBe(false);
     process.env.CX_PLATFORM_READ_ONLY = "0";
     expect(platformReadOnly()).toBe(false);
     process.env.CX_PLATFORM_READ_ONLY = "1";
     expect(platformReadOnly()).toBe(true);
+  });
+
+  it("is on when CX_DATABASE named the stored account's database, unless set off: a checkout reading a shared index", () => {
+    signedIn(true);
+    const env = { [DATABASE_ENV]: "infino" };
+    configureHosted(hostedSettingsFromFlags({}, env, undefined, { accountRoot: ROOT }));
+    expect(platformReadOnly(env)).toBe(true);
+    expect(platformReadOnly({ ...env, CX_PLATFORM_READ_ONLY: "0" })).toBe(false);
+    expect(platformReadOnly({ ...env, CX_PLATFORM_READ_ONLY: "1" })).toBe(true);
+    expect(platformReadOnly({})).toBe(false);
+  });
+
+  it("is not implied by CX_DATABASE beside --db, which names the database itself", () => {
+    signedIn(true);
+    const env = { [DATABASE_ENV]: "infino" };
+    configureHosted(hostedSettingsFromFlags({ db: `${PLATFORM}/named` }, env, undefined, { accountRoot: ROOT }));
+    expect(platformReadOnly(env)).toBe(false);
   });
 });
 

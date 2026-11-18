@@ -420,6 +420,19 @@ describe("the memory sender", () => {
     expect(existsSync(dir)).toBe(false);
   });
 
+  it("sends nothing from a checkout reading a shared index (CX_PLATFORM_READ_ONLY), and removes the file", async () => {
+    const { dir, file } = rowsFile();
+    const { sent, fetchImpl } = platform(answer(200, { agent_apis: true }));
+    process.env.CX_PLATFORM_READ_ONLY = "1";
+    try {
+      await memorySend(file, target, fetchImpl);
+    } finally {
+      delete process.env.CX_PLATFORM_READ_ONLY;
+    }
+    expect(sent).toEqual([]);
+    expect(existsSync(dir)).toBe(false);
+  });
+
   it("removes the file when the features cannot be read, or there is no platform", async () => {
     for (const features of [answer(404, { error: "no such route" }), answer(503, { error: "starting" }), () => Promise.reject(new Error("network down"))]) {
       const { dir, file } = rowsFile();

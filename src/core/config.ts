@@ -309,14 +309,25 @@ export function databaseOverride(env: NodeJS.ProcessEnv = process.env): string |
   return name === "" ? undefined : name;
 }
 
-/** Whether builds and syncs leave the platform table alone
- * (CX_PLATFORM_READ_ONLY, default off): the local index is built and synced
- * as always, and nothing is loaded into, or deleted from, the platform's
- * copy, which `search` still reads. A checkout reading a shared index
- * (CX_DATABASE) sets it, so its own changes never reach the index every
- * other checkout reads. */
-export function platformReadOnly(): boolean {
-  return ON_VALUES.includes((process.env.CX_PLATFORM_READ_ONLY ?? "").toLowerCase());
+/** Whether this checkout leaves the platform database alone
+ * (CX_PLATFORM_READ_ONLY): the local index is built and synced as always,
+ * and nothing is loaded into, or deleted from, the platform's chunks table,
+ * which the MCP `search` tool still reads; no database is registered; and the
+ * memory hooks write nothing.
+ *
+ * Unset, it is on when CX_DATABASE named the stored account's database, and
+ * off otherwise (no platform, or a database `--db` named, where CX_DATABASE
+ * is not read). A checkout naming a shared index - one repository's default
+ * branch - reads it: with no local record of the platform table, its first
+ * build would drop that table and load it again from this checkout's tree,
+ * and its memory would be recalled by every other checkout. Whatever keeps
+ * the shared index current sets CX_PLATFORM_READ_ONLY=0. */
+export const PLATFORM_READ_ONLY_ENV = "CX_PLATFORM_READ_ONLY";
+export function platformReadOnly(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = (env[PLATFORM_READ_ONLY_ENV] ?? "").trim().toLowerCase();
+  if (ON_VALUES.includes(value)) return true;
+  if (OFF_VALUES.includes(value)) return false;
+  return hosted?.account !== undefined && databaseOverride(env) !== undefined;
 }
 
 /** Whether queries re-sync the index against the working tree (CX_AUTO_SYNC,

@@ -27,7 +27,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { figuresReason, namesUncomputedReading, toolValues, UNCOMPUTED_READING_REASON, unbackedFigures } from "../core/answer-figures.js";
 import { shouldIndexFile } from "../core/chunker.js";
-import { DEFAULT_CAPS, hostedTarget, indexDir } from "../core/config.js";
+import { DEFAULT_CAPS, hostedTarget, indexDir, platformReadOnly } from "../core/config.js";
 import { accountFeatures } from "../core/account-api.js";
 import { hostedDbFor } from "../core/context.js";
 import type { HostedDb, HostedTarget } from "../core/hosted.js";
@@ -459,7 +459,8 @@ function readMemoryState(path: string): MemoryState | null {
  * Nothing reaches stdout, so nothing here can block a stop either. */
 function rememberTurn(input: string, readFile: (path: string) => string | null, server: string | undefined): void {
   const target = hostedTarget();
-  if (target === null) return;
+  // A checkout reading a shared index writes nothing to it (platformReadOnly).
+  if (target === null || platformReadOnly()) return;
   try {
     const turn = memoryRows(input, readFile, Date.now, memoryAdmits, projectRoot(), server);
     if (turn === null) return;
@@ -525,10 +526,12 @@ export async function sendRememberedRows(rowsFile: string, db: HostedDb): Promis
  * (`remember` is one; an account without them answers 403), and remove the
  * file whatever happens - no platform, no agent routes, a features read or a
  * send that fails - since it holds the person's question, the answer and the
- * text of the files the model wrote. `fetchImpl` is for tests. */
+ * text of the files the model wrote. Nothing is sent from a checkout reading
+ * a shared index (platformReadOnly): its memory would be recalled by every
+ * other checkout. `fetchImpl` is for tests. */
 export async function memorySend(rowsFile: string, target: HostedTarget | null, fetchImpl?: typeof fetch): Promise<void> {
   try {
-    if (target === null) return;
+    if (target === null || platformReadOnly()) return;
     const { agentApis } = await accountFeatures({ baseUrl: target.baseUrl, apiKey: target.apiKey }, fetchImpl ? { fetch: fetchImpl } : {});
     if (!agentApis) return;
     await rememberRows(hostedDbFor(target, fetchImpl ? { fetch: fetchImpl } : {}), JSON.parse(readFileSync(rowsFile, "utf8")) as MemoryRow[]);
