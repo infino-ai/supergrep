@@ -2,7 +2,7 @@
   "mcpServers": {
     "code-context": {
       "command": "npx",
-      "args": ["-y", "@infino-ai/code-context@0.5.1", "mcp"],
+      "args": ["-y", "@infino-ai/code-context@0.6.0", "mcp"],
       "env": { "CX_PLATFORM_URL": "https://api.supergrep.infino.ai" },
       "alwaysLoad": true
     }
