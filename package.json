@@ -1,6 +1,6 @@
 {
   "name": "@infino-ai/code-context",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "mcpName": "io.github.infino-ai/code-context",
   "description": "SuperGrep: retrieval for AI coding agents. find and plain sql run locally over an index in plain files, no account needed; search and a ranked sql statement run in the cloud over the same index's platform copy.",
   "license": "Apache-2.0",
