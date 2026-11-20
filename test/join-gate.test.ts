@@ -84,6 +84,41 @@ describe("joinGate", () => {
     for (const q of carried) expect((await joinGate(q, TABLES, keys([BY_ID]).fetch)).kind, q).toBe("run");
   });
 
+  it("holds a renamed column inside a key's expression to the key", async () => {
+    // The key's side is an expression, so the column sits inside a call, not
+    // next to the `=`: a derived name renaming it is still not the table.
+    const renamed = [
+      "SELECT count(*) FROM (SELECT content AS path FROM chunks) c JOIN swe_issues s ON split_part(c.path, '/', 1) = s.project",
+      "SELECT count(*) FROM (SELECT content AS path FROM chunks) c, swe_issues s WHERE split_part(c.path, '/', 1) = s.project",
+      "WITH c AS (SELECT content AS path FROM chunks) SELECT count(*) FROM c JOIN swe_issues s ON split_part(c.path, '/', 1) = s.project",
+    ];
+    for (const q of renamed) expect((await joinGate(q, TABLES, keys([BY_PREFIX]).fetch)).kind, q).toBe("refuse");
+    // The column carried as itself still reads as the table's, and a renamed
+    // column only selected or sorted on changes nothing.
+    const carried = [
+      "SELECT count(*) FROM (SELECT path FROM chunks) c JOIN swe_issues s ON split_part(c.path, '/', 1) = s.project",
+      "SELECT c.n FROM (SELECT path, count(*) AS n FROM chunks GROUP BY path) c JOIN swe_issues s ON split_part(c.path, '/', 1) = s.project ORDER BY c.n",
+    ];
+    for (const q of carried) expect((await joinGate(q, TABLES, keys([BY_PREFIX]).fetch)).kind, q).toBe("run");
+  });
+
+  it("judges a derived name column by column: a join on a carried key runs whatever else is read through the name", async () => {
+    // The key's column is carried as itself; the other column the statement
+    // filters or joins on is computed or renamed inside, which says nothing
+    // about the key.
+    const onKey = [
+      "SELECT count(*) FROM (SELECT path, lower(content) AS body FROM chunks) c JOIN swe_issues s ON split_part(c.path, '/', 1) = s.project WHERE c.body LIKE '%panic%'",
+      "SELECT count(*) FROM (SELECT path, length(content) AS size FROM chunks) c JOIN swe_issues s ON split_part(c.path, '/', 1) = s.project WHERE c.size = 0",
+      "WITH c AS (SELECT path, count(*) AS n FROM chunks GROUP BY path) SELECT count(*) FROM c JOIN swe_issues s ON split_part(c.path, '/', 1) = s.project WHERE c.n > 1",
+      "SELECT count(*) FROM (SELECT instance_id, title AS name FROM swe_issues) i JOIN chunks_swelogs l ON l.instance_id = i.instance_id AND l.test = i.name",
+    ];
+    for (const q of onKey) expect((await joinGate(q, TABLES, keys([BY_PREFIX, BY_ID]).fetch)).kind, q).toBe("run");
+    // A renamed column stays off the key when the derived name is the
+    // table's own name, where it would otherwise read as the table's column.
+    const shadowed = "SELECT count(*) FROM (SELECT content AS path FROM chunks) chunks JOIN swe_issues s ON split_part(chunks.path, '/', 1) = s.project";
+    expect((await joinGate(shadowed, TABLES, keys([BY_PREFIX]).fetch)).kind).toBe("refuse");
+  });
+
   it("gives a subquery over several tables no table of its own", () => {
     const q = "SELECT x.instance_id FROM (SELECT i.instance_id FROM swe_issues i JOIN chunks_swelogs l ON l.instance_id = i.instance_id) x";
     expect(aliasesOf(q, TABLES).get("x")).toBeUndefined();
